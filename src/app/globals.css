@@ -53,6 +53,49 @@ body::before {
   pointer-events: none;
 }
 
+/* Brutalist Card Styles */
+.brutal-card {
+  background: white;
+  border: 2px solid #000;
+  box-shadow: 4px 4px 0 0 #000;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.brutal-card:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: 6px 6px 0 0 #000;
+}
+
+/* Section label styling */
+.section-label {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3em;
+  color: var(--cta);
+}
+
+/* Code block styling */
+.code-block {
+  background: #0f0f0f;
+  color: #e5e7eb;
+  padding: 1rem;
+  font-family: var(--font-mono), monospace;
+  font-size: 0.875rem;
+  line-height: 1.6;
+  overflow-x: auto;
+}
+
+.code-block code {
+  font-family: inherit;
+}
+
+/* Dark section styling */
+.dark-section {
+  background: linear-gradient(180deg, #0f0f0f 0%, #0a0a0a 100%);
+  color: white;
+}
+
 /* Loading spinner */
 @keyframes spin {
   from { transform: rotate(0deg); }

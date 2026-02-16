@@ -105,7 +105,7 @@ for loc_id, name, score in results:
 
 <span id="company-embedder" />
 
-Wraps `sentence-transformers` for generating 768-dimensional embeddings using `all-MiniLM-L6-v2`.
+Wraps `sentence-transformers` for generating 768-dimensional embeddings using `google/embeddinggemma-300m` (300M params).
 
 ```python
 from corp_entity_db import CompanyEmbedder, get_embedder

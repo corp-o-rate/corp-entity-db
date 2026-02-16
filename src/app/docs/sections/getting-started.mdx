@@ -10,17 +10,23 @@
 pip install corp-entity-db
 ```
 
-The embedding model (`all-MiniLM-L6-v2`, 22M params) is downloaded automatically on first use. For full import capabilities, install with extras:
+The embedding model (`google/embeddinggemma-300m`, 300M params) is downloaded automatically on first use. The default install includes only search dependencies. Install extras as needed:
 
 ```bash
-# Core library (search + resolve)
+# Default: search and resolve (no build dependencies)
 pip install corp-entity-db
 
-# With import tools (GLEIF, SEC, Wikidata dump)
-pip install "corp-entity-db[importers]"
+# With database build/import support (sqlite-vec, orjson, indexed-bzip2)
+pip install "corp-entity-db[build]"
 
-# With fast import support (orjson, indexed_bzip2)
-pip install "corp-entity-db[fast-import]"
+# With HTTP server (corp-entity-db serve)
+pip install "corp-entity-db[serve]"
+
+# With remote client (EntityDBClient via httpx)
+pip install "corp-entity-db[client]"
+
+# Everything
+pip install "corp-entity-db[all]"
 ```
 
 ### Quick Start
@@ -124,19 +130,24 @@ for stmt in ctx.labeled_statements:
       <td>Required (bundled with Python)</td>
     </tr>
     <tr>
-      <td>sqlite-vec</td>
-      <td>latest</td>
-      <td>Required, SQLite vector extension</td>
-    </tr>
-    <tr>
       <td>Pydantic</td>
       <td>2.0+</td>
       <td>Required, for data models</td>
     </tr>
     <tr>
+      <td>sqlite-vec</td>
+      <td>latest</td>
+      <td>Optional (<code>[build]</code> extra), for database construction</td>
+    </tr>
+    <tr>
       <td>httpx</td>
       <td>latest</td>
-      <td>Required, for server client and downloads</td>
+      <td>Optional (<code>[client]</code> extra), for EntityDBClient</td>
+    </tr>
+    <tr>
+      <td>FastAPI + uvicorn</td>
+      <td>latest</td>
+      <td>Optional (<code>[serve]</code> extra), for HTTP server</td>
     </tr>
     <tr>
       <td>huggingface-hub</td>

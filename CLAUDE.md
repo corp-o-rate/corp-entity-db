@@ -41,7 +41,10 @@ pnpm lint        # Run ESLint
 ### Python Library
 ```bash
 cd entity-db-lib
-uv sync                        # Install dependencies
+uv sync                        # Install dependencies (default: search only)
+uv sync --extra build          # Install with build/import extras
+uv sync --extra serve          # Install with server extras
+uv sync --all-extras           # Install everything
 uv run pytest                  # Run tests
 uv build                       # Build package
 uv publish                     # Publish to PyPI (requires credentials)
@@ -107,7 +110,7 @@ The frontend can connect to the entity database via two backends (configured by 
 - `PersonDatabase` - Search and manage people
 - `RolesDatabase` - Search roles/positions
 - `LocationsDatabase` - Search locations
-- `CompanyEmbedder` - Generate embeddings using google/embedding-gemma-300m (300M params)
+- `CompanyEmbedder` - Generate embeddings using google/embeddinggemma-300m (300M params)
 - `OrganizationResolver` - Resolve organization names to canonical records
 - `Canonicalizer` - Link equivalent records across data sources
 
@@ -170,12 +173,20 @@ The frontend can connect to the entity database via two backends (configured by 
 | Wikidata People | Notable people via SPARQL | Variable (may timeout) |
 | Wikidata Dump | Full JSON dump import (recommended) | ~100GB, 3-thread parallel |
 
+### Dependency Extras
+The default install (`pip install corp-entity-db`) includes only search dependencies. Optional extras:
+- `[build]` — sqlite-vec, orjson, indexed-bzip2 (for building/importing databases)
+- `[serve]` — fastapi, uvicorn (for `corp-entity-db serve`)
+- `[client]` — httpx (for `EntityDBClient` remote proxy)
+- `[all]` — everything combined
+
 ### Key Technical Notes
 - USearch `expansion_search=200` must be set after `Index.restore()` (default resets to 64)
 - SQLite pragmas: 256MB mmap, 500MB page cache, WAL journal mode
-- Float32 and int8 scalar embeddings (75% storage reduction, ~92% recall)
+- sqlite-vec is optional — only loaded when installed (needed for build operations, not search)
+- Lite database ships without embeddings — just USearch HNSW indexes for ANN search
 - Hybrid search: text filtering + USearch embeddings
-- Embedding model: `google/embedding-gemma-300m` (300M params)
+- Embedding model: `google/embeddinggemma-300m` (300M params)
 - PyPI package: `corp-entity-db`
 - CLI entry point: `corp-entity-db`
 - Server default port: 8222

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "corp-entity-db"
-version = "0.1.0"
+version = "0.2.0"
 description = "Entity database for organizations, people, roles, and locations with embedding search"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,21 +14,35 @@ dependencies = [
     "numpy>=1.24.0",
     "click>=8.0.0",
     "sentence-transformers>=2.2.0",
-    "sqlite-vec>=0.1.6",
     "usearch>=2.0.0",
-    "httpx>=0.25.0",
-    "beautifulsoup4>=4.12.0",
     "huggingface_hub>=0.20.0",
     "pycountry>=24.6.1",
-    "fastapi>=0.100.0",
-    "uvicorn[standard]>=0.20.0",
 ]
 
 [project.optional-dependencies]
-fast-import = ["orjson", "indexed-bzip2"]
+build = [
+    "sqlite-vec>=0.1.6",
+    "orjson",
+    "indexed-bzip2",
+]
+serve = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
+]
+client = [
+    "httpx>=0.25.0",
+]
+all = [
+    "corp-entity-db[build,serve,client]",
+]
 
 [project.scripts]
 corp-entity-db = "corp_entity_db.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/corp_entity_db"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

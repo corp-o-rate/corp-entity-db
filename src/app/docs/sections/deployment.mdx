@@ -126,8 +126,8 @@ For self-hosted Docker deployments:
 # Minimal Dockerfile
 FROM python:3.12-slim
 
-# Install the library
-RUN pip install corp-entity-db
+# Install the library with serve extra
+RUN pip install "corp-entity-db[serve]"
 
 # Download database on build (bakes it into the image)
 RUN corp-entity-db download

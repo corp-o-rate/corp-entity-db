@@ -129,7 +129,7 @@ The v2/v3 schema uses normalized integer foreign keys instead of TEXT enum value
 
 The full database stores embeddings in two formats:
 
-- **Float32 embeddings** (`organization_embeddings`, `person_embeddings`): Full-precision 768-dimensional vectors in SQLite via `sqlite-vec`
+- **Float32 embeddings** (`organization_embeddings`, `person_embeddings`): Full-precision 768-dimensional vectors in SQLite (requires `[build]` extra for sqlite-vec)
 - **Int8 scalar embeddings** (`organization_embeddings_scalar`, `person_embeddings_scalar`): Quantized to 8-bit integers for ~75% storage reduction with ~92% recall
 
 The **lite database** drops all embedding tables entirely. Search is performed via USearch HNSW indexes stored as separate `.bin` files.

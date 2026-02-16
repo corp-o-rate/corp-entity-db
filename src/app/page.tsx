@@ -1,9 +1,12 @@
 'use client';
 
 import { useState, useCallback } from 'react';
+import { Header } from '@/components/header';
+import { Footer } from '@/components/footer';
 import { SearchBar, EntityType } from '@/components/SearchBar';
 import { ResultCard } from '@/components/ResultCard';
-import { Database, AlertCircle } from 'lucide-react';
+import { HowItWorks, AboutCorpORate } from '@/components/about-sections';
+import { Database, AlertCircle, BookOpen, Terminal } from 'lucide-react';
 
 interface SearchResult {
   name: string;
@@ -75,103 +78,165 @@ export default function Home() {
 
   return (
     <div className="min-h-screen flex flex-col">
-      {/* Header */}
-      <header className="border-b border-gray-200 px-4 sm:px-6 lg:px-8 py-4">
-        <div className="max-w-4xl mx-auto flex items-center gap-3">
-          <Database className="w-6 h-6 text-red-600" />
-          <div>
-            <h1 className="font-black text-lg tracking-tight">ENTITY DATABASE</h1>
-            <p className="text-xs text-gray-500 uppercase tracking-widest font-semibold">corp-o-rate</p>
-          </div>
-        </div>
-      </header>
+      <Header />
 
-      <main className="flex-1 px-4 sm:px-6 lg:px-8 py-8">
-        <div className="max-w-4xl mx-auto">
-          {/* Hero */}
-          <div className="text-center mb-8">
-            <span className="text-xs font-bold uppercase tracking-[0.3em] text-red-600">entity search</span>
-            <h2 className="text-3xl md:text-4xl font-black mt-3 tracking-tight">
-              SEARCH THE DATABASE.
-            </h2>
-            <p className="mt-3 text-gray-600 max-w-xl mx-auto">
-              9.7M+ organizations and 63M+ people with USearch HNSW indexes for sub-millisecond lookups.
-            </p>
-          </div>
-
-          {/* Search */}
-          <div className="border-2 border-black shadow-[4px_4px_0_0_#000] bg-white p-6 mb-8">
-            <SearchBar
-              query={query}
-              onQueryChange={setQuery}
-              entityType={entityType}
-              onEntityTypeChange={setEntityType}
-              hybrid={hybrid}
-              onHybridChange={setHybrid}
-              onSubmit={handleSearch}
-              isLoading={isLoading}
-            />
-          </div>
-
-          {/* Error */}
-          {error && (
-            <div className="flex items-center gap-2 p-4 mb-6 border border-red-200 bg-red-50 text-red-700 text-sm">
-              <AlertCircle className="w-4 h-4 shrink-0" />
-              {error}
-            </div>
-          )}
-
-          {/* Results header */}
-          {hasSearched && !error && (
-            <div className="flex items-center justify-between mb-4">
-              <p className="text-sm text-gray-500">
-                {results.length} result{results.length !== 1 ? 's' : ''}
-                {searchTime !== null && (
-                  <span className="font-mono ml-1">({searchTime}ms)</span>
-                )}
+      <main className="flex-1">
+        {/* Hero Section */}
+        <section className="py-12 px-4 sm:px-6 lg:px-8 border-b">
+          <div className="max-w-6xl mx-auto">
+            <div className="text-center mb-8">
+              <span className="section-label">corp-entity-db demo</span>
+              <h1 className="text-4xl md:text-5xl font-black mt-4 tracking-tight">
+                SEARCH THE DATABASE.
+                <br />
+                <span className="text-gray-400">RESOLVE ENTITIES.</span>
+              </h1>
+              <p className="mt-4 text-gray-600 max-w-2xl mx-auto">
+                A Python library for searching and resolving organizations, people, roles, and locations.
+                9.7M+ organizations and 63M+ people with embedding-based{' '}
+                <a
+                  href="https://github.com/unum-cloud/usearch"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-red-600 hover:underline font-medium"
+                >
+                  USearch HNSW
+                </a>{' '}
+                indexes for sub-millisecond lookups. Data sourced from GLEIF, SEC Edgar,
+                UK Companies House, and Wikidata.
               </p>
             </div>
-          )}
 
-          {/* Results */}
-          {results.length > 0 && (
-            <div className="space-y-3">
-              {results.map((result, i) => (
-                <ResultCard
-                  key={`${result.name}-${result.id ?? i}`}
-                  result={result}
-                  entityType={entityType}
-                  rank={i + 1}
-                />
-              ))}
+            {/* Search Section */}
+            <div className="brutal-card p-6 md:p-8">
+              <SearchBar
+                query={query}
+                onQueryChange={setQuery}
+                entityType={entityType}
+                onEntityTypeChange={setEntityType}
+                hybrid={hybrid}
+                onHybridChange={setHybrid}
+                onSubmit={handleSearch}
+                isLoading={isLoading}
+              />
             </div>
-          )}
+          </div>
+        </section>
 
-          {/* Empty state */}
-          {hasSearched && !isLoading && !error && results.length === 0 && (
-            <div className="text-center py-16 text-gray-400">
-              <Database className="w-12 h-12 mx-auto mb-3 opacity-30" />
-              <p className="text-lg font-semibold">No results found</p>
-              <p className="text-sm mt-1">Try a different query or entity type</p>
-            </div>
-          )}
+        {/* Results Section */}
+        <section className="py-12 px-4 sm:px-6 lg:px-8">
+          <div className="max-w-6xl mx-auto">
+            {/* Error */}
+            {error && (
+              <div className="flex items-center gap-2 p-4 mb-6 border border-red-200 bg-red-50 text-red-700 text-sm">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                {error}
+              </div>
+            )}
 
-          {/* Initial state */}
-          {!hasSearched && (
-            <div className="text-center py-16 text-gray-300">
-              <Database className="w-16 h-16 mx-auto mb-4 opacity-20" />
-              <p className="text-gray-400">Enter a query above to search</p>
+            {/* Results header */}
+            {hasSearched && !error && (
+              <div className="flex items-center justify-between mb-4">
+                <p className="text-sm text-gray-500">
+                  {results.length} result{results.length !== 1 ? 's' : ''}
+                  {searchTime !== null && (
+                    <span className="font-mono ml-1">({searchTime}ms)</span>
+                  )}
+                </p>
+              </div>
+            )}
+
+            {/* Results */}
+            {results.length > 0 && (
+              <div className="space-y-3">
+                {results.map((result, i) => (
+                  <ResultCard
+                    key={`${result.name}-${result.id ?? i}`}
+                    result={result}
+                    entityType={entityType}
+                    rank={i + 1}
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* Empty state */}
+            {hasSearched && !isLoading && !error && results.length === 0 && (
+              <div className="text-center py-16 text-gray-400">
+                <Database className="w-12 h-12 mx-auto mb-3 opacity-30" />
+                <p className="text-lg font-semibold">No results found</p>
+                <p className="text-sm mt-1">Try a different query or entity type</p>
+              </div>
+            )}
+
+            {/* Initial state */}
+            {!hasSearched && (
+              <div className="text-center py-16 text-gray-300">
+                <Database className="w-16 h-16 mx-auto mb-4 opacity-20" />
+                <p className="text-gray-400">Enter a query above to search</p>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Quick Start Section */}
+        <section className="py-12 px-4 sm:px-6 lg:px-8 bg-gray-50/50">
+          <div className="max-w-6xl mx-auto">
+            <div className="flex items-center gap-2 mb-6">
+              <BookOpen className="w-5 h-5 text-red-600" />
+              <h2 className="font-bold text-xl">Quick Start</h2>
             </div>
-          )}
-        </div>
+            <div className="grid md:grid-cols-2 gap-6">
+              <div>
+                <h3 className="font-semibold mb-3 flex items-center gap-2">
+                  <Terminal className="w-4 h-4 text-gray-500" />
+                  Install &amp; Search
+                </h3>
+                <pre className="code-block rounded-lg text-sm"><code>{`\
+`}<span className="text-gray-500"># Install from PyPI</span>{`
+pip install corp-entity-db
+
+`}<span className="text-gray-500"># Download lite database + indexes</span>{`
+corp-entity-db download
+
+`}<span className="text-gray-500"># Search organizations</span>{`
+corp-entity-db search "Microsoft"
+corp-entity-db search "Microsoft" --hybrid
+
+`}<span className="text-gray-500"># Search people</span>{`
+corp-entity-db search-people "Tim Cook"`}</code></pre>
+              </div>
+              <div>
+                <h3 className="font-semibold mb-3 flex items-center gap-2">
+                  <Terminal className="w-4 h-4 text-gray-500" />
+                  Python API
+                </h3>
+                <pre className="code-block rounded-lg text-sm"><code><span className="text-green-400">from</span>{` corp_entity_db `}<span className="text-green-400">import</span>{` (
+    OrganizationDatabase,
+    get_database_path
+)
+
+db = OrganizationDatabase(
+    get_database_path()
+)
+matches = db.search(
+    `}<span className="text-yellow-300">&quot;Microsoft&quot;</span>{`, limit=`}<span className="text-cyan-300">10</span>{`
+)
+`}<span className="text-green-400">for</span>{` m `}<span className="text-green-400">in</span>{` matches:
+    print(m.record.name, m.score)`}</code></pre>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* How It Works Section */}
+        <HowItWorks />
+
+        {/* About Corp-o-Rate Section */}
+        <AboutCorpORate />
       </main>
 
-      {/* Footer */}
-      <footer className="border-t border-gray-200 px-4 sm:px-6 lg:px-8 py-4">
-        <div className="max-w-4xl mx-auto text-center text-xs text-gray-400">
-          corp-entity-db -- entity database search
-        </div>
-      </footer>
+      <Footer />
     </div>
   );
 }

@@ -1,2 +1,2 @@
-corp-entity-db>=0.1.0
+corp-entity-db[serve]>=0.2.0
 runpod>=1.6.0

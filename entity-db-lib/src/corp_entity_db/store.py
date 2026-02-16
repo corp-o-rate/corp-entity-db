@@ -16,7 +16,12 @@ from typing import Any, Iterator, Optional
 
 import numpy as np
 import pycountry
-import sqlite_vec
+
+try:
+    import sqlite_vec
+    _has_sqlite_vec = True
+except ImportError:
+    _has_sqlite_vec = False
 
 from .models import (
     CompanyRecord,
@@ -95,10 +100,11 @@ def _get_shared_connection(
             conn = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
             conn.row_factory = sqlite3.Row
 
-            # Load sqlite-vec extension
-            conn.enable_load_extension(True)
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
+            # Load sqlite-vec extension if available (only needed for build operations)
+            if _has_sqlite_vec:
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+                conn.enable_load_extension(False)
 
             _apply_pragmas(conn, readonly=True)
 
@@ -114,10 +120,11 @@ def _get_shared_connection(
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
 
-        # Load sqlite-vec extension
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
+        # Load sqlite-vec extension if available (only needed for build operations)
+        if _has_sqlite_vec:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
 
         _apply_pragmas(conn, readonly=False)
 
