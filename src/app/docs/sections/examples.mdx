@@ -1,0 +1,213 @@
+## Examples
+
+<span id="examples" />
+
+### Search Organizations
+
+<span id="search-organizations-example" />
+
+```python
+from corp_entity_db import OrganizationDatabase, CompanyEmbedder, download_database
+
+# Setup
+db_path = download_database()
+embedder = CompanyEmbedder()
+db = OrganizationDatabase(db_path=db_path, readonly=True)
+
+# Search for an organization
+query = "JPMorgan Chase"
+vec = embedder.embed(query)
+results = db.search(vec, top_k=5)
+
+for record, score in results:
+    print(f"  {record.name}")
+    print(f"    Source: {record.source}:{record.source_id}")
+    print(f"    Region: {record.region}")
+    print(f"    Type: {record.entity_type}")
+    print(f"    Score: {score:.3f}")
+    print()
+```
+
+### Search People
+
+<span id="search-people-example" />
+
+```python
+from corp_entity_db import get_person_database, CompanyEmbedder, get_database_path
+
+db_path = get_database_path(auto_download=True)
+embedder = CompanyEmbedder()
+db = get_person_database(db_path=db_path, readonly=True)
+
+# Search with embedding
+vec = embedder.embed("Elon Musk")
+results = db.search(vec, top_k=5, query_text="Elon Musk")
+
+for record, score in results:
+    role_info = f"{record.known_for_role} at {record.known_for_org}" if record.known_for_role else ""
+    print(f"  {record.name} — {role_info} (score: {score:.3f})")
+    print(f"    Type: {record.person_type}, Born: {record.birth_date or 'unknown'}")
+```
+
+### Hybrid Search
+
+<span id="hybrid-search-example" />
+
+Hybrid search combines text-based filtering with embedding similarity for improved precision. Text filtering narrows candidates by substring match before re-ranking by embeddings.
+
+```python
+from corp_entity_db import OrganizationDatabase, CompanyEmbedder, get_database_path
+
+db_path = get_database_path(auto_download=True)
+embedder = CompanyEmbedder()
+db = OrganizationDatabase(db_path=db_path, readonly=True)
+
+# Embedding-only search
+vec = embedder.embed("Deutsche Bank")
+results_embedding = db.search(vec, top_k=5)
+
+# Hybrid search (text + embedding)
+results_hybrid = db.search(vec, top_k=5, query_text="Deutsche Bank")
+
+print("Embedding-only results:")
+for r, s in results_embedding:
+    print(f"  {r.name} ({r.source}) — {s:.3f}")
+
+print("\nHybrid results:")
+for r, s in results_hybrid:
+    print(f"  {r.name} ({r.source}) — {s:.3f}")
+```
+
+### Building a Database from Scratch
+
+<span id="building-database" />
+
+To build the full entity database from source data:
+
+```bash
+# Step 1: Import organizations from each source
+corp-entity-db import-gleif --download
+corp-entity-db import-sec --download
+corp-entity-db import-companies-house --download
+
+# Step 2: Import from Wikidata dump (orgs + people + locations)
+corp-entity-db import-wikidata-dump --download
+
+# Step 3: Import officers
+corp-entity-db import-sec-officers --start-year 2020
+corp-entity-db import-ch-officers --file officers.zip
+
+# Step 4: Link equivalent records across sources
+corp-entity-db canonicalize
+
+# Step 5: Generate embeddings, build USearch indexes, VACUUM
+corp-entity-db post-import
+
+# Step 6: Check the result
+corp-entity-db status
+
+# Step 7: Upload to HuggingFace (creates lite variant automatically)
+corp-entity-db upload
+```
+
+The `post-import` command handles three things in sequence:
+1. Generates embeddings for any records that lack them
+2. Builds USearch HNSW indexes from the embedding tables
+3. Runs `VACUUM` to compact the database
+
+### Using in the Statement Extractor Pipeline
+
+<span id="pipeline-integration" />
+
+The `corp-entity-db` library is used internally by `corp-extractor` for Stage 3 (Entity Qualification). The pipeline automatically resolves extracted entities against the database:
+
+```python
+from statement_extractor.pipeline import ExtractionPipeline, PipelineConfig
+
+# The embedding_company_qualifier and person_qualifier plugins
+# use corp-entity-db internally
+pipeline = ExtractionPipeline()
+ctx = pipeline.process("Apple CEO Tim Cook announced new products at WWDC.")
+
+for stmt in ctx.labeled_statements:
+    # Subjects and objects are qualified with canonical IDs
+    print(f"{stmt.subject_fqn} -> {stmt.statement.predicate} -> {stmt.object_fqn}")
+    # e.g., "Tim Cook (CEO, Apple Inc.) -> announced -> new products"
+    # e.g., "Apple Inc. [LEI:HWUPKR0MPOU8FGXBT394] -> held event -> WWDC"
+```
+
+To use a remote entity database server for qualification:
+
+```python
+from statement_extractor.pipeline import ExtractionPipeline
+
+# Delegates entity lookups to the running server
+pipeline = ExtractionPipeline(server_url="http://localhost:8111")
+ctx = pipeline.process("Amazon CEO Andy Jassy announced...")
+```
+
+### Server Delegation
+
+<span id="server-delegation-example" />
+
+Use the HTTP client for search without loading models locally:
+
+```python
+from corp_entity_db.client import EntityDBClient
+
+# Connect to a running server
+client = EntityDBClient("http://localhost:8222")
+
+# Search organizations
+matches = client.search_organizations("Tesla Inc", limit=3)
+for m in matches:
+    rec = m["record"]
+    print(f"{rec['name']} ({rec['source']}:{rec['source_id']}) — {m['similarity_score']:.3f}")
+
+# Resolve to canonical form
+resolved = client.resolve("Google LLC", type="org")
+if resolved:
+    print(f"Canonical: {resolved['canonical_name']} ({resolved['canonical_id']})")
+```
+
+### Batch Embedding and Import
+
+<span id="batch-import-example" />
+
+For custom data sources, you can insert records directly:
+
+```python
+from corp_entity_db import OrganizationDatabase, CompanyEmbedder, CompanyRecord, EntityType
+
+db = OrganizationDatabase(db_path="my_entities.db")
+embedder = CompanyEmbedder()
+
+# Create records
+records = [
+    CompanyRecord(
+        name="Acme Corporation",
+        source="wikidata",
+        source_id="Q12345",
+        region="US",
+        entity_type=EntityType.BUSINESS,
+    ),
+    CompanyRecord(
+        name="Widget Industries Ltd",
+        source="companies_house",
+        source_id="12345678",
+        region="UK",
+        entity_type=EntityType.BUSINESS,
+    ),
+]
+
+# Insert with embeddings
+for record in records:
+    embedding = embedder.embed(record.name)
+    db.insert(record, embedding)
+
+# Search to verify
+vec = embedder.embed("Acme Corp")
+results = db.search(vec, top_k=3)
+for r, score in results:
+    print(f"{r.name} — {score:.3f}")
+```

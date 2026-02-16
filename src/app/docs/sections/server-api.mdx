@@ -1,0 +1,201 @@
+## Server API
+
+<span id="server-api" />
+
+The entity database server provides a FastAPI HTTP interface for search and resolution. Start it with `corp-entity-db serve` and it keeps databases, USearch indexes, and the embedding model warm in memory.
+
+### Starting the Server
+
+<span id="starting-server" />
+
+```bash
+# Start with default settings (0.0.0.0:8222)
+corp-entity-db serve
+
+# Custom port
+corp-entity-db serve --port 9000
+
+# Skip eager warmup (load on first request)
+corp-entity-db serve --no-warmup
+```
+
+On startup with warmup enabled, the server loads:
+1. The `all-MiniLM-L6-v2` embedding model
+2. Organization database + USearch HNSW index
+3. Person database + USearch HNSW index
+4. Roles and locations databases
+
+### Endpoints
+
+<span id="endpoints" />
+
+#### GET / -- Health Check
+
+Returns server status and loaded database statistics.
+
+```bash
+curl http://localhost:8222/
+```
+
+```json
+{
+  "status": "ok",
+  "db_path": "/Users/you/.cache/corp-extractor/entities-v3.db",
+  "indexes_loaded": true,
+  "org_count": 9700000,
+  "person_count": 63000000
+}
+```
+
+#### POST /search -- Search Organizations
+
+Search organizations by name using embedding similarity.
+
+```bash
+curl -X POST http://localhost:8222/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Microsoft", "limit": 5, "hybrid": true}'
+```
+
+**Request body:**
+
+<table>
+  <thead>
+    <tr>
+      <th>Field</th>
+      <th>Type</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>query</code></td><td>string</td><td>required</td><td>Organization name to search</td></tr>
+    <tr><td><code>limit</code></td><td>int</td><td>10</td><td>Max results to return</td></tr>
+    <tr><td><code>hybrid</code></td><td>bool</td><td>false</td><td>Enable text + embedding hybrid search</td></tr>
+  </tbody>
+</table>
+
+**Response:** Array of `CompanyMatch` objects with `query_name`, `record`, `source`, `source_id`, `canonical_id`, and `similarity_score`.
+
+#### POST /search-people -- Search People
+
+Search notable people by name.
+
+```bash
+curl -X POST http://localhost:8222/search-people \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Tim Cook", "limit": 5}'
+```
+
+**Request body:**
+
+<table>
+  <thead>
+    <tr>
+      <th>Field</th>
+      <th>Type</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>query</code></td><td>string</td><td>required</td><td>Person name to search</td></tr>
+    <tr><td><code>limit</code></td><td>int</td><td>10</td><td>Max results to return</td></tr>
+  </tbody>
+</table>
+
+**Response:** Array of `PersonMatch` objects with `query_name`, `record` (including `known_for_role`, `known_for_org`, `person_type`), `source`, `source_id`, `canonical_id`, and `similarity_score`.
+
+#### POST /search-roles -- Search Roles
+
+Search normalized role/job titles.
+
+```bash
+curl -X POST http://localhost:8222/search-roles \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Chief Executive", "limit": 5}'
+```
+
+**Response:** Array of objects with `id`, `name`, and `score`.
+
+#### POST /search-locations -- Search Locations
+
+Search geographic locations.
+
+```bash
+curl -X POST http://localhost:8222/search-locations \
+  -H "Content-Type: application/json" \
+  -d '{"query": "California", "limit": 5}'
+```
+
+**Response:** Array of objects with `id`, `name`, and `score`.
+
+#### POST /resolve -- Resolve Entity
+
+Resolve an entity name to its canonical record from the database.
+
+```bash
+curl -X POST http://localhost:8222/resolve \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Apple Inc", "type": "org"}'
+```
+
+**Request body:**
+
+<table>
+  <thead>
+    <tr>
+      <th>Field</th>
+      <th>Type</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>name</code></td><td>string</td><td>required</td><td>Entity name to resolve</td></tr>
+    <tr><td><code>type</code></td><td>"org" | "person"</td><td>"org"</td><td>Entity type</td></tr>
+  </tbody>
+</table>
+
+**Response (org):** `ResolvedOrganization` object with `canonical_name`, `canonical_id`, `source`, `source_id`, `region`, and `match_confidence`. Returns `null` if no match found.
+
+**Response (person):** `PersonMatch` object or `null`.
+
+### Python Client
+
+<span id="python-client" />
+
+Use `EntityDBClient` to interact with the server from Python:
+
+```python
+from corp_entity_db.client import EntityDBClient
+
+client = EntityDBClient(server_url="http://localhost:8222")
+
+# Health check
+print(client.health())
+
+# Search
+orgs = client.search_organizations("Goldman Sachs", limit=5, hybrid=True)
+people = client.search_people("Warren Buffett", limit=3)
+roles = client.search_roles("Director", limit=5)
+locations = client.search_locations("London", limit=5)
+
+# Resolve
+resolved = client.resolve("Tesla Inc", type="org")
+```
+
+### RunPod Deployment
+
+<span id="runpod-deployment" />
+
+The entity database server can be deployed on RunPod serverless for scalable, pay-per-use search. The Docker image is lighter than the statement-extractor deployment since it does not require the T5-Gemma model.
+
+```bash
+cd runpod
+
+# Build for RunPod (Linux/amd64 required on Mac)
+docker build --platform linux/amd64 -t corp-entity-db-runpod .
+```
+
+The RunPod handler wraps the same FastAPI endpoints, making the API identical whether running locally or on RunPod.

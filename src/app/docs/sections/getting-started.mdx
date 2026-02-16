@@ -1,0 +1,156 @@
+## Getting Started
+
+<span id="getting-started" />
+
+### Installation
+
+<span id="installation" />
+
+```bash
+pip install corp-entity-db
+```
+
+The embedding model (`all-MiniLM-L6-v2`, 22M params) is downloaded automatically on first use. For full import capabilities, install with extras:
+
+```bash
+# Core library (search + resolve)
+pip install corp-entity-db
+
+# With import tools (GLEIF, SEC, Wikidata dump)
+pip install "corp-entity-db[importers]"
+
+# With fast import support (orjson, indexed_bzip2)
+pip install "corp-entity-db[fast-import]"
+```
+
+### Quick Start
+
+<span id="quick-start" />
+
+Search for organizations in the pre-built database:
+
+```python
+from corp_entity_db import OrganizationDatabase, CompanyEmbedder, download_database
+
+# Download the pre-built database (~500MB lite version)
+db_path = download_database()
+
+# Initialize the embedding model and database
+embedder = CompanyEmbedder()
+db = OrganizationDatabase(db_path=db_path, readonly=True)
+
+# Search by embedding similarity
+query_embedding = embedder.embed("Microsoft Corporation")
+results = db.search(query_embedding, top_k=5)
+
+for record, score in results:
+    print(f"{record.name} ({record.source}:{record.source_id}) — score: {score:.3f}")
+```
+
+Output:
+
+```
+MICROSOFT CORPORATION (gleif:WSGQFNP4W478JIHB1584) — score: 0.952
+Microsoft Corp (sec_edgar:789019) — score: 0.941
+MICROSOFT LIMITED (companies_house:01624297) — score: 0.893
+Microsoft Mobile Oy (gleif:549300TKJB0DCKBD4V57) — score: 0.847
+```
+
+**CLI quick start:**
+
+```bash
+# Download the database first
+corp-entity-db download
+
+# Search for organizations
+corp-entity-db search "Goldman Sachs"
+
+# Search for people
+corp-entity-db search-people "Tim Cook"
+
+# Show database statistics
+corp-entity-db status
+```
+
+### Using with statement-extractor
+
+<span id="using-with-statement-extractor" />
+
+`corp-entity-db` is the entity database backend for the `corp-extractor` statement extraction pipeline. When used together, the pipeline automatically qualifies extracted entities against the database:
+
+```python
+from statement_extractor.pipeline import ExtractionPipeline
+
+# The pipeline uses corp-entity-db internally for Stage 3 (Entity Qualification)
+pipeline = ExtractionPipeline()
+ctx = pipeline.process("Apple CEO Tim Cook announced...")
+
+# Entities are qualified with canonical IDs from the database
+for stmt in ctx.labeled_statements:
+    print(f"{stmt.subject_fqn} -> {stmt.statement.predicate} -> {stmt.object_fqn}")
+```
+
+### Requirements
+
+<span id="requirements" />
+
+<table>
+  <thead>
+    <tr>
+      <th>Dependency</th>
+      <th>Version</th>
+      <th>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Python</td>
+      <td>3.10+</td>
+      <td>Required</td>
+    </tr>
+    <tr>
+      <td>sentence-transformers</td>
+      <td>2.2+</td>
+      <td>Required, for embedding generation</td>
+    </tr>
+    <tr>
+      <td>USearch</td>
+      <td>2.0+</td>
+      <td>Required, for HNSW approximate nearest neighbor search</td>
+    </tr>
+    <tr>
+      <td>SQLite</td>
+      <td>3.35+</td>
+      <td>Required (bundled with Python)</td>
+    </tr>
+    <tr>
+      <td>sqlite-vec</td>
+      <td>latest</td>
+      <td>Required, SQLite vector extension</td>
+    </tr>
+    <tr>
+      <td>Pydantic</td>
+      <td>2.0+</td>
+      <td>Required, for data models</td>
+    </tr>
+    <tr>
+      <td>httpx</td>
+      <td>latest</td>
+      <td>Required, for server client and downloads</td>
+    </tr>
+    <tr>
+      <td>huggingface-hub</td>
+      <td>latest</td>
+      <td>Required, for database download/upload</td>
+    </tr>
+  </tbody>
+</table>
+
+**Hardware requirements:**
+
+- **RAM**: ~2GB for the embedding model + USearch indexes in memory
+- **Disk**: ~500MB for the lite database, ~8GB for the full database with embeddings
+- **CPU**: Any modern CPU works. No GPU required for search — only embedding generation.
+- **GPU**: Optional. Speeds up bulk embedding generation during imports.
+
+The library runs entirely locally with no external API dependencies.

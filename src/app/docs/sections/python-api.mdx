@@ -1,0 +1,311 @@
+## Python API
+
+<span id="python-api" />
+
+The `corp-entity-db` Python package provides database classes, embedding tools, hub utilities, and a resolver for entity qualification.
+
+### OrganizationDatabase
+
+<span id="organization-database" />
+
+The primary interface for searching organizations by embedding similarity.
+
+```python
+from corp_entity_db import OrganizationDatabase, CompanyEmbedder, get_database_path
+
+# Get the database path (auto-downloads if not present)
+db_path = get_database_path(auto_download=True)
+
+# Initialize (readonly mode uses immutable SQLite connection)
+db = OrganizationDatabase(db_path=db_path, readonly=True)
+
+# Get database statistics
+stats = db.get_stats()
+print(f"Total organizations: {stats.total_records}")
+print(f"By source: {stats.by_source}")
+
+# Search by embedding
+embedder = CompanyEmbedder()
+query_vec = embedder.embed("Apple Inc")
+results = db.search(query_vec, top_k=10)
+
+for record, score in results:
+    print(f"{record.name} ({record.source}:{record.source_id}) — {score:.3f}")
+
+# Hybrid search: text filtering + embedding similarity
+results = db.search(query_vec, top_k=10, query_text="Apple Inc")
+```
+
+**Singleton access** via `get_database()` avoids loading the database multiple times:
+
+```python
+from corp_entity_db import get_database
+
+db = get_database(db_path="/path/to/entities-v3.db", readonly=True)
+```
+
+### PersonDatabase
+
+<span id="person-database" />
+
+Search notable people with role and organization context.
+
+```python
+from corp_entity_db import get_person_database, CompanyEmbedder
+
+db = get_person_database(db_path=db_path, readonly=True)
+embedder = CompanyEmbedder()
+
+# Search for a person
+query_vec = embedder.embed("Tim Cook")
+results = db.search(query_vec, top_k=5, query_text="Tim Cook")
+
+for record, score in results:
+    print(f"{record.name} | {record.known_for_role} at {record.known_for_org}")
+    print(f"  Type: {record.person_type}, Score: {score:.3f}")
+    if record.is_historic:
+        print(f"  Historic: {record.birth_date} - {record.death_date}")
+```
+
+### RolesDatabase
+
+<span id="roles-database" />
+
+Search normalized job titles and roles.
+
+```python
+from corp_entity_db import RolesDatabase
+
+roles_db = RolesDatabase(db_path=db_path, readonly=True)
+
+# Search by name (text similarity)
+results = roles_db.search("CEO", top_k=5)
+for role_id, name, score in results:
+    print(f"{name} (id={role_id}, score={score:.3f})")
+```
+
+### LocationsDatabase
+
+<span id="locations-database" />
+
+Search geographic locations with hierarchy.
+
+```python
+from corp_entity_db import LocationsDatabase
+
+locations_db = LocationsDatabase(db_path=db_path, readonly=True)
+
+# Search locations
+results = locations_db.search("California", top_k=5)
+for loc_id, name, score in results:
+    print(f"{name} (id={loc_id}, score={score:.3f})")
+```
+
+### CompanyEmbedder
+
+<span id="company-embedder" />
+
+Wraps `sentence-transformers` for generating 768-dimensional embeddings using `all-MiniLM-L6-v2`.
+
+```python
+from corp_entity_db import CompanyEmbedder, get_embedder
+
+# Create a new instance
+embedder = CompanyEmbedder()
+
+# Or use the singleton (recommended)
+embedder = get_embedder()
+
+# Embed a single query
+vec = embedder.embed("Goldman Sachs Group Inc")
+print(f"Embedding dimension: {len(vec)}")  # 768
+
+# Access the embedding dimension
+print(embedder.embedding_dim)  # 768
+```
+
+### Hub Functions
+
+<span id="hub-functions" />
+
+Download and upload databases from [HuggingFace Hub](https://huggingface.co/Corp-o-Rate-Community/entity-references).
+
+```python
+from corp_entity_db import download_database, get_database_path, upload_database
+
+# Download pre-built database (lite version + USearch indexes)
+db_path = download_database()
+print(f"Downloaded to: {db_path}")
+
+# Get existing database path (no download)
+db_path = get_database_path(auto_download=False)
+
+# Get path with auto-download if missing
+db_path = get_database_path(auto_download=True)
+
+# Upload database with lite variant
+upload_database("/path/to/entities-v3.db")
+```
+
+### OrganizationResolver
+
+<span id="organization-resolver" />
+
+High-level resolver that wraps database lookup with caching and canonical ID generation. Used by the `corp-extractor` pipeline for entity qualification.
+
+```python
+from corp_entity_db import OrganizationResolver, get_organization_resolver
+
+# Create resolver with custom settings
+resolver = OrganizationResolver(
+    db_path="/path/to/entities-v3.db",
+    top_k=5,
+    min_similarity=0.7,
+)
+
+# Resolve an organization name
+result = resolver.resolve("Apple Inc")
+if result:
+    print(f"Canonical name: {result.canonical_name}")
+    print(f"Canonical ID: {result.canonical_id}")    # e.g., "LEI:HWUPKR0MPOU8FGXBT394"
+    print(f"Source: {result.source}")                 # e.g., "gleif"
+    print(f"Confidence: {result.match_confidence}")
+
+# Singleton access
+resolver = get_organization_resolver()
+```
+
+The resolver generates canonical IDs with source-specific prefixes:
+
+<table>
+  <thead>
+    <tr>
+      <th>Source</th>
+      <th>Prefix</th>
+      <th>Example</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>gleif</code></td><td><code>LEI</code></td><td><code>LEI:549300XYZ...</code></td></tr>
+    <tr><td><code>sec_edgar</code></td><td><code>SEC-CIK</code></td><td><code>SEC-CIK:789019</code></td></tr>
+    <tr><td><code>companies_house</code></td><td><code>UK-CH</code></td><td><code>UK-CH:01624297</code></td></tr>
+    <tr><td><code>wikidata</code></td><td><code>WIKIDATA</code></td><td><code>WIKIDATA:Q312</code></td></tr>
+  </tbody>
+</table>
+
+### Data Models
+
+<span id="data-models" />
+
+All models are Pydantic `BaseModel` subclasses.
+
+**CompanyRecord** -- An organization record:
+
+```python
+from corp_entity_db import CompanyRecord, EntityType
+
+record = CompanyRecord(
+    name="Apple Inc.",
+    source="gleif",
+    source_id="HWUPKR0MPOU8FGXBT394",
+    region="US",
+    entity_type=EntityType.BUSINESS,
+)
+print(record.canonical_id)  # "gleif:HWUPKR0MPOU8FGXBT394"
+```
+
+**PersonRecord** -- A person record with role context:
+
+```python
+from corp_entity_db import PersonRecord, PersonType
+
+record = PersonRecord(
+    name="Tim Cook",
+    source="wikidata",
+    source_id="Q265398",
+    person_type=PersonType.EXECUTIVE,
+    known_for_role="CEO",
+    known_for_org="Apple Inc.",
+    birth_date="1960-11-01",
+)
+print(record.canonical_id)   # "wikidata:Q265398"
+print(record.is_historic)    # False (no death_date)
+print(record.get_embedding_text())  # "Tim Cook | CEO | Apple Inc."
+```
+
+**CompanyMatch / PersonMatch** -- Search result wrappers:
+
+```python
+from corp_entity_db import CompanyMatch, PersonMatch
+
+# Created automatically by search operations
+match = CompanyMatch.from_record(
+    query_name="Apple",
+    record=record,
+    similarity_score=0.95,
+)
+print(f"{match.name} — {match.similarity_score:.3f}")
+```
+
+**ResolvedOrganization** -- Output of the resolver:
+
+```python
+from corp_entity_db import ResolvedOrganization
+
+resolved = ResolvedOrganization(
+    canonical_name="APPLE INC.",
+    canonical_id="LEI:HWUPKR0MPOU8FGXBT394",
+    source="gleif",
+    source_id="HWUPKR0MPOU8FGXBT394",
+    region="US",
+    match_confidence=0.95,
+)
+```
+
+**DatabaseStats** -- Database statistics:
+
+```python
+from corp_entity_db import DatabaseStats
+
+stats = DatabaseStats(
+    total_records=9700000,
+    by_source={"gleif": 3200000, "sec_edgar": 100000, "companies_house": 5500000},
+    embedding_dimension=768,
+    database_size_bytes=500_000_000,
+)
+```
+
+### EntityDBClient (Server Delegation)
+
+<span id="entity-db-client" />
+
+Delegate searches to a running `corp-entity-db serve` instance instead of loading models locally.
+
+```python
+from corp_entity_db.client import EntityDBClient
+
+client = EntityDBClient(server_url="http://localhost:8222")
+
+# Check server health
+health = client.health()
+print(f"Status: {health['status']}, Orgs: {health.get('org_count')}")
+
+# Search organizations
+matches = client.search_organizations("Microsoft", limit=5, hybrid=True)
+for m in matches:
+    print(f"{m['record']['name']} — {m['similarity_score']:.3f}")
+
+# Search people
+people = client.search_people("Tim Cook", limit=3)
+
+# Search roles
+roles = client.search_roles("CEO", limit=5)
+
+# Search locations
+locations = client.search_locations("California", limit=5)
+
+# Resolve an entity
+resolved = client.resolve("Apple Inc", type="org")
+if resolved:
+    print(f"Canonical: {resolved['canonical_name']}")
+```

@@ -1,0 +1,225 @@
+## Data Sources
+
+<span id="data-sources" />
+
+The entity database aggregates records from multiple authoritative data sources covering organizations, people, roles, and locations worldwide.
+
+### GLEIF (LEI Registry)
+
+<span id="gleif" />
+
+The Global Legal Entity Identifier Foundation maintains a registry of ~3.2M Legal Entity Identifiers (LEIs). Each LEI uniquely identifies a legal entity participating in financial transactions.
+
+```bash
+# Import all GLEIF records (~3.2M, downloads ~500MB)
+corp-entity-db import-gleif --download
+
+# Import with a limit for testing
+corp-entity-db import-gleif --download --limit 100000
+```
+
+**Data includes**: Legal name, headquarters country, entity status, registration dates, LEI code.
+
+### SEC EDGAR
+
+<span id="sec-edgar" />
+
+The U.S. Securities and Exchange Commission's EDGAR system provides bulk submission data for ~100K+ public company filers.
+
+```bash
+# Import SEC filers (~100K+, downloads ~200MB)
+corp-entity-db import-sec --download
+
+# Import with limit
+corp-entity-db import-sec --download --limit 50000
+```
+
+**Data includes**: Company name, CIK number, SIC code, state of incorporation, filing history.
+
+### SEC Form 4 (Insider Filings)
+
+<span id="sec-form4" />
+
+SEC Form 4 filings report insider ownership changes. The importer extracts officers and directors from these filings as person records.
+
+```bash
+# Import officers from Form 4 filings (2023 onwards)
+corp-entity-db import-sec-officers --start-year 2023 --limit 10000
+
+# Import with specific date range
+corp-entity-db import-sec-officers --start-year 2022 --end-year 2024
+```
+
+**Data includes**: Officer/director name, title, company CIK, filing date.
+
+### Companies House (UK)
+
+<span id="companies-house" />
+
+UK Companies House provides data on ~5.5M registered companies. The bulk download includes all active and recently dissolved companies.
+
+```bash
+# Import UK companies (~5.5M, downloads ~1GB)
+corp-entity-db import-companies-house --download
+
+# Import with limit
+corp-entity-db import-companies-house --download --limit 500000
+```
+
+**Data includes**: Company name, company number, incorporation date, registered address, SIC codes.
+
+### Companies House Officers
+
+<span id="companies-house-officers" />
+
+The Companies House officers dataset (Product 195) contains ~27.5M officer records for UK companies.
+
+```bash
+# Import from local officers zip file
+corp-entity-db import-ch-officers --file officers.zip --limit 10000
+
+# Process specific date range
+corp-entity-db import-ch-officers --file officers.zip --start-year 2020
+```
+
+**Data includes**: Officer name, role (director, secretary), appointed date, company number.
+
+### Wikidata (SPARQL)
+
+<span id="wikidata-sparql" />
+
+The Wikidata SPARQL endpoint provides structured data for organizations and notable people. Queries target 35+ entity types including companies, universities, government agencies, and more.
+
+```bash
+# Import organizations via SPARQL (may timeout for large queries)
+corp-entity-db import-wikidata --limit 50000
+
+# Import notable people by type
+corp-entity-db import-people --type executive --limit 5000
+corp-entity-db import-people --type politician --limit 5000
+corp-entity-db import-people --all --limit 10000
+
+# Skip existing records (faster re-runs)
+corp-entity-db import-people --type executive --skip-existing
+
+# Enrich with start/end dates for roles (slower, extra queries)
+corp-entity-db import-people --type executive --enrich-dates
+```
+
+> **Note**: SPARQL queries can timeout for large result sets. For comprehensive imports, use the Wikidata dump importer instead.
+
+### Wikidata Dump Import
+
+<span id="wikidata-dump" />
+
+For large-scale imports that avoid SPARQL timeouts, the dump importer processes the full Wikidata JSON dump (~100GB compressed). It uses a 3-thread parallel pipeline (reader, embedder, writer) for maximum throughput.
+
+```bash
+# Download and import (downloads ~100GB dump file)
+corp-entity-db import-wikidata-dump --download --limit 50000
+
+# Import only people
+corp-entity-db import-wikidata-dump --download --people --no-orgs --limit 100000
+
+# Import only organizations
+corp-entity-db import-wikidata-dump --download --orgs --no-people --limit 100000
+
+# Import only locations
+corp-entity-db import-wikidata-dump --download --locations --no-people --no-orgs
+
+# Use existing dump file (supports .bz2 and .zst)
+corp-entity-db import-wikidata-dump --dump /path/to/latest-all.json.bz2
+
+# Resume an interrupted import
+corp-entity-db import-wikidata-dump --dump dump.bz2 --resume
+
+# Skip records already in the database
+corp-entity-db import-wikidata-dump --dump dump.bz2 --skip-updates
+
+# Only import entities with English Wikipedia articles
+corp-entity-db import-wikidata-dump --download --require-enwiki
+```
+
+**Fast download with aria2c:** Install `aria2c` for 10-20x faster downloads:
+
+```bash
+brew install aria2   # macOS
+apt install aria2    # Ubuntu/Debian
+```
+
+**Advantages over SPARQL:**
+- No timeouts (processes locally)
+- Complete coverage (all notable people/orgs with English Wikipedia)
+- 3-thread parallel pipeline for fast import
+- Multi-record person import (one record per position+org, max 10 per person)
+- Extracts role dates from position qualifiers (P580/P582)
+- Reverse org-to-person mappings (P169 CEO, P488 chairperson)
+- Auto-canonicalization at end of import
+- Supports `.bz2` and `.zst`/`.zstd` compressed dumps
+
+**Download location:** `~/.cache/corp-extractor/wikidata-latest-all.json.bz2`
+
+### Import Summary
+
+<span id="import-summary" />
+
+<table>
+  <thead>
+    <tr>
+      <th>Source</th>
+      <th>Command</th>
+      <th>Records</th>
+      <th>Entity Types</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>GLEIF</td>
+      <td><code>import-gleif --download</code></td>
+      <td>~3.2M</td>
+      <td>Organizations</td>
+    </tr>
+    <tr>
+      <td>SEC EDGAR</td>
+      <td><code>import-sec --download</code></td>
+      <td>~100K+</td>
+      <td>Organizations</td>
+    </tr>
+    <tr>
+      <td>SEC Form 4</td>
+      <td><code>import-sec-officers</code></td>
+      <td>Variable</td>
+      <td>People</td>
+    </tr>
+    <tr>
+      <td>Companies House</td>
+      <td><code>import-companies-house --download</code></td>
+      <td>~5.5M</td>
+      <td>Organizations</td>
+    </tr>
+    <tr>
+      <td>CH Officers</td>
+      <td><code>import-ch-officers --file ...</code></td>
+      <td>~27.5M</td>
+      <td>People</td>
+    </tr>
+    <tr>
+      <td>Wikidata (SPARQL)</td>
+      <td><code>import-wikidata</code></td>
+      <td>Variable</td>
+      <td>Organizations</td>
+    </tr>
+    <tr>
+      <td>Wikidata People</td>
+      <td><code>import-people --all</code></td>
+      <td>Variable</td>
+      <td>People</td>
+    </tr>
+    <tr>
+      <td>Wikidata Dump</td>
+      <td><code>import-wikidata-dump --download</code></td>
+      <td>Millions</td>
+      <td>Orgs, People, Locations</td>
+    </tr>
+  </tbody>
+</table>

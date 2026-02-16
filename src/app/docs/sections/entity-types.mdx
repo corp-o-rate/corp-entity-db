@@ -1,0 +1,126 @@
+## Entity Types
+
+<span id="entity-types" />
+
+The entity database classifies organizations, people, and locations into typed categories for filtering and disambiguation.
+
+### Organization Types
+
+<span id="organization-types" />
+
+<table>
+  <thead>
+    <tr>
+      <th>EntityType</th>
+      <th>Description</th>
+      <th>Examples</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>business</code></td><td>Commercial companies</td><td>Apple Inc., Amazon, Toyota</td></tr>
+    <tr><td><code>fund</code></td><td>Investment funds, ETFs, mutual funds</td><td>Vanguard S&P 500 ETF, BlackRock Fund</td></tr>
+    <tr><td><code>branch</code></td><td>Branch offices of companies</td><td>Deutsche Bank London, HSBC Singapore</td></tr>
+    <tr><td><code>nonprofit</code></td><td>Non-profit organizations</td><td>Red Cross, Salvation Army</td></tr>
+    <tr><td><code>ngo</code></td><td>Non-governmental organizations</td><td>Greenpeace, Amnesty International</td></tr>
+    <tr><td><code>foundation</code></td><td>Charitable foundations</td><td>Gates Foundation, Ford Foundation</td></tr>
+    <tr><td><code>government</code></td><td>Government agencies</td><td>SEC, FDA, HMRC</td></tr>
+    <tr><td><code>international_org</code></td><td>International organizations</td><td>UN, WHO, IMF, NATO</td></tr>
+    <tr><td><code>educational</code></td><td>Schools, universities</td><td>MIT, Stanford, Oxford</td></tr>
+    <tr><td><code>research</code></td><td>Research institutes</td><td>CERN, NIH, Max Planck</td></tr>
+    <tr><td><code>healthcare</code></td><td>Hospitals, health organizations</td><td>Mayo Clinic, NHS Trust</td></tr>
+    <tr><td><code>media</code></td><td>Studios, publishers, record labels</td><td>Warner Bros, BBC, Spotify</td></tr>
+    <tr><td><code>sports</code></td><td>Sports clubs and teams</td><td>Manchester United, LA Lakers</td></tr>
+    <tr><td><code>political_party</code></td><td>Political parties</td><td>Democratic Party, Labour Party</td></tr>
+    <tr><td><code>trade_union</code></td><td>Labor unions</td><td>AFL-CIO, Unite the Union</td></tr>
+    <tr><td><code>religious</code></td><td>Religious organizations</td><td>Catholic Church, Islamic Foundation</td></tr>
+    <tr><td><code>unknown</code></td><td>Type not determined</td><td>Newly imported, unclassified</td></tr>
+  </tbody>
+</table>
+
+Organization types are stored in the `organization_types` lookup table and referenced by integer FK from the `organizations` table.
+
+### Person Types
+
+<span id="person-types" />
+
+<table>
+  <thead>
+    <tr>
+      <th>PersonType</th>
+      <th>Description</th>
+      <th>Examples</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>executive</code></td><td>C-suite, board members</td><td>Tim Cook, Satya Nadella</td></tr>
+    <tr><td><code>politician</code></td><td>Elected officials (presidents, MPs, mayors)</td><td>Joe Biden, Angela Merkel</td></tr>
+    <tr><td><code>government</code></td><td>Civil servants, diplomats, appointed officials</td><td>Ambassadors, agency heads</td></tr>
+    <tr><td><code>military</code></td><td>Military officers, armed forces personnel</td><td>Generals, admirals</td></tr>
+    <tr><td><code>legal</code></td><td>Judges, lawyers, legal professionals</td><td>Supreme Court justices</td></tr>
+    <tr><td><code>professional</code></td><td>Known for profession (doctors, engineers)</td><td>Famous surgeons, architects</td></tr>
+    <tr><td><code>athlete</code></td><td>Sports figures</td><td>LeBron James, Lionel Messi</td></tr>
+    <tr><td><code>artist</code></td><td>Traditional creatives (musicians, actors, painters)</td><td>Tom Hanks, Taylor Swift</td></tr>
+    <tr><td><code>media</code></td><td>Internet/social media personalities</td><td>YouTubers, influencers, podcasters</td></tr>
+    <tr><td><code>academic</code></td><td>Professors, researchers</td><td>Neil deGrasse Tyson</td></tr>
+    <tr><td><code>scientist</code></td><td>Scientists, inventors</td><td>Research scientists</td></tr>
+    <tr><td><code>journalist</code></td><td>Reporters, news presenters</td><td>Anderson Cooper</td></tr>
+    <tr><td><code>entrepreneur</code></td><td>Founders, business owners</td><td>Mark Zuckerberg</td></tr>
+    <tr><td><code>activist</code></td><td>Advocates, campaigners</td><td>Greta Thunberg</td></tr>
+    <tr><td><code>unknown</code></td><td>Type not determined</td><td>Newly imported, unclassified</td></tr>
+  </tbody>
+</table>
+
+Person records include `birth_date` and `death_date` fields. The `is_historic` property returns `True` for deceased individuals. A single person can have multiple records with different role/org combinations (unique on `source_id + role + org`).
+
+### Location Types
+
+<span id="location-types" />
+
+Locations use a two-level type system: a detailed `location_type` string (from Wikidata, e.g. `us_state`, `sovereign_state`) and a `simplified_type` enum for easy filtering.
+
+<table>
+  <thead>
+    <tr>
+      <th>SimplifiedLocationType</th>
+      <th>Description</th>
+      <th>Examples</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>continent</code></td><td>Continents</td><td>Europe, Asia, Africa</td></tr>
+    <tr><td><code>country</code></td><td>Countries and sovereign states</td><td>United States, Germany, Japan</td></tr>
+    <tr><td><code>subdivision</code></td><td>States, provinces, regions</td><td>California, Bavaria, Ontario</td></tr>
+    <tr><td><code>city</code></td><td>Cities, towns, municipalities</td><td>New York, London, Tokyo</td></tr>
+    <tr><td><code>district</code></td><td>Districts, boroughs</td><td>Manhattan, Westminster</td></tr>
+    <tr><td><code>historic</code></td><td>Former countries, historic territories</td><td>Soviet Union, Czechoslovakia</td></tr>
+    <tr><td><code>other</code></td><td>Unclassified</td><td>Miscellaneous locations</td></tr>
+  </tbody>
+</table>
+
+Locations include hierarchical `parent_ids` for navigating the geographic hierarchy (e.g., a city points to its state, which points to its country).
+
+### Source Types
+
+<span id="source-types" />
+
+Every record tracks its data provenance:
+
+<table>
+  <thead>
+    <tr>
+      <th>Source</th>
+      <th>Entity Types</th>
+      <th>Identifier Format</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>gleif</code></td><td>Organizations</td><td>LEI (20-char alphanumeric, e.g. <code>549300XYZ...</code>)</td></tr>
+    <tr><td><code>sec_edgar</code></td><td>Organizations, People</td><td>CIK (integer, e.g. <code>789019</code>)</td></tr>
+    <tr><td><code>companies_house</code></td><td>Organizations, People</td><td>Company number (e.g. <code>01624297</code>)</td></tr>
+    <tr><td><code>wikidata</code></td><td>Organizations, People, Roles, Locations</td><td>QID (e.g. <code>Q312</code>)</td></tr>
+    <tr><td><code>sec_form4</code></td><td>People</td><td>CIK of the reporting person</td></tr>
+    <tr><td><code>companies_house_officers</code></td><td>People</td><td>Officer ID from Companies House</td></tr>
+  </tbody>
+</table>
+
+Records from different sources can be linked via **canonicalization**, which identifies equivalent entities across sources and stores the link in the `canonical_id` foreign key column.

@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm lint:*)",
+      "Bash(pnpm build:*)",
+      "Bash(pnpm add:*)",
+      "Bash(pnpm remove:*)",
+      "Bash(uv run pytest:*)",
+      "Bash(uv run python:*)",
+      "Bash(uv run python3:*)",
+      "Bash(uv run corp-entity-db:*)",
+      "Bash(uv sync:*)",
+      "Bash(uv build:*)",
+      "Bash(uv publish)",
+      "Bash(uv pip install:*)",
+      "Bash(uv add:*)",
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "Bash(ls:*)",
+      "Bash(wc:*)",
+      "Bash(git add:*)",
+      "Bash(git diff:*)",
+      "Bash(git commit:*)",
+      "Bash(sqlite3:*)",
+      "Bash(find:*)",
+      "Bash(pip index:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:docs.runpod.io)",
+      "WebFetch(domain:www.wikidata.org)",
+      "WebFetch(domain:query.wikidata.org)",
+      "WebFetch(domain:www.sec.gov)",
+      "WebFetch(domain:download.companieshouse.gov.uk)",
+      "WebFetch(domain:cas-bridge.xethub.hf.co)"
+    ]
+  }
+}

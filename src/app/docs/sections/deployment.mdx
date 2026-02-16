@@ -1,0 +1,148 @@
+## Deployment
+
+<span id="deployment" />
+
+### Local Usage
+
+<span id="local-usage" />
+
+The simplest deployment is running everything locally. The library downloads models and databases automatically on first use.
+
+**Hardware requirements:**
+
+<table>
+  <thead>
+    <tr>
+      <th>Component</th>
+      <th>Requirement</th>
+      <th>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>RAM</td>
+      <td>~2GB minimum</td>
+      <td>Embedding model (~200MB) + USearch indexes in memory</td>
+    </tr>
+    <tr>
+      <td>Disk (lite DB)</td>
+      <td>~500MB</td>
+      <td>Default download: lite DB + USearch indexes</td>
+    </tr>
+    <tr>
+      <td>Disk (full DB)</td>
+      <td>~8GB</td>
+      <td>Full DB with all embedding tables</td>
+    </tr>
+    <tr>
+      <td>Disk (indexes)</td>
+      <td>~21GB</td>
+      <td>USearch HNSW indexes (orgs + people)</td>
+    </tr>
+    <tr>
+      <td>CPU</td>
+      <td>Any modern CPU</td>
+      <td>No GPU required for search</td>
+    </tr>
+  </tbody>
+</table>
+
+```bash
+# Install
+pip install corp-entity-db
+
+# Download database + indexes
+corp-entity-db download
+
+# Start searching
+corp-entity-db search "Microsoft"
+```
+
+For Python usage, the database auto-downloads on first access:
+
+```python
+from corp_entity_db import get_database_path, OrganizationDatabase, CompanyEmbedder
+
+# Auto-downloads if not present
+db_path = get_database_path(auto_download=True)
+db = OrganizationDatabase(db_path=db_path, readonly=True)
+```
+
+### Server Mode
+
+<span id="server-mode" />
+
+For repeated searches, run the server to keep models warm in memory:
+
+```bash
+# Start the server
+corp-entity-db serve --port 8222
+
+# In another terminal, or from Python
+curl http://localhost:8222/search -d '{"query":"Apple","limit":5}' -H "Content-Type: application/json"
+```
+
+Server mode is ideal for:
+- CLI scripts that make many searches
+- Web applications that need low-latency lookups
+- Multi-process environments where you want a single model instance
+- Integration with the `corp-extractor` pipeline
+
+### RunPod Serverless
+
+<span id="runpod-serverless" />
+
+For scalable, pay-per-use deployment, the entity database can run on RunPod serverless infrastructure.
+
+```bash
+cd runpod
+
+# Build the Docker image (Linux/amd64 required on Mac)
+docker build --platform linux/amd64 -t corp-entity-db-runpod .
+
+# Push to your registry
+docker tag corp-entity-db-runpod your-registry/corp-entity-db-runpod:latest
+docker push your-registry/corp-entity-db-runpod:latest
+```
+
+The RunPod image includes:
+- The `corp-entity-db` library
+- Pre-downloaded embedding model
+- The lite database + USearch indexes
+
+Configure your RunPod endpoint with:
+- **GPU**: Not required (CPU is sufficient for search)
+- **Min workers**: 0 (scale to zero when idle)
+- **Max workers**: As needed for throughput
+- **Volume**: Optional (databases can be baked into the image)
+
+### Docker Setup
+
+<span id="docker-setup" />
+
+For self-hosted Docker deployments:
+
+```bash
+# Minimal Dockerfile
+FROM python:3.12-slim
+
+# Install the library
+RUN pip install corp-entity-db
+
+# Download database on build (bakes it into the image)
+RUN corp-entity-db download
+
+# Expose the server port
+EXPOSE 8222
+
+# Run the server
+CMD ["corp-entity-db", "serve", "--host", "0.0.0.0", "--port", "8222"]
+```
+
+The Docker image is significantly lighter than the `corp-extractor` deployment because it does not require the T5-Gemma model (~1.5GB) or GLiNER2 (~200MB). The main size contributors are:
+- Python + dependencies (~500MB)
+- Embedding model (~200MB)
+- Lite database (~500MB)
+- USearch indexes (~21GB for full coverage, or smaller for subset)
+
+For a smaller footprint, consider building a database with only the sources you need and generating indexes for just those records.

@@ -1,0 +1,342 @@
+## Command Line Interface
+
+<span id="cli" />
+
+The `corp-entity-db` CLI provides commands for searching, importing, and managing the entity database.
+
+### Commands Overview
+
+<span id="commands-overview" />
+
+<table>
+  <thead>
+    <tr>
+      <th>Command</th>
+      <th>Description</th>
+      <th>Use Case</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>search</code></td>
+      <td>Search organizations</td>
+      <td>Find orgs by name with embedding similarity</td>
+    </tr>
+    <tr>
+      <td><code>search-people</code></td>
+      <td>Search people</td>
+      <td>Find people with role/org context</td>
+    </tr>
+    <tr>
+      <td><code>search-roles</code></td>
+      <td>Search roles/job titles</td>
+      <td>Find normalized role names</td>
+    </tr>
+    <tr>
+      <td><code>search-locations</code></td>
+      <td>Search locations</td>
+      <td>Find countries, states, cities</td>
+    </tr>
+    <tr>
+      <td><code>status</code></td>
+      <td>Database statistics</td>
+      <td>Record counts, schema version, sources</td>
+    </tr>
+    <tr>
+      <td><code>serve</code></td>
+      <td>Persistent server</td>
+      <td>Keep databases warm for fast repeated use</td>
+    </tr>
+    <tr>
+      <td><code>import-gleif</code></td>
+      <td>Import GLEIF data</td>
+      <td>~3.2M LEI records</td>
+    </tr>
+    <tr>
+      <td><code>import-sec</code></td>
+      <td>Import SEC EDGAR</td>
+      <td>~100K+ public filers</td>
+    </tr>
+    <tr>
+      <td><code>import-sec-officers</code></td>
+      <td>Import SEC Form 4</td>
+      <td>Officers/directors from insider filings</td>
+    </tr>
+    <tr>
+      <td><code>import-ch-officers</code></td>
+      <td>Import CH officers</td>
+      <td>~27.5M UK company officers</td>
+    </tr>
+    <tr>
+      <td><code>import-companies-house</code></td>
+      <td>Import Companies House</td>
+      <td>~5.5M UK companies</td>
+    </tr>
+    <tr>
+      <td><code>import-wikidata</code></td>
+      <td>Import via SPARQL</td>
+      <td>Organizations from Wikidata</td>
+    </tr>
+    <tr>
+      <td><code>import-people</code></td>
+      <td>Import people via SPARQL</td>
+      <td>Notable people by type</td>
+    </tr>
+    <tr>
+      <td><code>import-wikidata-dump</code></td>
+      <td>Import from dump</td>
+      <td>Full Wikidata JSON dump (recommended)</td>
+    </tr>
+    <tr>
+      <td><code>download</code></td>
+      <td>Download from HuggingFace</td>
+      <td>Get pre-built database + USearch indexes</td>
+    </tr>
+    <tr>
+      <td><code>upload</code></td>
+      <td>Upload to HuggingFace</td>
+      <td>Publish database with lite variant</td>
+    </tr>
+    <tr>
+      <td><code>post-import</code></td>
+      <td>Post-import processing</td>
+      <td>Generate embeddings, build indexes, VACUUM</td>
+    </tr>
+    <tr>
+      <td><code>build-index</code></td>
+      <td>Build USearch index</td>
+      <td>Rebuild HNSW index from embeddings</td>
+    </tr>
+    <tr>
+      <td><code>canonicalize</code></td>
+      <td>Cross-source linking</td>
+      <td>Link equivalent records across sources</td>
+    </tr>
+    <tr>
+      <td><code>create-lite</code></td>
+      <td>Create lite database</td>
+      <td>Strip embeddings for smaller download</td>
+    </tr>
+  </tbody>
+</table>
+
+### Global Options
+
+<span id="global-options" />
+
+<table>
+  <thead>
+    <tr>
+      <th>Option</th>
+      <th>Description</th>
+      <th>Default</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>--db-version N</code></td>
+      <td>Database schema version for filenames</td>
+      <td>latest (3)</td>
+    </tr>
+    <tr>
+      <td><code>-v, --verbose</code></td>
+      <td>Verbose logging output</td>
+      <td>off</td>
+    </tr>
+    <tr>
+      <td><code>--version</code></td>
+      <td>Show version number</td>
+      <td>--</td>
+    </tr>
+  </tbody>
+</table>
+
+```bash
+# Use v2 filenames for backwards compatibility
+corp-entity-db --db-version=2 download
+
+# Verbose output to see skipped records during import
+corp-entity-db -v import-people --type executive
+```
+
+---
+
+### Search Commands
+
+<span id="search-commands" />
+
+#### Search Organizations
+
+```bash
+# Basic search (USearch HNSW)
+corp-entity-db search "Microsoft"
+
+# Hybrid search (text filtering + embeddings)
+corp-entity-db search "Microsoft" --hybrid
+
+# Filter by source
+corp-entity-db search "Barclays" --source companies_house
+
+# Adjust result count
+corp-entity-db search "Goldman Sachs" --top-k 10
+```
+
+#### Search People
+
+```bash
+# Search by name (embedding similarity)
+corp-entity-db search-people "Tim Cook"
+
+# Hybrid search
+corp-entity-db search-people "Tim Cook" --hybrid
+
+# Limit results
+corp-entity-db search-people "Elon Musk" --top-k 5
+```
+
+#### Search Roles
+
+```bash
+# Search for role titles
+corp-entity-db search-roles "CEO"
+corp-entity-db search-roles "Chief Financial Officer"
+```
+
+#### Search Locations
+
+```bash
+# Search locations
+corp-entity-db search-locations "California"
+corp-entity-db search-locations "Germany" --type country
+```
+
+---
+
+### Import Commands
+
+<span id="import-commands" />
+
+All import commands accept `--db PATH` to specify a custom database path and `--limit N` to cap the number of records imported.
+
+```bash
+# Organization imports
+corp-entity-db import-gleif --download
+corp-entity-db import-sec --download
+corp-entity-db import-companies-house --download
+corp-entity-db import-wikidata --limit 50000
+
+# People imports
+corp-entity-db import-people --type executive --limit 5000
+corp-entity-db import-people --all --skip-existing
+corp-entity-db import-sec-officers --start-year 2023 --limit 10000
+corp-entity-db import-ch-officers --file officers.zip --limit 10000
+
+# Wikidata dump import (recommended for large imports)
+corp-entity-db import-wikidata-dump --download --limit 50000
+corp-entity-db import-wikidata-dump --dump /path/to/dump.bz2 --people --no-orgs
+corp-entity-db import-wikidata-dump --dump dump.bz2 --locations --no-people --no-orgs
+corp-entity-db import-wikidata-dump --dump dump.bz2 --resume
+```
+
+---
+
+### Management Commands
+
+<span id="management-commands" />
+
+```bash
+# Show database statistics (record counts, schema version, sources)
+corp-entity-db status
+
+# Output schema and enum tables in LLM-friendly format
+corp-entity-db status --for-llm
+
+# Download pre-built database from HuggingFace (lite + USearch indexes)
+corp-entity-db download
+
+# Download full database (includes embedding tables)
+corp-entity-db download --full
+
+# Upload database with lite variant and USearch indexes
+corp-entity-db upload
+
+# Post-import: generate embeddings, build USearch indexes, VACUUM
+corp-entity-db post-import
+corp-entity-db post-import --no-orgs    # People only
+
+# Build USearch HNSW index from embeddings
+corp-entity-db build-index
+
+# Link equivalent records across data sources
+corp-entity-db canonicalize
+
+# Create lite database (drop embedding tables)
+corp-entity-db create-lite entities-v3.db
+
+# Migrate from v1 to v2 schema
+corp-entity-db migrate-v2 entities.db entities-v2.db
+
+# Generate int8 scalar embeddings (75% smaller, ~92% recall)
+corp-entity-db backfill-scalar
+```
+
+---
+
+### Serve Command
+
+<span id="serve-command" />
+
+The `serve` command starts a persistent FastAPI server that keeps databases and the embedding model warm in memory. This eliminates the ~5-10s startup cost for repeated CLI or API calls.
+
+```bash
+# Start the server (default: 0.0.0.0:8222)
+corp-entity-db serve
+
+# Custom host and port
+corp-entity-db serve --host 127.0.0.1 --port 9000
+
+# Skip eager model loading
+corp-entity-db serve --no-warmup
+
+# Verbose logging
+corp-entity-db serve -v
+```
+
+<table>
+  <thead>
+    <tr>
+      <th>Option</th>
+      <th>Description</th>
+      <th>Default</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>--host</code></td>
+      <td>Bind address</td>
+      <td>0.0.0.0</td>
+    </tr>
+    <tr>
+      <td><code>--port</code></td>
+      <td>Port number</td>
+      <td>8222</td>
+    </tr>
+    <tr>
+      <td><code>--no-warmup</code></td>
+      <td>Skip eager loading (lazy on first request)</td>
+      <td>--</td>
+    </tr>
+    <tr>
+      <td><code>--db PATH</code></td>
+      <td>Database file path</td>
+      <td>auto-detect</td>
+    </tr>
+    <tr>
+      <td><code>-v, --verbose</code></td>
+      <td>Debug logging</td>
+      <td>off</td>
+    </tr>
+  </tbody>
+</table>
+
+Once the server is running, you can use the Python `EntityDBClient` or make HTTP requests directly. See [Server API](#server-api) for endpoint details.
