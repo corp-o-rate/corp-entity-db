@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #000000;
+  --text-muted: #4B5563;
+  --text-secondary: #6B7280;
+  --cta: #DC2626;
+  --cta-hover: #B91C1C;
+  --border: #e5e7eb;
+  --border-dark: #000000;
+
+  /* Entity type colors */
+  --type-business: #3b82f6;
+  --type-fund: #6366f1;
+  --type-government: #dc2626;
+  --type-nonprofit: #10b981;
+  --type-educational: #f59e0b;
+  --type-executive: #8b5cf6;
+  --type-politician: #ef4444;
+  --type-athlete: #06b6d4;
+  --type-artist: #ec4899;
+  --type-default: #6b7280;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+  position: relative;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-image:
+    linear-gradient(90deg, rgba(0,0,0,0.02) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(0,0,0,0.02) 1px, transparent 1px);
+  background-size: 30px 30px;
+  opacity: 0.5;
+  z-index: -1;
+  pointer-events: none;
+}
+
+/* Loading spinner */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  animation: spin 1s linear infinite;
+}
