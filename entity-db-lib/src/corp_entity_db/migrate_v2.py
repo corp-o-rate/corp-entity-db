@@ -8,15 +8,12 @@ Usage:
     corp-extractor db migrate-v2 entities.db entities-v2.db
 """
 
-import json
 import logging
-import re
 import sqlite3
 from pathlib import Path
 from typing import Optional
 
 import pycountry
-import sqlite_vec
 
 from .schema_v2 import create_all_tables
 from .seed_data import (
@@ -75,7 +72,7 @@ class DatabaseMigrator:
     - Migrating organizations with FK resolution
     - Migrating people with FK resolution
     - Converting QIDs from TEXT to INTEGER
-    - Preserving embeddings
+    - Skipping embeddings (v1 vec0 tables require sqlite-vec; run post-import to regenerate)
     """
 
     def __init__(
@@ -128,19 +125,9 @@ class DatabaseMigrator:
         source_conn = sqlite3.connect(str(self.source_path))
         source_conn.row_factory = sqlite3.Row
 
-        # Load sqlite-vec for source (needed to read embedding virtual tables)
-        source_conn.enable_load_extension(True)
-        sqlite_vec.load(source_conn)
-        source_conn.enable_load_extension(False)
-
         self.target_path.parent.mkdir(parents=True, exist_ok=True)
         target_conn = sqlite3.connect(str(self.target_path))
         target_conn.row_factory = sqlite3.Row
-
-        # Load sqlite-vec for target
-        target_conn.enable_load_extension(True)
-        sqlite_vec.load(target_conn)
-        target_conn.enable_load_extension(False)
 
         try:
             stats = self._run_migration(source_conn, target_conn, batch_size)
@@ -204,8 +191,6 @@ class DatabaseMigrator:
             stats["organizations"] = self._migrate_organizations(source, target, batch_size)
         else:
             logger.info("Step 5: Skipped (organizations already migrated)")
-            # Rebuild ID mapping for embedding migration
-            self._rebuild_org_id_mapping(source, target)
 
         # Step 6: Migrate people
         if start_step <= 6:
@@ -213,22 +198,10 @@ class DatabaseMigrator:
             stats["people"] = self._migrate_people(source, target, batch_size)
         else:
             logger.info("Step 6: Skipped (people already migrated)")
-            # Rebuild ID mapping for embedding migration
-            self._rebuild_person_id_mapping(source, target)
 
-        # Step 7: Migrate organization embeddings
-        if start_step <= 7:
-            logger.info("Step 7: Migrating organization embeddings...")
-            stats["org_embeddings"] = self._migrate_org_embeddings(source, target, batch_size)
-        else:
-            logger.info("Step 7: Skipped (organization embeddings already migrated)")
-
-        # Step 8: Migrate person embeddings
-        if start_step <= 8:
-            logger.info("Step 8: Migrating person embeddings...")
-            stats["person_embeddings"] = self._migrate_person_embeddings(source, target, batch_size)
-        else:
-            logger.info("Step 8: Skipped (person embeddings already migrated)")
+        # Steps 7-8: Embedding migration skipped (v1 vec0 tables require sqlite-vec)
+        logger.info("Step 7-8: Skipping embedding migration (v1 vec0 tables require sqlite-vec to read)")
+        logger.info("Run `corp-entity-db migrate-embeddings` to copy vec0 embeddings to the new column")
 
         # Vacuum to optimize
         logger.info("Step 9: Optimizing database...")
@@ -243,30 +216,14 @@ class DatabaseMigrator:
         Returns:
             Step number to resume from (1-9)
         """
-        # Check if organization_embeddings has data
-        try:
-            cursor = target.execute("SELECT COUNT(*) FROM organization_embeddings")
-            if cursor.fetchone()[0] > 0:
-                # Check person embeddings
-                cursor = target.execute("SELECT COUNT(*) FROM person_embeddings")
-                if cursor.fetchone()[0] > 0:
-                    return 9  # All done, just vacuum
-                return 8  # Person embeddings pending
-            # Org embeddings empty, check if organizations exist
-            cursor = target.execute("SELECT COUNT(*) FROM organizations")
-            if cursor.fetchone()[0] > 0:
-                return 7  # Org embeddings pending
-        except sqlite3.OperationalError:
-            pass
-
-        # Check if organizations table has data
+        # Check if organizations and people have been migrated
         try:
             cursor = target.execute("SELECT COUNT(*) FROM organizations")
             if cursor.fetchone()[0] > 0:
                 # Check if people exist
                 cursor = target.execute("SELECT COUNT(*) FROM people")
                 if cursor.fetchone()[0] > 0:
-                    return 7  # Ready for embeddings
+                    return 9  # All data migrated, just vacuum (embeddings handled by migrate-embeddings)
                 return 6  # People pending
         except sqlite3.OperationalError:
             pass
@@ -303,68 +260,6 @@ class DatabaseMigrator:
             pass
 
         return 1  # Start from beginning
-
-    def _rebuild_org_id_mapping(
-        self,
-        source: sqlite3.Connection,
-        target: sqlite3.Connection,
-    ) -> None:
-        """Rebuild organization ID mapping for embedding migration when resuming."""
-        logger.info("Rebuilding organization ID mapping...")
-
-        self._org_id_mapping = {}
-
-        # Get all source organizations with their IDs and source_ids
-        source_cursor = source.execute(
-            "SELECT id, source_id FROM organizations"
-        )
-
-        for row in source_cursor:
-            old_id = row["id"]
-            source_identifier = row["source_id"]
-
-            if source_identifier:
-                # Look up in target by source_identifier
-                target_cursor = target.execute(
-                    "SELECT id FROM organizations WHERE source_identifier = ?",
-                    (source_identifier,)
-                )
-                target_row = target_cursor.fetchone()
-                if target_row:
-                    self._org_id_mapping[old_id] = target_row["id"]
-
-        logger.info(f"Rebuilt mapping for {len(self._org_id_mapping)} organizations")
-
-    def _rebuild_person_id_mapping(
-        self,
-        source: sqlite3.Connection,
-        target: sqlite3.Connection,
-    ) -> None:
-        """Rebuild person ID mapping for embedding migration when resuming."""
-        logger.info("Rebuilding person ID mapping...")
-
-        self._person_id_mapping = {}
-
-        # Get all source people with their IDs and source_ids
-        source_cursor = source.execute(
-            "SELECT id, source_id FROM people"
-        )
-
-        for row in source_cursor:
-            old_id = row["id"]
-            source_identifier = row["source_id"]
-
-            if source_identifier:
-                # Look up in target by source_identifier
-                target_cursor = target.execute(
-                    "SELECT id FROM people WHERE source_identifier = ?",
-                    (source_identifier,)
-                )
-                target_row = target_cursor.fetchone()
-                if target_row:
-                    self._person_id_mapping[old_id] = target_row["id"]
-
-        logger.info(f"Rebuilt mapping for {len(self._person_id_mapping)} people")
 
     def _build_location_cache(self, conn: sqlite3.Connection) -> None:
         """Build location lookup cache from existing locations."""
@@ -622,7 +517,7 @@ class DatabaseMigrator:
         target.commit()
         logger.info(f"Migrated {count} organizations")
 
-        # Store ID mapping for embedding migration
+        # Store ID mapping for people migration (known_for_org_id resolution)
         self._org_id_mapping = id_mapping
         return count
 
@@ -740,93 +635,7 @@ class DatabaseMigrator:
 
         target.commit()
         logger.info(f"Migrated {count} people")
-
-        # Store ID mapping for embedding migration
-        self._person_id_mapping = id_mapping
         return count
-
-    def _migrate_org_embeddings(
-        self,
-        source: sqlite3.Connection,
-        target: sqlite3.Connection,
-        batch_size: int,
-    ) -> int:
-        """Migrate organization embeddings using ID mapping."""
-        # Check if source has embeddings table
-        cursor = source.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='organization_embeddings'"
-        )
-        if not cursor.fetchone():
-            logger.info("No organization_embeddings table in source, skipping")
-            return 0
-
-        if not hasattr(self, "_org_id_mapping"):
-            logger.warning("No org ID mapping available, skipping embedding migration")
-            return 0
-
-        cursor = source.execute("SELECT org_id, embedding FROM organization_embeddings")
-        count = 0
-
-        for row in cursor:
-            old_id = row["org_id"]
-            new_id = self._org_id_mapping.get(old_id)
-
-            if new_id is not None:
-                target.execute(
-                    "INSERT OR REPLACE INTO organization_embeddings (org_id, embedding) VALUES (?, ?)",
-                    (new_id, row["embedding"])
-                )
-                count += 1
-
-                if count % batch_size == 0:
-                    target.commit()
-                    logger.info(f"  Migrated {count} organization embeddings...")
-
-        target.commit()
-        logger.info(f"Migrated {count} organization embeddings")
-        return count
-
-    def _migrate_person_embeddings(
-        self,
-        source: sqlite3.Connection,
-        target: sqlite3.Connection,
-        batch_size: int,
-    ) -> int:
-        """Migrate person embeddings using ID mapping."""
-        # Check if source has embeddings table
-        cursor = source.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='person_embeddings'"
-        )
-        if not cursor.fetchone():
-            logger.info("No person_embeddings table in source, skipping")
-            return 0
-
-        if not hasattr(self, "_person_id_mapping"):
-            logger.warning("No person ID mapping available, skipping embedding migration")
-            return 0
-
-        cursor = source.execute("SELECT person_id, embedding FROM person_embeddings")
-        count = 0
-
-        for row in cursor:
-            old_id = row["person_id"]
-            new_id = self._person_id_mapping.get(old_id)
-
-            if new_id is not None:
-                target.execute(
-                    "INSERT OR REPLACE INTO person_embeddings (person_id, embedding) VALUES (?, ?)",
-                    (new_id, row["embedding"])
-                )
-                count += 1
-
-                if count % batch_size == 0:
-                    target.commit()
-                    logger.info(f"  Migrated {count} person embeddings...")
-
-        target.commit()
-        logger.info(f"Migrated {count} person embeddings")
-        return count
-
 
 def migrate_database(
     source_path: str | Path,

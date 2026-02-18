@@ -245,7 +245,9 @@ def create_lite_database(
 
     The lite version:
     - Strips the `record` column content (sets to empty {})
-    - Drops ALL embedding tables (float32 + scalar int8) — uses USearch indexes for search
+    - Drops the `embedding` column from organizations and people tables
+    - Drops any legacy vec0 embedding tables
+    - Uses USearch HNSW index files for search instead
     - Significantly reduces file size
 
     Args:
@@ -255,8 +257,6 @@ def create_lite_database(
     Returns:
         Path to the lite database
     """
-    import sqlite_vec
-
     source_db_path = Path(source_db_path)
     if not source_db_path.exists():
         raise FileNotFoundError(f"Source database not found: {source_db_path}")
@@ -271,31 +271,37 @@ def create_lite_database(
     # Copy the database first
     shutil.copy2(source_db_path, output_path)
 
-    # Connect and strip record contents
+    # Connect and strip record contents + embeddings
     # Use isolation_level=None for autocommit (required for VACUUM)
     conn = sqlite3.connect(str(output_path), isolation_level=None)
 
-    # Load sqlite-vec extension (required for vec0 virtual tables)
-    conn.enable_load_extension(True)
-    sqlite_vec.load(conn)
-    conn.enable_load_extension(False)
-
     try:
-        # Update all records to have empty record JSON
         conn.execute("BEGIN")
+
+        # Strip record JSON
         cursor = conn.execute("UPDATE organizations SET record = '{}'")
         updated = cursor.rowcount
         logger.info(f"Stripped {updated} organization record fields")
 
-        # Also strip people records if table exists
+        # Drop embedding column — lite databases use USearch indexes for search
+        try:
+            conn.execute("ALTER TABLE organizations DROP COLUMN embedding")
+            logger.info("Dropped embedding column from organizations")
+        except sqlite3.OperationalError:
+            pass  # Column doesn't exist
+
+        # Also strip people records and embeddings if table exists
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='people'")
         if cursor.fetchone():
             cursor = conn.execute("UPDATE people SET record = '{}'")
             logger.info(f"Stripped {cursor.rowcount} people record fields")
+            try:
+                conn.execute("ALTER TABLE people DROP COLUMN embedding")
+                logger.info("Dropped embedding column from people")
+            except sqlite3.OperationalError:
+                pass  # Column doesn't exist
 
-        conn.execute("COMMIT")
-
-        # Drop ALL embedding tables — lite databases use USearch indexes for search
+        # Drop legacy vec0 tables if they still exist
         for table in [
             "organization_embeddings",
             "organization_embeddings_scalar",
@@ -303,7 +309,8 @@ def create_lite_database(
             "person_embeddings_scalar",
         ]:
             conn.execute(f"DROP TABLE IF EXISTS {table}")
-            logger.info(f"Dropped {table}")
+
+        conn.execute("COMMIT")
 
         # Vacuum to reclaim space (must be outside transaction)
         conn.execute("VACUUM")

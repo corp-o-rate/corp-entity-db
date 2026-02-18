@@ -77,6 +77,8 @@ corp-entity-db import-wikidata-dump --download --limit 50000
 corp-entity-db canonicalize                    # Link equivalent records across sources
 corp-entity-db post-import                     # Run after any import: embeddings + USearch index + VACUUM
 corp-entity-db build-index                     # Build USearch HNSW index for fast ANN search
+corp-entity-db repair-embeddings               # Generate missing embeddings
+corp-entity-db migrate-embeddings              # Migrate from legacy vec0 tables to embedding column
 corp-entity-db download                        # Download lite version + USearch indexes (default)
 corp-entity-db download --full                 # Download full version + USearch indexes
 corp-entity-db upload                          # Upload with lite variant + USearch indexes
@@ -116,7 +118,7 @@ The frontend can connect to the entity database via two backends (configured by 
 
 ### Database Schema
 - Schema version: v3 with normalized FK references (INTEGER FKs replace TEXT enums)
-- Variants: full (`entities-v3.db`), lite (`entities-v3-lite.db` - drops embedding tables)
+- Variants: full (`entities-v3.db`), lite (`entities-v3-lite.db` - drops embedding column, uses USearch only)
 - Default DB path: `~/.cache/corp-extractor/entities-v2.db` (symlinked to v3)
 - USearch indexes: `people_usearch.bin`, `organizations_usearch.bin` (same dir as DB)
 - Tables: `organizations`, `people`, `roles`, `locations`, `location_types`, `db_info`
@@ -175,7 +177,7 @@ The frontend can connect to the entity database via two backends (configured by 
 
 ### Dependency Extras
 The default install (`pip install corp-entity-db`) includes only search dependencies. Optional extras:
-- `[build]` — sqlite-vec, orjson, indexed-bzip2 (for building/importing databases)
+- `[build]` — orjson, indexed-bzip2 (for building/importing databases)
 - `[serve]` — fastapi, uvicorn (for `corp-entity-db serve`)
 - `[client]` — httpx (for `EntityDBClient` remote proxy)
 - `[all]` — everything combined
@@ -183,8 +185,9 @@ The default install (`pip install corp-entity-db`) includes only search dependen
 ### Key Technical Notes
 - USearch `expansion_search=200` must be set after `Index.restore()` (default resets to 64)
 - SQLite pragmas: 256MB mmap, 500MB page cache, WAL journal mode
-- sqlite-vec is optional — only loaded when installed (needed for build operations, not search)
-- Lite database ships without embeddings — just USearch HNSW indexes for ANN search
+- Embeddings stored as float32 BLOB directly in organizations/people tables (NOT NULL in full DB)
+- Lite database ships without embedding column — uses USearch HNSW indexes for ANN search
+- Int8 quantization for USearch is computed on-the-fly during index build (not stored)
 - Hybrid search: text filtering + USearch embeddings
 - Embedding model: `google/embeddinggemma-300m` (300M params)
 - PyPI package: `corp-entity-db`

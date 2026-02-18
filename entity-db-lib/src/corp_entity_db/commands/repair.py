@@ -588,7 +588,7 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                         texts = embed_q.get()
                         if texts is None:
                             return
-                        result_q.put(embedder.embed_batch_and_quantize(texts))
+                        result_q.put(embedder.embed_batch(texts))
                 except Exception as e:
                     embed_errors.append(e)
                     result_q.put(None)
@@ -603,10 +603,9 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
 
             for batch_idx, batch in enumerate(batches):
                 # Get current batch embeddings (blocks until embedder finishes)
-                emb_result = result_q.get()
-                if emb_result is None:
+                fp32_embs = result_q.get()
+                if fp32_embs is None:
                     raise embed_errors[0]
-                fp32_embs, int8_embs = emb_result
 
                 # Submit NEXT batch immediately — embeds while we write to DB below
                 if batch_idx + 1 < len(batches):
@@ -618,8 +617,8 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                         """INSERT INTO people
                         (qid, name, name_normalized, source_id, source_identifier, country_id,
                          person_type_id, known_for_role_id, known_for_org, from_date, to_date,
-                         birth_date, death_date, record)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         birth_date, death_date, record, embedding)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             rec["qid_int"], rec["name"], rec["name_normalized"],
                             4, rec["person_qid"], rec["country_id"],
@@ -627,18 +626,8 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                             rec["from_date"], rec["to_date"],
                             rec["birth_date"], rec["death_date"],
                             rec["record_json"],
+                            fp32_embs[i].astype(np.float32).tobytes(),
                         ),
-                    )
-                    row_id = cursor.lastrowid
-                    assert row_id is not None
-
-                    conn.execute(
-                        "INSERT INTO person_embeddings (person_id, embedding) VALUES (?, ?)",
-                        (row_id, fp32_embs[i].astype(np.float32).tobytes()),
-                    )
-                    conn.execute(
-                        "INSERT INTO person_embeddings_scalar (person_id, embedding) VALUES (?, vec_int8(?))",
-                        (row_id, int8_embs[i].astype(np.int8).tobytes()),
                     )
                     new_records += 1
 
@@ -664,7 +653,6 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
 
         from corp_entity_db.store import get_person_database, get_roles_database
         from corp_entity_db.embeddings import CompanyEmbedder
-        import numpy as np
 
         person_database = get_person_database(db_path=db_path_obj, readonly=False)
         embedder = CompanyEmbedder()
@@ -725,7 +713,7 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                         texts = embed_q_3c.get()
                         if texts is None:
                             return
-                        result_q_3c.put(embedder.embed_batch_and_quantize(texts))
+                        result_q_3c.put(embedder.embed_batch(texts))
                 except Exception as e:
                     embed_errors_3c.append(e)
                     result_q_3c.put(None)
@@ -739,10 +727,9 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
             embed_q_3c.put([r["embed_text"] for r in batches_3c[0]])
 
             for batch_idx, batch in enumerate(batches_3c):
-                emb_result = result_q_3c.get()
-                if emb_result is None:
+                fp32_embs = result_q_3c.get()
+                if fp32_embs is None:
                     raise embed_errors_3c[0]
-                fp32_embs, int8_embs = emb_result
 
                 # Submit next batch immediately — embeds while we write to DB
                 if batch_idx + 1 < len(batches_3c):
@@ -751,21 +738,10 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                 for i, rec in enumerate(batch):
                     conn.execute(
                         """UPDATE people SET known_for_org = ?,
-                           known_for_role_id = COALESCE(known_for_role_id, ?)
+                           known_for_role_id = COALESCE(known_for_role_id, ?),
+                           embedding = ?
                         WHERE id = ?""",
-                        (rec["jur_label"], rec["role_id"], rec["person_id"]),
-                    )
-                    conn.execute(
-                        "UPDATE person_embeddings SET embedding = ? WHERE person_id = ?",
-                        (fp32_embs[i].tobytes(), rec["person_id"]),
-                    )
-                    conn.execute(
-                        "DELETE FROM person_embeddings_scalar WHERE person_id = ?",
-                        (rec["person_id"],),
-                    )
-                    conn.execute(
-                        "INSERT INTO person_embeddings_scalar (person_id, embedding) VALUES (?, vec_int8(?))",
-                        (rec["person_id"], int8_embs[i].tobytes()),
+                        (rec["jur_label"], rec["role_id"], fp32_embs[i].tobytes(), rec["person_id"]),
                     )
                     updated += 1
 

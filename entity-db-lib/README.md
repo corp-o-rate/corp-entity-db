@@ -70,9 +70,22 @@ corp-entity-db serve --port 9000      # Custom port
 | SEC Edgar | US public company filers & officers | ~73K orgs |
 | **Total** | | **~9.9M orgs, ~66.9M people** |
 
+## Embedding Architecture
+
+Embeddings are stored as float32 BLOBs directly in the `organizations` and `people` tables. The full database enforces NOT NULL on the embedding column. Int8 scalar quantization is computed on-the-fly during USearch HNSW index building and is not stored separately.
+
 ## Database Variants
 
-- **Lite** (default download): No embedding tables, uses USearch HNSW indexes for search (~7GB)
-- **Full**: Includes float32 and int8 embedding tables (~32GB)
+- **Lite** (default download): Embedding column dropped, uses pre-built USearch HNSW indexes for search
+- **Full**: Includes float32 embedding BLOBs in main tables
+
+## Database Management
+
+```bash
+corp-entity-db post-import             # Generate embeddings + build USearch indexes + VACUUM
+corp-entity-db build-index             # Rebuild USearch HNSW indexes only
+corp-entity-db repair-embeddings       # Generate missing embeddings
+corp-entity-db migrate-embeddings      # Migrate from legacy vec0 tables to embedding column
+```
 
 HuggingFace dataset: [Corp-o-Rate-Community/entity-references](https://huggingface.co/datasets/Corp-o-Rate-Community/entity-references)

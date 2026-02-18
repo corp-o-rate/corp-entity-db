@@ -99,10 +99,9 @@ def db_import_gleif(file_path: Optional[str], download: bool, force: bool, db_pa
         records.append(record)
 
         if len(records) >= batch_size:
-            # Embed and insert batch (both float32 and int8)
             names = [r.name for r in records]
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(names)
-            database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+            embeddings = embedder.embed_batch(names)
+            database.insert_batch(records, embeddings)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
@@ -110,8 +109,8 @@ def db_import_gleif(file_path: Optional[str], download: bool, force: bool, db_pa
     # Final batch
     if records:
         names = [r.name for r in records]
-        embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(names)
-        database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+        embeddings = embedder.embed_batch(names)
+        database.insert_batch(records, embeddings)
         count += len(records)
 
     click.echo(f"\nImported {count} GLEIF records successfully.", err=True)
@@ -171,8 +170,8 @@ def db_import_sec(download: bool, file_path: Optional[str], db_path: Optional[st
 
         if len(records) >= batch_size:
             names = [r.name for r in records]
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(names)
-            database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+            embeddings = embedder.embed_batch(names)
+            database.insert_batch(records, embeddings)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
@@ -180,8 +179,8 @@ def db_import_sec(download: bool, file_path: Optional[str], db_path: Optional[st
     # Final batch
     if records:
         names = [r.name for r in records]
-        embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(names)
-        database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+        embeddings = embedder.embed_batch(names)
+        database.insert_batch(records, embeddings)
         count += len(records)
 
     click.echo(f"\nImported {count} SEC Edgar records successfully.", err=True)
@@ -271,8 +270,8 @@ def db_import_sec_officers(db_path: Optional[str], start_year: int, end_year: Op
 
         if len(records) >= batch_size:
             embedding_texts = [r.get_embedding_text() for r in records]
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(embedding_texts)
-            database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+            embeddings = embedder.embed_batch(embedding_texts)
+            database.insert_batch(records, embeddings)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
@@ -280,8 +279,8 @@ def db_import_sec_officers(db_path: Optional[str], start_year: int, end_year: Op
     # Final batch
     if records:
         embedding_texts = [r.get_embedding_text() for r in records]
-        embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(embedding_texts)
-        database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+        embeddings = embedder.embed_batch(embedding_texts)
+        database.insert_batch(records, embeddings)
         count += len(records)
 
     if skip_existing and skipped_existing > 0:
@@ -369,8 +368,8 @@ def db_import_ch_officers(file_path: str, db_path: Optional[str], limit: Optiona
 
         if len(records) >= batch_size:
             embedding_texts = [r.get_embedding_text() for r in records]
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(embedding_texts)
-            database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+            embeddings = embedder.embed_batch(embedding_texts)
+            database.insert_batch(records, embeddings)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
@@ -378,8 +377,8 @@ def db_import_ch_officers(file_path: str, db_path: Optional[str], limit: Optiona
     # Final batch
     if records:
         embedding_texts = [r.get_embedding_text() for r in records]
-        embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(embedding_texts)
-        database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+        embeddings = embedder.embed_batch(embedding_texts)
+        database.insert_batch(records, embeddings)
         count += len(records)
 
     if skip_existing and skipped_existing > 0:
@@ -446,8 +445,8 @@ def db_import_wikidata(db_path: Optional[str], limit: Optional[int], batch_size:
 
         if len(records) >= batch_size:
             names = [r.name for r in records]
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(names)
-            database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+            embeddings = embedder.embed_batch(names)
+            database.insert_batch(records, embeddings)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
@@ -455,8 +454,8 @@ def db_import_wikidata(db_path: Optional[str], limit: Optional[int], batch_size:
     # Final batch
     if records:
         names = [r.name for r in records]
-        embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(names)
-        database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+        embeddings = embedder.embed_batch(names)
+        database.insert_batch(records, embeddings)
         count += len(records)
 
     click.echo(f"\nImported {count} Wikidata records successfully.", err=True)
@@ -533,10 +532,9 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
             records.append(record)
 
             if len(records) >= batch_size:
-                # Generate embeddings (both float32 and int8)
                 embedding_texts = [r.get_embedding_text() for r in records]
-                embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(embedding_texts)
-                database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+                embeddings = embedder.embed_batch(embedding_texts)
+                database.insert_batch(records, embeddings)
                 count += len(records)
 
                 click.echo(f"  Imported {count} people...", err=True)
@@ -545,8 +543,8 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
         # Final batch
         if records:
             embedding_texts = [r.get_embedding_text() for r in records]
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(embedding_texts)
-            database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+            embeddings = embedder.embed_batch(embedding_texts)
+            database.insert_batch(records, embeddings)
             count += len(records)
 
         if skip_existing and skipped_existing > 0:
@@ -768,7 +766,7 @@ def _embedder_thread(
     shutdown_event: threading.Event,
     thread_errors: list[Exception],
 ) -> None:
-    """Embedder thread: consumes ImportBatch, produces (batch, embeddings, scalar_embeddings)."""
+    """Embedder thread: consumes ImportBatch, produces (batch, embeddings)."""
     import logging
     logger = logging.getLogger(__name__)
 
@@ -782,8 +780,8 @@ def _embedder_thread(
                 logger.info("Embedder thread: shutdown requested, stopping")
                 break
 
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(batch.embedding_texts)
-            result_queue.put((batch, embeddings, scalar_embeddings))
+            embeddings = embedder.embed_batch(batch.embedding_texts)
+            result_queue.put((batch, embeddings))
 
     except Exception as e:
         thread_errors.append(e)
@@ -1212,13 +1210,13 @@ def db_import_wikidata_dump(
                 # Embedder is done — all batches processed
                 break
 
-            batch, embeddings, scalar_embeddings = result
+            batch, embeddings = result
 
             # Insert into database (main thread owns SQLite writes)
             if batch.record_type == "people":
-                person_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
+                person_database.insert_batch(batch.records, embeddings)
             elif batch.record_type == "org" and org_database:
-                org_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
+                org_database.insert_batch(batch.records, embeddings)
 
             # Update progress from batch metadata
             people_count = batch.people_count
@@ -1247,11 +1245,11 @@ def db_import_wikidata_dump(
                 result = result_queue.get_nowait()
                 if result is None:
                     break
-                batch, embeddings, scalar_embeddings = result
+                batch, embeddings = result
                 if batch.record_type == "people":
-                    person_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
+                    person_database.insert_batch(batch.records, embeddings)
                 elif batch.record_type == "org" and org_database:
-                    org_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
+                    org_database.insert_batch(batch.records, embeddings)
                 people_count = batch.people_count
                 orgs_count = batch.orgs_count
                 last_entity_index = batch.last_entity_index
@@ -1451,8 +1449,8 @@ def db_import_companies_house(
 
         if len(records) >= batch_size:
             names = [r.name for r in records]
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(names)
-            database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+            embeddings = embedder.embed_batch(names)
+            database.insert_batch(records, embeddings)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
@@ -1460,8 +1458,8 @@ def db_import_companies_house(
     # Final batch
     if records:
         names = [r.name for r in records]
-        embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(names)
-        database.insert_batch(records, embeddings, scalar_embeddings=scalar_embeddings)
+        embeddings = embedder.embed_batch(names)
+        database.insert_batch(records, embeddings)
         count += len(records)
 
     click.echo(f"\nImported {count} Companies House records successfully.", err=True)

@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS organizations (
     from_date TEXT DEFAULT NULL,
     to_date TEXT DEFAULT NULL,
     record TEXT NOT NULL DEFAULT '{}',
+    embedding BLOB DEFAULT NULL,
     canon_id INTEGER DEFAULT NULL,
     canon_size INTEGER DEFAULT 1,
     FOREIGN KEY (source_id) REFERENCES source_types(id),
@@ -177,6 +178,7 @@ CREATE TABLE IF NOT EXISTS people (
     birth_date TEXT DEFAULT NULL,
     death_date TEXT DEFAULT NULL,
     record TEXT NOT NULL DEFAULT '{}',
+    embedding BLOB DEFAULT NULL,
     canon_id INTEGER DEFAULT NULL,
     canon_size INTEGER DEFAULT 1,
     FOREIGN KEY (source_id) REFERENCES source_types(id),
@@ -220,49 +222,6 @@ CREATE_DB_INFO = """
 CREATE TABLE IF NOT EXISTS db_info (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
-"""
-
-# =============================================================================
-# EMBEDDING VIRTUAL TABLES
-# =============================================================================
-
-def get_create_organization_embeddings(embedding_dim: int = 768) -> str:
-    """Get DDL for organization embeddings virtual table."""
-    return f"""
-CREATE VIRTUAL TABLE IF NOT EXISTS organization_embeddings USING vec0(
-    org_id INTEGER PRIMARY KEY,
-    embedding float[{embedding_dim}] distance_metric=cosine
-);
-"""
-
-
-def get_create_person_embeddings(embedding_dim: int = 768) -> str:
-    """Get DDL for person embeddings virtual table."""
-    return f"""
-CREATE VIRTUAL TABLE IF NOT EXISTS person_embeddings USING vec0(
-    person_id INTEGER PRIMARY KEY,
-    embedding float[{embedding_dim}] distance_metric=cosine
-);
-"""
-
-
-def get_create_organization_embeddings_scalar(embedding_dim: int = 768) -> str:
-    """Get DDL for organization scalar (int8) embeddings virtual table."""
-    return f"""
-CREATE VIRTUAL TABLE IF NOT EXISTS organization_embeddings_scalar USING vec0(
-    org_id INTEGER PRIMARY KEY,
-    embedding int8[{embedding_dim}] distance_metric=cosine
-);
-"""
-
-
-def get_create_person_embeddings_scalar(embedding_dim: int = 768) -> str:
-    """Get DDL for person scalar (int8) embeddings virtual table."""
-    return f"""
-CREATE VIRTUAL TABLE IF NOT EXISTS person_embeddings_scalar USING vec0(
-    person_id INTEGER PRIMARY KEY,
-    embedding int8[{embedding_dim}] distance_metric=cosine
 );
 """
 
@@ -397,23 +356,17 @@ def create_all_tables(conn, embedding_dim: int = 768) -> None:
     """
     Create all v2 schema tables.
 
+    Embeddings are stored as BLOB columns directly in the organizations and people tables.
+
     Args:
         conn: SQLite connection
-        embedding_dim: Dimension for embedding vectors
+        embedding_dim: Dimension for embedding vectors (unused, kept for API compat)
     """
     for ddl in ALL_DDL_STATEMENTS:
         for statement in ddl.strip().split(";"):
             statement = statement.strip()
             if statement:
                 conn.execute(statement)
-
-    # Create embedding virtual tables (float32)
-    conn.execute(get_create_organization_embeddings(embedding_dim))
-    conn.execute(get_create_person_embeddings(embedding_dim))
-
-    # Create scalar embedding virtual tables (int8) for 75% storage reduction
-    conn.execute(get_create_organization_embeddings_scalar(embedding_dim))
-    conn.execute(get_create_person_embeddings_scalar(embedding_dim))
 
     # Create views
     for ddl in VIEW_DDL_STATEMENTS:

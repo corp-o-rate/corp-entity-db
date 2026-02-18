@@ -17,12 +17,6 @@ from typing import Any, Iterator, Optional
 import numpy as np
 import pycountry
 
-try:
-    import sqlite_vec
-    _has_sqlite_vec = True
-except ImportError:
-    _has_sqlite_vec = False
-
 from .models import (
     CompanyRecord,
     DatabaseStats,
@@ -100,12 +94,6 @@ def _get_shared_connection(
             conn = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
             conn.row_factory = sqlite3.Row
 
-            # Load sqlite-vec extension if available (only needed for build operations)
-            if _has_sqlite_vec:
-                conn.enable_load_extension(True)
-                sqlite_vec.load(conn)
-                conn.enable_load_extension(False)
-
             _apply_pragmas(conn, readonly=True)
 
             _shared_readonly_connections[path_key] = conn
@@ -119,12 +107,6 @@ def _get_shared_connection(
 
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
-
-        # Load sqlite-vec extension if available (only needed for build operations)
-        if _has_sqlite_vec:
-            conn.enable_load_extension(True)
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
 
         _apply_pragmas(conn, readonly=False)
 
@@ -583,20 +565,20 @@ def build_hnsw_index(
     cache_dir = db_path.parent
 
     if entity_type == "people":
-        embedding_table = "person_embeddings_scalar"
-        id_column = "person_id"
+        source_table = "people"
+        id_column = "id"
         index_path = cache_dir / "people_usearch.bin"
     elif entity_type == "organizations":
-        embedding_table = "organization_embeddings_scalar"
-        id_column = "org_id"
+        source_table = "organizations"
+        id_column = "id"
         index_path = cache_dir / "organizations_usearch.bin"
     else:
         raise ValueError(f"Unknown entity_type: {entity_type}")
 
     # Count total vectors
-    total_count = conn.execute(f"SELECT COUNT(*) FROM {embedding_table}").fetchone()[0]
+    total_count = conn.execute(f"SELECT COUNT(*) FROM {source_table} WHERE embedding IS NOT NULL").fetchone()[0]
     if total_count == 0:
-        logger.warning(f"No embeddings found in {embedding_table}")
+        logger.warning(f"No embeddings found in {source_table}")
         return 0
 
     logger.info(f"Building USearch index for {total_count:,} {entity_type} vectors")
@@ -613,44 +595,54 @@ def build_hnsw_index(
         expansion_search=ef_search,
     )
 
-    # Fetch all embeddings
-    logger.info("Fetching embeddings from database...")
-    cursor = conn.execute(f"SELECT {id_column}, embedding FROM {embedding_table} ORDER BY {id_column}")
+    # Fetch embeddings in batches and add to index incrementally to avoid OOM
+    BATCH_SIZE = 100_000
+    logger.info("Fetching embeddings from database and building index in batches...")
+    cursor = conn.execute(f"SELECT {id_column}, embedding FROM {source_table} WHERE embedding IS NOT NULL ORDER BY {id_column}")
 
-    ids_list = []
-    vectors_list = []
+    batch_ids = []
+    batch_vecs = []
+    total_added = 0
 
-    for i, row in enumerate(cursor):
+    for row in cursor:
         entity_id = row[id_column]
         embedding_blob = row["embedding"]
-        # Keep as int8 for usearch
-        vec = np.frombuffer(embedding_blob, dtype=np.int8)
+        fp32_vec = np.frombuffer(embedding_blob, dtype=np.float32)
+        vec = np.clip(np.round(fp32_vec * 127), -127, 127).astype(np.int8)
 
-        ids_list.append(entity_id)
-        vectors_list.append(vec)
+        batch_ids.append(entity_id)
+        batch_vecs.append(vec)
 
-        if progress_callback and (i + 1) % 100000 == 0:
-            logger.info(f"Loaded {i + 1:,}/{total_count:,} vectors...")
-            progress_callback(i + 1, total_count)
+        if len(batch_ids) >= BATCH_SIZE:
+            ids_array = np.array(batch_ids, dtype=np.int64)
+            vectors_array = np.stack(batch_vecs)
+            index.add(ids_array, vectors_array, threads=4)
+            total_added += len(batch_ids)
+            batch_ids.clear()
+            batch_vecs.clear()
 
-    logger.info(f"Loaded {len(ids_list):,} vectors, building index...")
+            if progress_callback:
+                logger.info(f"Indexed {total_added:,}/{total_count:,} vectors...")
+                progress_callback(total_added, total_count)
 
-    # Convert to numpy arrays
-    ids_array = np.array(ids_list, dtype=np.int64)  # usearch requires int64 keys
-    vectors_array = np.stack(vectors_list)
+    # Add remaining vectors
+    if batch_ids:
+        ids_array = np.array(batch_ids, dtype=np.int64)
+        vectors_array = np.stack(batch_vecs)
+        index.add(ids_array, vectors_array, threads=4)
+        total_added += len(batch_ids)
 
-    # Add to index (usearch API: add(keys, vectors))
-    index.add(ids_array, vectors_array, threads=4)
+    logger.info(f"Indexed {total_added:,} vectors total")
 
     # Save index
     logger.info(f"Saving index to {index_path.name}...")
     index.save(str(index_path))
 
     index_size_mb = index_path.stat().st_size / 1024**2
-    logger.info(f"USearch index built successfully: {len(ids_array):,} vectors")
+    logger.info(f"USearch index built successfully: {total_added:,} vectors")
     logger.info(f"  Index file: {index_path.name} ({index_size_mb:.1f} MB)")
 
-    return len(ids_array)
+    return total_added
 
 
 def get_database(db_path: Optional[str | Path] = None, embedding_dim: int = 768, readonly: bool = True) -> "OrganizationDatabase":
@@ -702,8 +694,6 @@ class OrganizationDatabase:
         self._conn: Optional[sqlite3.Connection] = None
         self._is_v2: Optional[bool] = None  # Detected on first connect
         self._schema_version: int = 1  # Updated on connect (1=legacy, 2=normalized FKs, 3=no embeddings in lite)
-        # Cached flags
-        self._has_scalar_cached: Optional[bool] = None
         # USearch index for fast approximate nearest neighbor search
         self._hnsw_index: Optional[Any] = None  # usearch.index.Index
 
@@ -855,7 +845,6 @@ class OrganizationDatabase:
         self,
         record: CompanyRecord,
         embedding: np.ndarray,
-        scalar_embedding: Optional[np.ndarray] = None,
     ) -> int:
         """
         Insert an organization record with its embedding.
@@ -863,7 +852,6 @@ class OrganizationDatabase:
         Args:
             record: Organization record to insert
             embedding: Embedding vector for the organization name (float32)
-            scalar_embedding: Optional int8 scalar embedding for compact storage
 
         Returns:
             Row ID of inserted record
@@ -873,11 +861,12 @@ class OrganizationDatabase:
         # Serialize record
         record_json = json.dumps(record.record)
         name_normalized = _normalize_name(record.name)
+        embedding_blob = embedding.astype(np.float32).tobytes()
 
         cursor = conn.execute("""
             INSERT OR REPLACE INTO organizations
-            (name, name_normalized, source, source_id, region, entity_type, from_date, to_date, record)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (name, name_normalized, source, source_id, region, entity_type, from_date, to_date, record, embedding)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             record.name,
             name_normalized,
@@ -888,28 +877,11 @@ class OrganizationDatabase:
             record.from_date or "",
             record.to_date or "",
             record_json,
+            embedding_blob,
         ))
 
         row_id = cursor.lastrowid
         assert row_id is not None
-
-        # Insert embedding into vec table (float32)
-        # sqlite-vec virtual tables don't support INSERT OR REPLACE, so delete first
-        embedding_blob = embedding.astype(np.float32).tobytes()
-        conn.execute("DELETE FROM organization_embeddings WHERE org_id = ?", (row_id,))
-        conn.execute("""
-            INSERT INTO organization_embeddings (org_id, embedding)
-            VALUES (?, ?)
-        """, (row_id, embedding_blob))
-
-        # Insert scalar embedding if provided (int8)
-        if scalar_embedding is not None:
-            scalar_blob = scalar_embedding.astype(np.int8).tobytes()
-            conn.execute("DELETE FROM organization_embeddings_scalar WHERE org_id = ?", (row_id,))
-            conn.execute("""
-                INSERT INTO organization_embeddings_scalar (org_id, embedding)
-                VALUES (?, vec_int8(?))
-            """, (row_id, scalar_blob))
 
         conn.commit()
         return row_id
@@ -919,7 +891,6 @@ class OrganizationDatabase:
         records: list[CompanyRecord],
         embeddings: np.ndarray,
         batch_size: int = 1000,
-        scalar_embeddings: Optional[np.ndarray] = None,
     ) -> int:
         """
         Insert multiple organization records with embeddings.
@@ -928,7 +899,6 @@ class OrganizationDatabase:
             records: List of organization records
             embeddings: Matrix of embeddings (N x dim) - float32
             batch_size: Commit batch size
-            scalar_embeddings: Optional matrix of int8 scalar embeddings (N x dim)
 
         Returns:
             Number of records inserted
@@ -939,6 +909,7 @@ class OrganizationDatabase:
         for i, (record, embedding) in enumerate(zip(records, embeddings)):
             record_json = json.dumps(record.record)
             name_normalized = _normalize_name(record.name)
+            embedding_blob = embedding.astype(np.float32).tobytes()
 
             if self._is_v2:
                 # v2 schema: use FK IDs instead of TEXT columns
@@ -954,8 +925,8 @@ class OrganizationDatabase:
 
                 cursor = conn.execute("""
                     INSERT OR REPLACE INTO organizations
-                    (name, name_normalized, source_id, source_identifier, region_id, entity_type_id, from_date, to_date, record)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (name, name_normalized, source_id, source_identifier, region_id, entity_type_id, from_date, to_date, record, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     record.name,
                     name_normalized,
@@ -966,13 +937,14 @@ class OrganizationDatabase:
                     record.from_date or "",
                     record.to_date or "",
                     record_json,
+                    embedding_blob,
                 ))
             else:
                 # v1 schema: use TEXT columns
                 cursor = conn.execute("""
                     INSERT OR REPLACE INTO organizations
-                    (name, name_normalized, source, source_id, region, entity_type, from_date, to_date, record)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (name, name_normalized, source, source_id, region, entity_type, from_date, to_date, record, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     record.name,
                     name_normalized,
@@ -983,27 +955,8 @@ class OrganizationDatabase:
                     record.from_date or "",
                     record.to_date or "",
                     record_json,
+                    embedding_blob,
                 ))
-
-            row_id = cursor.lastrowid
-            assert row_id is not None
-
-            # Insert embedding (delete first since sqlite-vec doesn't support REPLACE)
-            embedding_blob = embedding.astype(np.float32).tobytes()
-            conn.execute("DELETE FROM organization_embeddings WHERE org_id = ?", (row_id,))
-            conn.execute("""
-                INSERT INTO organization_embeddings (org_id, embedding)
-                VALUES (?, ?)
-            """, (row_id, embedding_blob))
-
-            # Insert scalar embedding if provided (int8)
-            if scalar_embeddings is not None:
-                scalar_blob = scalar_embeddings[i].astype(np.int8).tobytes()
-                conn.execute("DELETE FROM organization_embeddings_scalar WHERE org_id = ?", (row_id,))
-                conn.execute("""
-                    INSERT INTO organization_embeddings_scalar (org_id, embedding)
-                    VALUES (?, vec_int8(?))
-                """, (row_id, scalar_blob))
 
             count += 1
 
@@ -1277,19 +1230,6 @@ class OrganizationDatabase:
 
         cursor = conn.execute(query, params)
         return set(row["id"] for row in cursor)
-
-    def _has_scalar_table(self) -> bool:
-        """Check if scalar embedding table exists (cached)."""
-        if self._has_scalar_cached is not None:
-            return self._has_scalar_cached
-        conn = self._conn
-        assert conn is not None
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='organization_embeddings_scalar'"
-        )
-        result = cursor.fetchone() is not None
-        self._has_scalar_cached = result
-        return result
 
     # --- USearch approximate nearest neighbor search ---
 
@@ -1894,107 +1834,14 @@ class OrganizationDatabase:
         logger.info(f"Migration complete: {updated} name_normalized values populated")
         return updated
 
-    def migrate_to_sqlite_vec(self, batch_size: int = 10000) -> int:
-        """
-        Migrate embeddings from BLOB column to sqlite-vec virtual table.
-
-        This is a one-time migration for databases created before sqlite-vec support.
-
-        Args:
-            batch_size: Number of records to process per batch
-
-        Returns:
-            Number of embeddings migrated
-        """
-        conn = self._connect()
-
-        # Check if migration is needed
-        cursor = conn.execute("SELECT COUNT(*) FROM organization_embeddings")
-        vec_count = cursor.fetchone()[0]
-
-        cursor = conn.execute("SELECT COUNT(*) FROM organizations WHERE embedding IS NOT NULL")
-        blob_count = cursor.fetchone()[0]
-
-        if vec_count >= blob_count:
-            logger.info(f"Migration not needed: sqlite-vec has {vec_count} embeddings, BLOB has {blob_count}")
-            return 0
-
-        logger.info(f"Migrating {blob_count} embeddings from BLOB to sqlite-vec...")
-
-        # Get IDs that need migration (in sqlite-vec but not in organizations)
-        cursor = conn.execute("""
-            SELECT c.id, c.embedding
-            FROM organizations c
-            LEFT JOIN organization_embeddings e ON c.id = e.org_id
-            WHERE c.embedding IS NOT NULL AND e.org_id IS NULL
-        """)
-
-        migrated = 0
-        batch = []
-
-        for row in cursor:
-            org_id = row["id"]
-            embedding_blob = row["embedding"]
-
-            if embedding_blob:
-                batch.append((org_id, embedding_blob))
-
-            if len(batch) >= batch_size:
-                self._insert_vec_batch(batch)
-                migrated += len(batch)
-                logger.info(f"  Migrated {migrated}/{blob_count} embeddings...")
-                batch = []
-
-        # Insert remaining batch
-        if batch:
-            self._insert_vec_batch(batch)
-            migrated += len(batch)
-
-        logger.info(f"Migration complete: {migrated} embeddings migrated to sqlite-vec")
-        return migrated
-
-    def _insert_vec_batch(self, batch: list[tuple[int, bytes]]) -> None:
-        """Insert a batch of embeddings into sqlite-vec table."""
-        conn = self._conn
-        assert conn is not None
-
-        for org_id, embedding_blob in batch:
-            conn.execute("DELETE FROM organization_embeddings WHERE org_id = ?", (org_id,))
-            conn.execute("""
-                INSERT INTO organization_embeddings (org_id, embedding)
-                VALUES (?, ?)
-            """, (org_id, embedding_blob))
-
-        conn.commit()
-
     def delete_source(self, source: str) -> int:
         """Delete all records from a specific source."""
         conn = self._connect()
 
         if self._is_v2:
             source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-            # First get IDs to delete from vec table
-            cursor = conn.execute("SELECT id FROM organizations WHERE source_id = ?", (source_type_id,))
-            ids_to_delete = [row["id"] for row in cursor]
-
-            # Delete from vec table
-            if ids_to_delete:
-                placeholders = ",".join("?" * len(ids_to_delete))
-                conn.execute(f"DELETE FROM organization_embeddings WHERE org_id IN ({placeholders})", ids_to_delete)
-
-            # Delete from main table
             cursor = conn.execute("DELETE FROM organizations WHERE source_id = ?", (source_type_id,))
         else:
-            # First get IDs to delete from vec table
-            cursor = conn.execute("SELECT id FROM organizations WHERE source = ?", (source,))
-            ids_to_delete = [row["id"] for row in cursor]
-
-            # Delete from vec table
-            if ids_to_delete:
-                placeholders = ",".join("?" * len(ids_to_delete))
-                conn.execute(f"DELETE FROM organization_embeddings WHERE org_id IN ({placeholders})", ids_to_delete)
-
-            # Delete from main table
             cursor = conn.execute("DELETE FROM organizations WHERE source = ?", (source,))
 
         deleted = cursor.rowcount
@@ -2141,14 +1988,10 @@ class OrganizationDatabase:
         return migrations
 
     def get_missing_embedding_count(self) -> int:
-        """Get count of organizations without embeddings in organization_embeddings table."""
+        """Get count of organizations without embeddings."""
         conn = self._connect()
 
-        cursor = conn.execute("""
-            SELECT COUNT(*) FROM organizations c
-            LEFT JOIN organization_embeddings e ON c.id = e.org_id
-            WHERE e.org_id IS NULL
-        """)
+        cursor = conn.execute("SELECT COUNT(*) FROM organizations WHERE embedding IS NULL")
         return cursor.fetchone()[0]
 
     def get_organizations_without_embeddings(
@@ -2172,18 +2015,16 @@ class OrganizationDatabase:
         while True:
             if source:
                 cursor = conn.execute("""
-                    SELECT c.id, c.name FROM organizations c
-                    LEFT JOIN organization_embeddings e ON c.id = e.org_id
-                    WHERE e.org_id IS NULL AND c.id > ? AND c.source = ?
-                    ORDER BY c.id
+                    SELECT id, name FROM organizations
+                    WHERE embedding IS NULL AND id > ? AND source = ?
+                    ORDER BY id
                     LIMIT ?
                 """, (last_id, source, batch_size))
             else:
                 cursor = conn.execute("""
-                    SELECT c.id, c.name FROM organizations c
-                    LEFT JOIN organization_embeddings e ON c.id = e.org_id
-                    WHERE e.org_id IS NULL AND c.id > ?
-                    ORDER BY c.id
+                    SELECT id, name FROM organizations
+                    WHERE embedding IS NULL AND id > ?
+                    ORDER BY id
                     LIMIT ?
                 """, (last_id, batch_size))
 
@@ -2194,141 +2035,6 @@ class OrganizationDatabase:
             for row in rows:
                 yield (row[0], row[1])
                 last_id = row[0]
-
-    def insert_embeddings_batch(
-        self,
-        org_ids: list[int],
-        embeddings: np.ndarray,
-    ) -> int:
-        """
-        Insert embeddings for existing organizations.
-
-        Args:
-            org_ids: List of organization IDs
-            embeddings: Matrix of embeddings (N x dim)
-
-        Returns:
-            Number of embeddings inserted
-        """
-        conn = self._connect()
-        count = 0
-
-        for org_id, embedding in zip(org_ids, embeddings):
-            embedding_blob = embedding.astype(np.float32).tobytes()
-            conn.execute("DELETE FROM organization_embeddings WHERE org_id = ?", (org_id,))
-            conn.execute("""
-                INSERT INTO organization_embeddings (org_id, embedding)
-                VALUES (?, ?)
-            """, (org_id, embedding_blob))
-            count += 1
-
-        conn.commit()
-        return count
-
-    def ensure_scalar_table_exists(self) -> None:
-        """Create scalar embedding table if it doesn't exist."""
-        conn = self._connect()
-        conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS organization_embeddings_scalar USING vec0(
-                org_id INTEGER PRIMARY KEY,
-                embedding int8[{self._embedding_dim}] distance_metric=cosine
-            )
-        """)
-        conn.commit()
-        logger.info("Ensured organization_embeddings_scalar table exists")
-
-    def rebuild_vec_tables(self) -> dict[str, int]:
-        """
-        Rebuild vec0 tables with distance_metric=cosine for indexed KNN search.
-
-        Drops and recreates each vec0 table, copying embeddings through a temp table.
-        Required once for databases created before the cosine metric was added.
-
-        Returns:
-            Dict with table names and row counts after rebuild.
-        """
-        conn = self._connect()
-        stats: dict[str, int] = {}
-
-        for table, id_col, dtype, vec_wrap in [
-            ("organization_embeddings", "org_id", f"float[{self._embedding_dim}]", None),
-            ("organization_embeddings_scalar", "org_id", f"int8[{self._embedding_dim}]", "vec_int8"),
-        ]:
-            # Check if table exists
-            cursor = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
-            )
-            if not cursor.fetchone():
-                logger.info(f"Table {table} does not exist, skipping")
-                stats[table] = 0
-                continue
-
-            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            logger.info(f"Rebuilding {table} ({count} rows) with distance_metric=cosine...")
-
-            # Dump to temp table
-            conn.execute(f"CREATE TEMP TABLE _rebuild AS SELECT {id_col}, embedding FROM {table}")
-            conn.execute(f"DROP TABLE {table}")
-
-            # Recreate with cosine metric
-            conn.execute(f"""
-                CREATE VIRTUAL TABLE {table} USING vec0(
-                    {id_col} INTEGER PRIMARY KEY,
-                    embedding {dtype} distance_metric=cosine
-                )
-            """)
-
-            # Copy back
-            if vec_wrap:
-                conn.execute(f"""
-                    INSERT INTO {table} ({id_col}, embedding)
-                    SELECT {id_col}, {vec_wrap}(embedding) FROM _rebuild
-                """)
-            else:
-                conn.execute(f"""
-                    INSERT INTO {table} ({id_col}, embedding)
-                    SELECT {id_col}, embedding FROM _rebuild
-                """)
-
-            conn.execute("DROP TABLE _rebuild")
-            stats[table] = count
-            logger.info(f"Rebuilt {table}: {count} rows")
-
-        conn.commit()
-        return stats
-
-    def get_missing_scalar_embedding_ids(self, batch_size: int = 1000) -> Iterator[list[int]]:
-        """
-        Yield batches of org IDs that have float32 but missing scalar embeddings.
-
-        Args:
-            batch_size: Number of IDs per batch
-
-        Yields:
-            Lists of org_ids needing scalar embeddings
-        """
-        conn = self._connect()
-
-        # Ensure scalar table exists before querying
-        self.ensure_scalar_table_exists()
-
-        last_id = 0
-        while True:
-            cursor = conn.execute("""
-                SELECT e.org_id FROM organization_embeddings e
-                LEFT JOIN organization_embeddings_scalar s ON e.org_id = s.org_id
-                WHERE s.org_id IS NULL AND e.org_id > ?
-                ORDER BY e.org_id
-                LIMIT ?
-            """, (last_id, batch_size))
-
-            rows = cursor.fetchall()
-            if not rows:
-                break
-
-            ids = [row["org_id"] for row in rows]
-            yield ids
-            last_id = ids[-1]
 
     def get_embeddings_by_ids(self, org_ids: list[int]) -> dict[int, np.ndarray]:
         """
@@ -2347,79 +2053,41 @@ class OrganizationDatabase:
 
         placeholders = ",".join("?" * len(org_ids))
         cursor = conn.execute(f"""
-            SELECT org_id, embedding FROM organization_embeddings
-            WHERE org_id IN ({placeholders})
+            SELECT id, embedding FROM organizations
+            WHERE id IN ({placeholders}) AND embedding IS NOT NULL
         """, org_ids)
 
         result = {}
         for row in cursor:
             embedding_blob = row["embedding"]
             embedding = np.frombuffer(embedding_blob, dtype=np.float32)
-            result[row["org_id"]] = embedding
+            result[row["id"]] = embedding
         return result
 
-    def insert_scalar_embeddings_batch(self, org_ids: list[int], embeddings: np.ndarray) -> int:
-        """
-        Insert scalar (int8) embeddings for existing orgs.
-
-        Args:
-            org_ids: List of organization IDs
-            embeddings: Matrix of int8 embeddings (N x dim)
-
-        Returns:
-            Number of embeddings inserted
-        """
+    def get_embedding_count(self) -> int:
+        """Get count of organizations with embeddings."""
         conn = self._connect()
-        count = 0
-
-        for org_id, embedding in zip(org_ids, embeddings):
-            scalar_blob = embedding.astype(np.int8).tobytes()
-            conn.execute("DELETE FROM organization_embeddings_scalar WHERE org_id = ?", (org_id,))
-            conn.execute("""
-                INSERT INTO organization_embeddings_scalar (org_id, embedding)
-                VALUES (?, vec_int8(?))
-            """, (org_id, scalar_blob))
-            count += 1
-
-        conn.commit()
-        return count
-
-    def get_scalar_embedding_count(self) -> int:
-        """Get count of scalar embeddings."""
-        conn = self._connect()
-        if not self._has_scalar_table():
-            return 0
-        cursor = conn.execute("SELECT COUNT(*) FROM organization_embeddings_scalar")
+        cursor = conn.execute("SELECT COUNT(*) FROM organizations WHERE embedding IS NOT NULL")
         return cursor.fetchone()[0]
 
-    def get_float32_embedding_count(self) -> int:
-        """Get count of float32 embeddings."""
-        conn = self._connect()
-        cursor = conn.execute("SELECT COUNT(*) FROM organization_embeddings")
-        return cursor.fetchone()[0]
-
-    def get_missing_all_embedding_ids(self, batch_size: int = 1000) -> Iterator[list[tuple[int, str]]]:
+    def get_missing_embedding_ids(self, batch_size: int = 1000) -> Iterator[list[tuple[int, str]]]:
         """
-        Yield batches of (org_id, name) tuples for records missing both float32 and scalar embeddings.
+        Yield batches of (org_id, name) tuples for records missing embeddings.
 
         Args:
             batch_size: Number of IDs per batch
 
         Yields:
-            Lists of (org_id, name) tuples needing embeddings generated from scratch
+            Lists of (org_id, name) tuples needing embeddings
         """
         conn = self._connect()
-
-        # Ensure scalar table exists
-        self.ensure_scalar_table_exists()
 
         last_id = 0
         while True:
             cursor = conn.execute("""
-                SELECT o.id, o.name FROM organizations o
-                LEFT JOIN organization_embeddings e ON o.id = e.org_id
-                WHERE e.org_id IS NULL AND o.id > ?
-                ORDER BY o.id
+                SELECT id, name FROM organizations
+                WHERE embedding IS NULL AND id > ?
+                ORDER BY id
                 LIMIT ?
             """, (last_id, batch_size))
 
@@ -2431,43 +2099,27 @@ class OrganizationDatabase:
             yield results
             last_id = results[-1][0]
 
-    def insert_both_embeddings_batch(
+    def update_embeddings_batch(
         self,
         org_ids: list[int],
-        fp32_embeddings: np.ndarray,
-        int8_embeddings: np.ndarray,
+        embeddings: np.ndarray,
     ) -> int:
         """
-        Insert both float32 and int8 embeddings for existing orgs.
+        Update embeddings for existing organizations.
 
         Args:
             org_ids: List of organization IDs
-            fp32_embeddings: Matrix of float32 embeddings (N x dim)
-            int8_embeddings: Matrix of int8 embeddings (N x dim)
+            embeddings: Matrix of float32 embeddings (N x dim)
 
         Returns:
-            Number of embeddings inserted
+            Number of embeddings updated
         """
         conn = self._connect()
         count = 0
 
-        for org_id, fp32, int8 in zip(org_ids, fp32_embeddings, int8_embeddings):
-            # Insert float32
-            fp32_blob = fp32.astype(np.float32).tobytes()
-            conn.execute("DELETE FROM organization_embeddings WHERE org_id = ?", (org_id,))
-            conn.execute("""
-                INSERT INTO organization_embeddings (org_id, embedding)
-                VALUES (?, ?)
-            """, (org_id, fp32_blob))
-
-            # Insert int8
-            int8_blob = int8.astype(np.int8).tobytes()
-            conn.execute("DELETE FROM organization_embeddings_scalar WHERE org_id = ?", (org_id,))
-            conn.execute("""
-                INSERT INTO organization_embeddings_scalar (org_id, embedding)
-                VALUES (?, vec_int8(?))
-            """, (org_id, int8_blob))
-
+        for org_id, embedding in zip(org_ids, embeddings):
+            fp32_blob = embedding.astype(np.float32).tobytes()
+            conn.execute("UPDATE organizations SET embedding = ? WHERE id = ?", (fp32_blob, org_id))
             count += 1
 
         conn.commit()
@@ -2632,8 +2284,6 @@ class PersonDatabase:
         self._conn: Optional[sqlite3.Connection] = None
         self._is_v2: Optional[bool] = None  # Detected on first connect
         self._schema_version: int = 1  # Updated on connect (1=legacy, 2=normalized FKs, 3=no embeddings in lite)
-        # Cached flags
-        self._has_scalar_cached: Optional[bool] = None
         # USearch index for fast approximate nearest neighbor search
         self._hnsw_index: Optional[Any] = None  # usearch.index.Index
 
@@ -2784,22 +2434,12 @@ class PersonDatabase:
         except sqlite3.OperationalError:
             pass  # Column doesn't exist yet
 
-        # Create sqlite-vec virtual table for embeddings (float32)
-        conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS person_embeddings USING vec0(
-                person_id INTEGER PRIMARY KEY,
-                embedding float[{self._embedding_dim}] distance_metric=cosine
-            )
-        """)
-
-        # Create sqlite-vec virtual table for scalar embeddings (int8)
-        # Provides 75% storage reduction with ~92% recall at top-100
-        conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS person_embeddings_scalar USING vec0(
-                person_id INTEGER PRIMARY KEY,
-                embedding int8[{self._embedding_dim}] distance_metric=cosine
-            )
-        """)
+        # Add embedding column if it doesn't exist (migration for existing DBs)
+        try:
+            conn.execute("ALTER TABLE people ADD COLUMN embedding BLOB DEFAULT NULL")
+            logger.info("Added embedding column to people table")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         # Create QID labels lookup table for Wikidata QID -> label mappings
         conn.execute("""
@@ -2894,7 +2534,6 @@ class PersonDatabase:
         self,
         record: PersonRecord,
         embedding: np.ndarray,
-        scalar_embedding: Optional[np.ndarray] = None,
     ) -> int:
         """
         Insert a person record with its embedding.
@@ -2902,7 +2541,6 @@ class PersonDatabase:
         Args:
             record: Person record to insert
             embedding: Embedding vector for the person name (float32)
-            scalar_embedding: Optional int8 scalar embedding for compact storage
 
         Returns:
             Row ID of inserted record
@@ -2912,13 +2550,14 @@ class PersonDatabase:
         # Serialize record
         record_json = json.dumps(record.record)
         name_normalized = _normalize_person_name(record.name)
+        embedding_blob = embedding.astype(np.float32).tobytes()
 
         cursor = conn.execute("""
             INSERT OR REPLACE INTO people
             (name, name_normalized, source, source_id, country, person_type,
              known_for_role, known_for_org, known_for_org_id, from_date, to_date,
-             birth_date, death_date, record)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             birth_date, death_date, record, embedding)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             record.name,
             name_normalized,
@@ -2934,27 +2573,11 @@ class PersonDatabase:
             record.birth_date or "",
             record.death_date or "",
             record_json,
+            embedding_blob,
         ))
 
         row_id = cursor.lastrowid
         assert row_id is not None
-
-        # Insert embedding into vec table (float32)
-        embedding_blob = embedding.astype(np.float32).tobytes()
-        conn.execute("DELETE FROM person_embeddings WHERE person_id = ?", (row_id,))
-        conn.execute("""
-            INSERT INTO person_embeddings (person_id, embedding)
-            VALUES (?, ?)
-        """, (row_id, embedding_blob))
-
-        # Insert scalar embedding if provided (int8)
-        if scalar_embedding is not None:
-            scalar_blob = scalar_embedding.astype(np.int8).tobytes()
-            conn.execute("DELETE FROM person_embeddings_scalar WHERE person_id = ?", (row_id,))
-            conn.execute("""
-                INSERT INTO person_embeddings_scalar (person_id, embedding)
-                VALUES (?, vec_int8(?))
-            """, (row_id, scalar_blob))
 
         conn.commit()
         return row_id
@@ -2964,7 +2587,6 @@ class PersonDatabase:
         records: list[PersonRecord],
         embeddings: np.ndarray,
         batch_size: int = 1000,
-        scalar_embeddings: Optional[np.ndarray] = None,
     ) -> int:
         """
         Insert multiple person records with embeddings.
@@ -2973,7 +2595,6 @@ class PersonDatabase:
             records: List of person records
             embeddings: Matrix of embeddings (N x dim) - float32
             batch_size: Commit batch size
-            scalar_embeddings: Optional matrix of int8 scalar embeddings (N x dim)
 
         Returns:
             Number of records inserted
@@ -2984,6 +2605,7 @@ class PersonDatabase:
         for i, (record, embedding) in enumerate(zip(records, embeddings)):
             record_json = json.dumps(record.record)
             name_normalized = _normalize_person_name(record.name)
+            embedding_blob = embedding.astype(np.float32).tobytes()
 
             if self._is_v2:
                 # v2 schema: use FK IDs instead of TEXT columns
@@ -3007,8 +2629,8 @@ class PersonDatabase:
                     INSERT OR REPLACE INTO people
                     (name, name_normalized, source_id, source_identifier, country_id, person_type_id,
                      known_for_role_id, known_for_org, known_for_org_id, from_date, to_date,
-                     birth_date, death_date, record)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     birth_date, death_date, record, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     record.name,
                     name_normalized,
@@ -3024,6 +2646,7 @@ class PersonDatabase:
                     record.birth_date or "",
                     record.death_date or "",
                     record_json,
+                    embedding_blob,
                 ))
             else:
                 # v1 schema: use TEXT columns
@@ -3031,8 +2654,8 @@ class PersonDatabase:
                     INSERT OR REPLACE INTO people
                     (name, name_normalized, source, source_id, country, person_type,
                      known_for_role, known_for_org, known_for_org_id, from_date, to_date,
-                     birth_date, death_date, record)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     birth_date, death_date, record, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     record.name,
                     name_normalized,
@@ -3048,27 +2671,8 @@ class PersonDatabase:
                     record.birth_date or "",
                     record.death_date or "",
                     record_json,
+                    embedding_blob,
                 ))
-
-            row_id = cursor.lastrowid
-            assert row_id is not None
-
-            # Insert embedding (delete first since sqlite-vec doesn't support REPLACE)
-            embedding_blob = embedding.astype(np.float32).tobytes()
-            conn.execute("DELETE FROM person_embeddings WHERE person_id = ?", (row_id,))
-            conn.execute("""
-                INSERT INTO person_embeddings (person_id, embedding)
-                VALUES (?, ?)
-            """, (row_id, embedding_blob))
-
-            # Insert scalar embedding if provided (int8)
-            if scalar_embeddings is not None:
-                scalar_blob = scalar_embeddings[i].astype(np.int8).tobytes()
-                conn.execute("DELETE FROM person_embeddings_scalar WHERE person_id = ?", (row_id,))
-                conn.execute("""
-                    INSERT INTO person_embeddings_scalar (person_id, embedding)
-                    VALUES (?, vec_int8(?))
-                """, (row_id, scalar_blob))
 
             count += 1
 
@@ -3167,10 +2771,7 @@ class PersonDatabase:
 
         # Update the embedding
         embedding_bytes = new_embedding.astype(np.float32).tobytes()
-        conn.execute("""
-            UPDATE people_vec SET embedding = ?
-            WHERE rowid = ?
-        """, (embedding_bytes, person_id))
+        conn.execute("UPDATE people SET embedding = ? WHERE id = ?", (embedding_bytes, person_id))
 
         conn.commit()
         return True
@@ -3353,19 +2954,6 @@ class PersonDatabase:
 
         cursor = conn.execute(query, params)
         return set(row["id"] for row in cursor)
-
-    def _has_scalar_table(self) -> bool:
-        """Check if scalar embedding table exists (cached)."""
-        if self._has_scalar_cached is not None:
-            return self._has_scalar_cached
-        conn = self._conn
-        assert conn is not None
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='person_embeddings_scalar'"
-        )
-        result = cursor.fetchone() is not None
-        self._has_scalar_cached = result
-        return result
 
     # --- USearch approximate nearest neighbor search ---
 
@@ -3571,107 +3159,6 @@ class PersonDatabase:
             "by_source": by_source,
         }
 
-    def ensure_scalar_table_exists(self) -> None:
-        """Create scalar embedding table if it doesn't exist."""
-        conn = self._connect()
-        conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS person_embeddings_scalar USING vec0(
-                person_id INTEGER PRIMARY KEY,
-                embedding int8[{self._embedding_dim}] distance_metric=cosine
-            )
-        """)
-        conn.commit()
-        logger.info("Ensured person_embeddings_scalar table exists")
-
-    def rebuild_vec_tables(self) -> dict[str, int]:
-        """
-        Rebuild vec0 tables with distance_metric=cosine for indexed KNN search.
-
-        Drops and recreates each vec0 table, copying embeddings through a temp table.
-        Required once for databases created before the cosine metric was added.
-
-        Returns:
-            Dict with table names and row counts after rebuild.
-        """
-        conn = self._connect()
-        stats: dict[str, int] = {}
-
-        for table, id_col, dtype, vec_wrap in [
-            ("person_embeddings", "person_id", f"float[{self._embedding_dim}]", None),
-            ("person_embeddings_scalar", "person_id", f"int8[{self._embedding_dim}]", "vec_int8"),
-        ]:
-            cursor = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
-            )
-            if not cursor.fetchone():
-                logger.info(f"Table {table} does not exist, skipping")
-                stats[table] = 0
-                continue
-
-            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            logger.info(f"Rebuilding {table} ({count} rows) with distance_metric=cosine...")
-
-            conn.execute(f"CREATE TEMP TABLE _rebuild AS SELECT {id_col}, embedding FROM {table}")
-            conn.execute(f"DROP TABLE {table}")
-
-            conn.execute(f"""
-                CREATE VIRTUAL TABLE {table} USING vec0(
-                    {id_col} INTEGER PRIMARY KEY,
-                    embedding {dtype} distance_metric=cosine
-                )
-            """)
-
-            if vec_wrap:
-                conn.execute(f"""
-                    INSERT INTO {table} ({id_col}, embedding)
-                    SELECT {id_col}, {vec_wrap}(embedding) FROM _rebuild
-                """)
-            else:
-                conn.execute(f"""
-                    INSERT INTO {table} ({id_col}, embedding)
-                    SELECT {id_col}, embedding FROM _rebuild
-                """)
-
-            conn.execute("DROP TABLE _rebuild")
-            stats[table] = count
-            logger.info(f"Rebuilt {table}: {count} rows")
-
-        conn.commit()
-        return stats
-
-    def get_missing_scalar_embedding_ids(self, batch_size: int = 1000) -> Iterator[list[int]]:
-        """
-        Yield batches of person IDs that have float32 but missing scalar embeddings.
-
-        Args:
-            batch_size: Number of IDs per batch
-
-        Yields:
-            Lists of person_ids needing scalar embeddings
-        """
-        conn = self._connect()
-
-        # Ensure scalar table exists before querying
-        self.ensure_scalar_table_exists()
-
-        last_id = 0
-        while True:
-            cursor = conn.execute("""
-                SELECT e.person_id FROM person_embeddings e
-                LEFT JOIN person_embeddings_scalar s ON e.person_id = s.person_id
-                WHERE s.person_id IS NULL AND e.person_id > ?
-                ORDER BY e.person_id
-                LIMIT ?
-            """, (last_id, batch_size))
-
-            rows = cursor.fetchall()
-            if not rows:
-                break
-
-            ids = [row["person_id"] for row in rows]
-            yield ids
-            last_id = ids[-1]
-
     def get_embeddings_by_ids(self, person_ids: list[int]) -> dict[int, np.ndarray]:
         """
         Fetch float32 embeddings for given person IDs.
@@ -3689,79 +3176,41 @@ class PersonDatabase:
 
         placeholders = ",".join("?" * len(person_ids))
         cursor = conn.execute(f"""
-            SELECT person_id, embedding FROM person_embeddings
-            WHERE person_id IN ({placeholders})
+            SELECT id, embedding FROM people
+            WHERE id IN ({placeholders}) AND embedding IS NOT NULL
         """, person_ids)
 
         result = {}
         for row in cursor:
             embedding_blob = row["embedding"]
             embedding = np.frombuffer(embedding_blob, dtype=np.float32)
-            result[row["person_id"]] = embedding
+            result[row["id"]] = embedding
         return result
 
-    def insert_scalar_embeddings_batch(self, person_ids: list[int], embeddings: np.ndarray) -> int:
-        """
-        Insert scalar (int8) embeddings for existing people.
-
-        Args:
-            person_ids: List of person IDs
-            embeddings: Matrix of int8 embeddings (N x dim)
-
-        Returns:
-            Number of embeddings inserted
-        """
+    def get_embedding_count(self) -> int:
+        """Get count of people with embeddings."""
         conn = self._connect()
-        count = 0
-
-        for person_id, embedding in zip(person_ids, embeddings):
-            scalar_blob = embedding.astype(np.int8).tobytes()
-            conn.execute("DELETE FROM person_embeddings_scalar WHERE person_id = ?", (person_id,))
-            conn.execute("""
-                INSERT INTO person_embeddings_scalar (person_id, embedding)
-                VALUES (?, vec_int8(?))
-            """, (person_id, scalar_blob))
-            count += 1
-
-        conn.commit()
-        return count
-
-    def get_scalar_embedding_count(self) -> int:
-        """Get count of scalar embeddings."""
-        conn = self._connect()
-        if not self._has_scalar_table():
-            return 0
-        cursor = conn.execute("SELECT COUNT(*) FROM person_embeddings_scalar")
+        cursor = conn.execute("SELECT COUNT(*) FROM people WHERE embedding IS NOT NULL")
         return cursor.fetchone()[0]
 
-    def get_float32_embedding_count(self) -> int:
-        """Get count of float32 embeddings."""
-        conn = self._connect()
-        cursor = conn.execute("SELECT COUNT(*) FROM person_embeddings")
-        return cursor.fetchone()[0]
-
-    def get_missing_all_embedding_ids(self, batch_size: int = 1000) -> Iterator[list[tuple[int, str]]]:
+    def get_missing_embedding_ids(self, batch_size: int = 1000) -> Iterator[list[tuple[int, str]]]:
         """
-        Yield batches of (person_id, name) tuples for records missing both float32 and scalar embeddings.
+        Yield batches of (person_id, name) tuples for records missing embeddings.
 
         Args:
             batch_size: Number of IDs per batch
 
         Yields:
-            Lists of (person_id, name) tuples needing embeddings generated from scratch
+            Lists of (person_id, name) tuples needing embeddings
         """
         conn = self._connect()
-
-        # Ensure scalar table exists
-        self.ensure_scalar_table_exists()
 
         last_id = 0
         while True:
             cursor = conn.execute("""
-                SELECT p.id, p.name FROM people p
-                LEFT JOIN person_embeddings e ON p.id = e.person_id
-                WHERE e.person_id IS NULL AND p.id > ?
-                ORDER BY p.id
+                SELECT id, name FROM people
+                WHERE embedding IS NULL AND id > ?
+                ORDER BY id
                 LIMIT ?
             """, (last_id, batch_size))
 
@@ -3773,43 +3222,27 @@ class PersonDatabase:
             yield results
             last_id = results[-1][0]
 
-    def insert_both_embeddings_batch(
+    def update_embeddings_batch(
         self,
         person_ids: list[int],
-        fp32_embeddings: np.ndarray,
-        int8_embeddings: np.ndarray,
+        embeddings: np.ndarray,
     ) -> int:
         """
-        Insert both float32 and int8 embeddings for existing people.
+        Update embeddings for existing people.
 
         Args:
             person_ids: List of person IDs
-            fp32_embeddings: Matrix of float32 embeddings (N x dim)
-            int8_embeddings: Matrix of int8 embeddings (N x dim)
+            embeddings: Matrix of float32 embeddings (N x dim)
 
         Returns:
-            Number of embeddings inserted
+            Number of embeddings updated
         """
         conn = self._connect()
         count = 0
 
-        for person_id, fp32, int8 in zip(person_ids, fp32_embeddings, int8_embeddings):
-            # Insert float32
-            fp32_blob = fp32.astype(np.float32).tobytes()
-            conn.execute("DELETE FROM person_embeddings WHERE person_id = ?", (person_id,))
-            conn.execute("""
-                INSERT INTO person_embeddings (person_id, embedding)
-                VALUES (?, ?)
-            """, (person_id, fp32_blob))
-
-            # Insert int8
-            int8_blob = int8.astype(np.int8).tobytes()
-            conn.execute("DELETE FROM person_embeddings_scalar WHERE person_id = ?", (person_id,))
-            conn.execute("""
-                INSERT INTO person_embeddings_scalar (person_id, embedding)
-                VALUES (?, vec_int8(?))
-            """, (person_id, int8_blob))
-
+        for person_id, embedding in zip(person_ids, embeddings):
+            fp32_blob = embedding.astype(np.float32).tobytes()
+            conn.execute("UPDATE people SET embedding = ? WHERE id = ?", (fp32_blob, person_id))
             count += 1
 
         conn.commit()

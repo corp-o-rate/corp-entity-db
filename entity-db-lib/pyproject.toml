@@ -21,7 +21,6 @@ dependencies = [
 
 [project.optional-dependencies]
 build = [
-    "sqlite-vec>=0.1.6",
     "orjson",
     "indexed-bzip2",
 ]

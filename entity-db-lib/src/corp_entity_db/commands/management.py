@@ -372,19 +372,16 @@ def db_create_lite(db_path: str, output: Optional[str], verbose: bool):
 @click.command("repair-embeddings")
 @click.option("--db", "db_path", type=click.Path(), help="Database path")
 @click.option("--batch-size", type=int, default=1000, help="Batch size for embedding generation (default: 1000)")
-@click.option("--source", type=str, help="Only repair specific source (gleif, sec_edgar, etc.)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_repair_embeddings(db_path: Optional[str], batch_size: int, source: Optional[str], verbose: bool):
+def db_repair_embeddings(db_path: Optional[str], batch_size: int, verbose: bool):
     """
     Generate missing embeddings for organizations in the database.
 
-    This repairs databases where organizations were imported without embeddings
-    being properly stored in the organization_embeddings table.
+    This repairs databases where organizations were imported without embeddings.
 
     \b
     Examples:
         corp-entity-db repair-embeddings
-        corp-entity-db repair-embeddings --source wikipedia
         corp-entity-db repair-embeddings --batch-size 500
     """
     _configure_logging(verbose)
@@ -407,225 +404,18 @@ def db_repair_embeddings(db_path: Optional[str], batch_size: int, source: Option
     click.echo("Generating embeddings...", err=True)
 
     # Process in batches
-    org_ids = []
-    names = []
     count = 0
+    for batch in database.get_missing_embedding_ids(batch_size=batch_size):
+        ids = [item[0] for item in batch]
+        names = [item[1] for item in batch]
 
-    for org_id, name in database.get_organizations_without_embeddings(batch_size=batch_size, source=source):
-        org_ids.append(org_id)
-        names.append(name)
-
-        if len(names) >= batch_size:
-            # Generate both float32 and int8 embeddings
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(names)
-            database.insert_both_embeddings_batch(org_ids, embeddings, scalar_embeddings)
-            count += len(names)
-            click.echo(f"Repaired {count:,} / {missing_count:,} embeddings...", err=True)
-            org_ids = []
-            names = []
-
-    # Final batch
-    if names:
-        embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(names)
-        database.insert_both_embeddings_batch(org_ids, embeddings, scalar_embeddings)
-        count += len(names)
+        embeddings = embedder.embed_batch(names)
+        database.update_embeddings_batch(ids, embeddings)
+        count += len(ids)
+        click.echo(f"Repaired {count:,} / {missing_count:,} embeddings...", err=True)
 
     click.echo(f"\nRepaired {count:,} embeddings successfully.", err=True)
     database.close()
-
-
-@click.command("rebuild-vec")
-@click.option("--db", "db_path", type=click.Path(), help="Database path")
-@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_rebuild_vec(db_path: Optional[str], verbose: bool):
-    """
-    Rebuild vec0 embedding tables with distance_metric=cosine.
-
-    Required once for databases created before indexed KNN support was added.
-    This enables fast MATCH-based vector search instead of brute-force scans.
-
-    \b
-    Examples:
-        corp-entity-db rebuild-vec
-        corp-entity-db rebuild-vec --db /path/to/entities.db
-    """
-    _configure_logging(verbose)
-
-    from corp_entity_db.store import (
-        get_database,
-        get_person_database,
-    )
-
-    db_path_obj = _resolve_db_path(db_path)
-
-    click.echo(f"Rebuilding vec0 tables in {db_path_obj}...", err=True)
-
-    # Rebuild organization embedding tables
-    click.echo("Rebuilding organization embedding tables...", err=True)
-    org_db = get_database(db_path=db_path_obj, readonly=False)
-    org_stats = org_db.rebuild_vec_tables()
-    for table, count in org_stats.items():
-        click.echo(f"  {table}: {count} rows", err=True)
-    org_db.close()
-
-    # Rebuild person embedding tables
-    click.echo("Rebuilding person embedding tables...", err=True)
-    person_db = get_person_database(db_path=db_path_obj, readonly=False)
-    person_stats = person_db.rebuild_vec_tables()
-    for table, count in person_stats.items():
-        click.echo(f"  {table}: {count} rows", err=True)
-    person_db.close()
-
-    total = sum(org_stats.values()) + sum(person_stats.values())
-    click.echo(f"\nDone. Rebuilt {total} total embeddings with cosine distance metric.", err=True)
-
-
-@click.command("backfill-scalar")
-@click.option("--db", "db_path", type=click.Path(), help="Database path")
-@click.option("--batch-size", type=int, default=10000, help="Batch size for processing (default: 10000)")
-@click.option("--embed-batch-size", type=int, default=64, help="Batch size for embedding generation (default: 64)")
-@click.option("--skip-generate", is_flag=True, help="Skip generating missing float32 embeddings (only quantize existing)")
-@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_backfill_scalar(db_path: Optional[str], batch_size: int, embed_batch_size: int, skip_generate: bool, verbose: bool):
-    """
-    Backfill scalar (int8) embeddings for the entity database.
-
-    This command handles two cases:
-    1. Records with float32 but missing scalar → quantize existing
-    2. Records missing both embeddings → generate both from scratch
-
-    Scalar embeddings provide 75% storage reduction with ~92% recall at top-100.
-
-    \b
-    Examples:
-        corp-entity-db backfill-scalar
-        corp-entity-db backfill-scalar --batch-size 5000 -v
-        corp-entity-db backfill-scalar --skip-generate  # Only quantize existing
-    """
-    _configure_logging(verbose)
-    import numpy as np
-
-    from corp_entity_db import OrganizationDatabase, CompanyEmbedder
-    from corp_entity_db.store import get_person_database
-
-    db_path_obj = _resolve_db_path(db_path)
-    embedder = None  # Lazy load only if needed
-
-    # Process organizations (readonly=False for write operations)
-    org_db = OrganizationDatabase(db_path=db_path_obj, readonly=False)
-
-    # Phase 1: Quantize existing float32 embeddings to scalar
-    org_quantized = 0
-    click.echo("Phase 1: Quantizing existing float32 embeddings to scalar...", err=True)
-    for batch_ids in org_db.get_missing_scalar_embedding_ids(batch_size=batch_size):
-        fp32_map = org_db.get_embeddings_by_ids(batch_ids)
-        if not fp32_map:
-            continue
-
-        ids = list(fp32_map.keys())
-        int8_embeddings = np.array([
-            np.clip(np.round(fp32_map[i] * 127), -127, 127).astype(np.int8)
-            for i in ids
-        ])
-
-        org_db.insert_scalar_embeddings_batch(ids, int8_embeddings)
-        org_quantized += len(ids)
-        click.echo(f"  Quantized {org_quantized:,} organization embeddings...", err=True)
-
-    click.echo(f"Quantized {org_quantized:,} organization embeddings.", err=True)
-
-    # Phase 2: Generate embeddings for records missing both
-    org_generated = 0
-    if not skip_generate:
-        click.echo("\nPhase 2: Generating embeddings for organizations missing both...", err=True)
-
-        for batch in org_db.get_missing_all_embedding_ids(batch_size=batch_size):
-            if not batch:
-                continue
-
-            # Lazy load embedder
-            if embedder is None:
-                click.echo("  Loading embedding model...", err=True)
-                embedder = CompanyEmbedder()
-
-            # Process in smaller batches for embedding generation
-            for i in range(0, len(batch), embed_batch_size):
-                sub_batch = batch[i:i + embed_batch_size]
-                ids = [item[0] for item in sub_batch]
-                names = [item[1] for item in sub_batch]
-
-                # Generate both float32 and int8 embeddings
-                fp32_batch, int8_batch = embedder.embed_batch_and_quantize(names, batch_size=embed_batch_size)
-
-                # Insert both
-                org_db.insert_both_embeddings_batch(ids, fp32_batch, int8_batch)
-                org_generated += len(ids)
-
-                if org_generated % 10000 == 0:
-                    click.echo(f"  Generated {org_generated:,} organization embeddings...", err=True)
-
-        click.echo(f"Generated {org_generated:,} organization embeddings.", err=True)
-
-    # Process people (readonly=False for write operations)
-    person_db = get_person_database(db_path=db_path_obj, readonly=False)
-
-    # Phase 1: Quantize existing float32 embeddings to scalar
-    person_quantized = 0
-    click.echo("\nPhase 1: Quantizing existing float32 person embeddings to scalar...", err=True)
-    for batch_ids in person_db.get_missing_scalar_embedding_ids(batch_size=batch_size):
-        fp32_map = person_db.get_embeddings_by_ids(batch_ids)
-        if not fp32_map:
-            continue
-
-        ids = list(fp32_map.keys())
-        int8_embeddings = np.array([
-            np.clip(np.round(fp32_map[i] * 127), -127, 127).astype(np.int8)
-            for i in ids
-        ])
-
-        person_db.insert_scalar_embeddings_batch(ids, int8_embeddings)
-        person_quantized += len(ids)
-        click.echo(f"  Quantized {person_quantized:,} person embeddings...", err=True)
-
-    click.echo(f"Quantized {person_quantized:,} person embeddings.", err=True)
-
-    # Phase 2: Generate embeddings for records missing both
-    person_generated = 0
-    if not skip_generate:
-        click.echo("\nPhase 2: Generating embeddings for people missing both...", err=True)
-
-        for batch in person_db.get_missing_all_embedding_ids(batch_size=batch_size):
-            if not batch:
-                continue
-
-            # Lazy load embedder
-            if embedder is None:
-                click.echo("  Loading embedding model...", err=True)
-                embedder = CompanyEmbedder()
-
-            # Process in smaller batches for embedding generation
-            for i in range(0, len(batch), embed_batch_size):
-                sub_batch = batch[i:i + embed_batch_size]
-                ids = [item[0] for item in sub_batch]
-                names = [item[1] for item in sub_batch]
-
-                # Generate both float32 and int8 embeddings
-                fp32_batch, int8_batch = embedder.embed_batch_and_quantize(names, batch_size=embed_batch_size)
-
-                # Insert both
-                person_db.insert_both_embeddings_batch(ids, fp32_batch, int8_batch)
-                person_generated += len(ids)
-
-                if person_generated % 10000 == 0:
-                    click.echo(f"  Generated {person_generated:,} person embeddings...", err=True)
-
-        click.echo(f"Generated {person_generated:,} person embeddings.", err=True)
-
-    # Summary
-    click.echo(f"\nSummary:", err=True)
-    click.echo(f"  Organizations: {org_quantized:,} quantized, {org_generated:,} generated", err=True)
-    click.echo(f"  People: {person_quantized:,} quantized, {person_generated:,} generated", err=True)
-    click.echo(f"  Total: {org_quantized + org_generated + person_quantized + person_generated:,} embeddings processed", err=True)
 
 
 @click.command("build-index")
@@ -671,7 +461,7 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
     click.echo(f"Database: {db_path_obj}", err=True)
     click.echo(f"Parameters: M={m}, ef_construction={ef_construction}, ef_search={ef_search}", err=True)
 
-    # Open read-only connection (we only read from scalar table)
+    # Open read-only connection (we only read embeddings)
     conn = _get_shared_connection(db_path_obj, readonly=True)
 
     if people:
@@ -721,8 +511,6 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
     """
     import sqlite3
 
-    import numpy as np
-
     from corp_entity_db import OrganizationDatabase, CompanyEmbedder
     from corp_entity_db.store import (
         get_person_database,
@@ -738,25 +526,8 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
     if orgs:
         org_db = OrganizationDatabase(db_path=db_path_obj, readonly=False)
 
-        # Quantize existing float32 → int8
-        org_quantized = 0
-        for batch_ids in org_db.get_missing_scalar_embedding_ids(batch_size=batch_size):
-            fp32_map = org_db.get_embeddings_by_ids(batch_ids)
-            if not fp32_map:
-                continue
-            ids = list(fp32_map.keys())
-            int8_embeddings = np.array([
-                np.clip(np.round(fp32_map[i] * 127), -127, 127).astype(np.int8)
-                for i in ids
-            ])
-            org_db.insert_scalar_embeddings_batch(ids, int8_embeddings)
-            org_quantized += len(ids)
-        if org_quantized:
-            click.echo(f"  Quantized {org_quantized:,} org embeddings (float32 → int8)", err=True)
-
-        # Generate both for records missing entirely
         org_generated = 0
-        for batch in org_db.get_missing_all_embedding_ids(batch_size=batch_size):
+        for batch in org_db.get_missing_embedding_ids(batch_size=batch_size):
             if not batch:
                 continue
             if embedder is None:
@@ -766,38 +537,23 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
                 sub_batch = batch[i:i + embed_batch_size]
                 ids = [item[0] for item in sub_batch]
                 names = [item[1] for item in sub_batch]
-                fp32_batch, int8_batch = embedder.embed_batch_and_quantize(names, batch_size=embed_batch_size)
-                org_db.insert_both_embeddings_batch(ids, fp32_batch, int8_batch)
+                fp32_batch = embedder.embed_batch(names, batch_size=embed_batch_size)
+                org_db.update_embeddings_batch(ids, fp32_batch)
                 org_generated += len(ids)
                 if org_generated % 10000 == 0:
                     click.echo(f"  Generated {org_generated:,} org embeddings...", err=True)
         if org_generated:
             click.echo(f"  Generated {org_generated:,} org embeddings", err=True)
-
-        if not org_quantized and not org_generated:
+        else:
             click.echo("  Organizations: all embeddings up to date", err=True)
+
         org_db.close()
 
     if people:
         person_db = get_person_database(db_path=db_path_obj, readonly=False)
 
-        person_quantized = 0
-        for batch_ids in person_db.get_missing_scalar_embedding_ids(batch_size=batch_size):
-            fp32_map = person_db.get_embeddings_by_ids(batch_ids)
-            if not fp32_map:
-                continue
-            ids = list(fp32_map.keys())
-            int8_embeddings = np.array([
-                np.clip(np.round(fp32_map[i] * 127), -127, 127).astype(np.int8)
-                for i in ids
-            ])
-            person_db.insert_scalar_embeddings_batch(ids, int8_embeddings)
-            person_quantized += len(ids)
-        if person_quantized:
-            click.echo(f"  Quantized {person_quantized:,} person embeddings (float32 → int8)", err=True)
-
         person_generated = 0
-        for batch in person_db.get_missing_all_embedding_ids(batch_size=batch_size):
+        for batch in person_db.get_missing_embedding_ids(batch_size=batch_size):
             if not batch:
                 continue
             if embedder is None:
@@ -807,20 +563,20 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
                 sub_batch = batch[i:i + embed_batch_size]
                 ids = [item[0] for item in sub_batch]
                 names = [item[1] for item in sub_batch]
-                fp32_batch, int8_batch = embedder.embed_batch_and_quantize(names, batch_size=embed_batch_size)
-                person_db.insert_both_embeddings_batch(ids, fp32_batch, int8_batch)
+                fp32_batch = embedder.embed_batch(names, batch_size=embed_batch_size)
+                person_db.update_embeddings_batch(ids, fp32_batch)
                 person_generated += len(ids)
                 if person_generated % 10000 == 0:
                     click.echo(f"  Generated {person_generated:,} person embeddings...", err=True)
         if person_generated:
             click.echo(f"  Generated {person_generated:,} person embeddings", err=True)
-
-        if not person_quantized and not person_generated:
+        else:
             click.echo("  People: all embeddings up to date", err=True)
+
         person_db.close()
 
-    # --- Step 2: Rebuild USearch indexes ---
-    click.echo("\n=== Step 2: Rebuild USearch indexes ===", err=True)
+    # --- Step 2: Build USearch indexes ---
+    click.echo("\n=== Step 2: Build USearch indexes ===", err=True)
 
     conn = _get_shared_connection(db_path_obj, readonly=True)
 
@@ -857,8 +613,8 @@ def db_post_import(db_path: Optional[str], people: bool, orgs: bool, batch_size:
 
     \b
     Steps:
-    1. Generate float32 + int8 embeddings for new records
-    2. Rebuild USearch HNSW indexes for fast search
+    1. Generate embeddings for new records
+    2. Build USearch HNSW indexes for fast search
     3. VACUUM database to reclaim space
 
     \b
@@ -938,6 +694,292 @@ def db_migrate(db_path: str, rename_file: bool, yes: bool, verbose: bool):
 
     except Exception as e:
         raise click.ClickException(f"Migration failed: {e}")
+
+
+@click.command("migrate-embeddings")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--batch-size", type=int, default=10000, help="SQL batch size (default: 10000)")
+@click.option("--embed-batch-size", type=int, default=64, help="Embedder batch size (default: 64)")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_migrate_embeddings(db_path: Optional[str], batch_size: int, embed_batch_size: int, verbose: bool):
+    """
+    Migrate embeddings from old vec0 tables to the new embedding column.
+
+    Copies float32 embeddings from the legacy sqlite-vec vec0 virtual tables
+    (organization_embeddings, person_embeddings) into the embedding BLOB column
+    on the main organizations/people tables. Generates any missing embeddings,
+    enforces NOT NULL on the embedding column, then VACUUMs.
+
+    Requires sqlite-vec to be installed to read from vec0 tables. Any records
+    not found in vec0 tables will have embeddings generated from scratch.
+
+    \b
+    Steps:
+    1. Copy embeddings from vec0 tables to main table column
+    2. Generate embeddings for any records still missing them
+    3. Enforce NOT NULL on embedding columns (table rebuild)
+    4. Drop legacy vec0 tables
+    5. VACUUM
+
+    \b
+    Examples:
+        corp-entity-db migrate-embeddings
+        corp-entity-db migrate-embeddings --db /path/to/entities.db
+        corp-entity-db migrate-embeddings -v
+    """
+    import sqlite3
+
+    _configure_logging(verbose)
+
+    from corp_entity_db import CompanyEmbedder
+    from corp_entity_db.schema_v2 import CREATE_ORGANIZATIONS_V2_INDEXES, CREATE_PEOPLE_V2_INDEXES
+
+    db_path_obj = _resolve_db_path(db_path)
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    click.echo(f"Database: {db_path_obj}", err=True)
+
+    conn = sqlite3.connect(str(db_path_obj))
+    conn.row_factory = sqlite3.Row
+
+    # Performance pragmas for bulk operations
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA mmap_size=268435456")   # 256MB mmap
+    conn.execute("PRAGMA cache_size=-500000")     # 500MB page cache
+    conn.execute("PRAGMA threads=4")              # helper threads for sorting/subqueries
+
+    # Ensure embedding column exists on both tables (may be missing on older schemas)
+    for table in ["organizations", "people"]:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN embedding BLOB DEFAULT NULL")
+            click.echo(f"  Added embedding column to {table}", err=True)
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    # --- Step 1: Copy embeddings from vec0 tables ---
+    click.echo("\n=== Step 1: Copy embeddings from vec0 tables ===", err=True)
+
+    # Try to load sqlite-vec for reading vec0 tables
+    _sqlite_vec_mod = None
+    try:
+        import sqlite_vec as _sqlite_vec_mod
+        conn.enable_load_extension(True)
+        _sqlite_vec_mod.load(conn)
+        conn.enable_load_extension(False)
+        click.echo("  sqlite-vec loaded successfully", err=True)
+    except (ImportError, Exception) as e:
+        click.echo(f"  sqlite-vec not available ({e}), will generate all embeddings from scratch", err=True)
+
+    vec0_tables = {
+        "organizations": "organization_embeddings",
+        "people": "person_embeddings",
+    }
+    id_columns = {
+        "organizations": "org_id",
+        "people": "person_id",
+    }
+
+    for table, vec_table in vec0_tables.items():
+        # Check if the vec0 table exists
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE name=?", (vec_table,)
+        )
+        if not cursor.fetchone():
+            click.echo(f"  {vec_table}: not found, skipping", err=True)
+            continue
+
+        if _sqlite_vec_mod is None:
+            click.echo(f"  {vec_table}: exists but sqlite-vec not loaded, cannot read", err=True)
+            continue
+
+        id_col = id_columns[table]
+
+        # Get ID range and count for batching by ID bands (avoids full table scans)
+        row = conn.execute(
+            f"SELECT COUNT(*) as cnt, MIN({id_col}) as min_id, MAX({id_col}) as max_id "
+            f"FROM {vec_table} WHERE embedding IS NOT NULL"
+        ).fetchone()
+        total, min_id, max_id = row["cnt"], row["min_id"], row["max_id"]
+        click.echo(f"  Copying {total:,} embeddings from {vec_table} (IDs {min_id}-{max_id})...", err=True)
+
+        # Bulk UPDATE in ID-range batches using UPDATE ... FROM (SQLite 3.33+)
+        copy_batch = 100_000
+        copied = 0
+        batch_num = 0
+        range_start = min_id
+        while range_start <= max_id:
+            batch_num += 1
+            range_end = range_start + copy_batch - 1
+            cursor = conn.execute(
+                f"UPDATE {table} SET embedding = v.embedding "
+                f"FROM {vec_table} v WHERE {table}.id = v.{id_col} "
+                f"AND v.embedding IS NOT NULL "
+                f"AND v.{id_col} >= ? AND v.{id_col} <= ?",
+                (range_start, range_end),
+            )
+            affected = cursor.rowcount
+            conn.commit()
+            copied += affected
+            if affected > 0:
+                click.echo(f"  {table} batch {batch_num}: {affected:,} rows ({copied:,}/{total:,})", err=True)
+            range_start = range_end + 1
+
+        click.echo(f"  {vec_table}: copied {copied:,} embeddings total", err=True)
+
+        # Drop all related vec0/shadow tables now that data is copied
+        click.echo(f"  Dropping legacy embedding tables for {table}...", err=True)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?",
+            (f"{vec_table}%",),
+        )
+        for row in cursor.fetchall():
+            conn.execute(f"DROP TABLE IF EXISTS [{row['name']}]")
+            click.echo(f"    Dropped {row['name']}", err=True)
+        conn.commit()
+
+        # VACUUM to reclaim space
+        click.echo(f"  Vacuuming after {table}...", err=True)
+        conn.close()
+        vacuum_conn = sqlite3.connect(str(db_path_obj))
+        vacuum_conn.execute("VACUUM")
+        vacuum_conn.close()
+        conn = sqlite3.connect(str(db_path_obj))
+        conn.row_factory = sqlite3.Row
+        if _sqlite_vec_mod is not None:
+            conn.enable_load_extension(True)
+            _sqlite_vec_mod.load(conn)
+            conn.enable_load_extension(False)
+
+    # --- Step 2: Generate missing embeddings ---
+    click.echo("\n=== Step 2: Generate missing embeddings ===", err=True)
+
+    embedder = None  # Lazy load
+
+    for table in ["organizations", "people"]:
+        cursor = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE embedding IS NULL"
+        )
+        missing_count = cursor.fetchone()[0]
+
+        if missing_count == 0:
+            click.echo(f"  {table}: all embeddings present", err=True)
+            continue
+
+        if embedder is None:
+            click.echo("  Loading embedding model...", err=True)
+            embedder = CompanyEmbedder()
+
+        generated = 0
+        with click.progressbar(length=missing_count, label=f"  {table}", file=click.get_text_stream("stderr")) as bar:
+            while True:
+                cursor = conn.execute(
+                    f"SELECT id, name FROM {table} WHERE embedding IS NULL LIMIT ?",
+                    (batch_size,),
+                )
+                rows = cursor.fetchall()
+                if not rows:
+                    break
+
+                for i in range(0, len(rows), embed_batch_size):
+                    sub_batch = rows[i : i + embed_batch_size]
+                    ids = [r["id"] for r in sub_batch]
+                    names = [r["name"] for r in sub_batch]
+
+                    embeddings = embedder.embed_batch(names, batch_size=embed_batch_size)
+
+                    for record_id, emb in zip(ids, embeddings):
+                        embedding_blob = emb.astype("float32").tobytes()
+                        conn.execute(
+                            f"UPDATE {table} SET embedding = ? WHERE id = ?",
+                            (embedding_blob, record_id),
+                        )
+
+                    generated += len(sub_batch)
+                    bar.update(len(sub_batch))
+
+                conn.commit()
+
+        click.echo(f"  {table}: generated {generated:,} embeddings", err=True)
+
+    # --- Step 3: Enforce NOT NULL on embedding columns ---
+    click.echo("\n=== Step 3: Enforce NOT NULL on embedding columns ===", err=True)
+
+    index_ddl = {
+        "organizations": CREATE_ORGANIZATIONS_V2_INDEXES,
+        "people": CREATE_PEOPLE_V2_INDEXES,
+    }
+
+    for table in ["organizations", "people"]:
+        # Verify no NULLs remain
+        cursor = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE embedding IS NULL"
+        )
+        null_count = cursor.fetchone()[0]
+        if null_count > 0:
+            raise click.ClickException(
+                f"Cannot enforce NOT NULL on {table}.embedding: "
+                f"{null_count:,} records still have NULL embeddings"
+            )
+
+        # Get the current CREATE TABLE statement
+        cursor = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        )
+        original_sql = cursor.fetchone()["sql"]
+
+        if "embedding BLOB NOT NULL" in original_sql:
+            click.echo(f"  {table}: already NOT NULL", err=True)
+            continue
+
+        # Replace the column definition
+        new_sql = original_sql.replace(
+            "embedding BLOB DEFAULT NULL",
+            "embedding BLOB NOT NULL",
+        )
+        new_sql = new_sql.replace(
+            f"CREATE TABLE {table}",
+            f"CREATE TABLE {table}_new",
+            1,
+        )
+
+        # Get column names
+        cursor = conn.execute(f"PRAGMA table_info({table})")
+        columns = [row["name"] for row in cursor.fetchall()]
+        col_list = ", ".join(columns)
+
+        click.echo(f"  Rebuilding {table} with NOT NULL constraint...", err=True)
+        conn.execute(new_sql)
+        conn.execute(
+            f"INSERT INTO {table}_new ({col_list}) SELECT {col_list} FROM {table}"
+        )
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+
+        # Recreate indexes
+        for stmt in index_ddl[table].strip().split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                conn.execute(stmt)
+
+        conn.commit()
+        click.echo(f"  {table}: embedding column is now NOT NULL", err=True)
+
+    # --- Step 4: Final VACUUM ---
+    click.echo("\n=== Step 4: VACUUM ===", err=True)
+    conn.close()
+
+    # VACUUM requires its own connection (no active transactions)
+    vacuum_conn = sqlite3.connect(str(db_path_obj))
+    vacuum_conn.execute("VACUUM")
+    vacuum_conn.close()
+
+    db_size_mb = db_path_obj.stat().st_size / 1024**2
+    click.echo(f"  Database size after VACUUM: {db_size_mb:,.0f} MB", err=True)
+
+    click.echo("\nEmbedding migration complete!", err=True)
 
 
 @click.command("migrate-v2")

@@ -99,11 +99,10 @@ from .management import (
     db_upload,
     db_create_lite,
     db_repair_embeddings,
-    db_rebuild_vec,
-    db_backfill_scalar,
     db_build_index,
     db_post_import,
     db_migrate,
+    db_migrate_embeddings,
     db_migrate_v2,
 )
 
@@ -113,11 +112,10 @@ main.add_command(db_download)
 main.add_command(db_upload)
 main.add_command(db_create_lite)
 main.add_command(db_repair_embeddings)
-main.add_command(db_rebuild_vec)
-main.add_command(db_backfill_scalar)
 main.add_command(db_build_index)
 main.add_command(db_post_import)
 main.add_command(db_migrate)
+main.add_command(db_migrate_embeddings)
 main.add_command(db_migrate_v2)
 
 from .repair import db_repair_resume, db_fix_resume

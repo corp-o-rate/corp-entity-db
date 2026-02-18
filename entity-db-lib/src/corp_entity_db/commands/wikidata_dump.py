@@ -132,7 +132,7 @@ def _embedder_thread(
     shutdown_event: threading.Event,
     thread_errors: list[Exception],
 ) -> None:
-    """Embedder thread: consumes ImportBatch, produces (batch, embeddings, scalar_embeddings)."""
+    """Embedder thread: consumes ImportBatch, produces (batch, embeddings)."""
     import logging
     logger = logging.getLogger(__name__)
 
@@ -146,8 +146,8 @@ def _embedder_thread(
                 logger.info("Embedder thread: shutdown requested, stopping")
                 break
 
-            embeddings, scalar_embeddings = embedder.embed_batch_and_quantize(batch.embedding_texts)
-            result_queue.put((batch, embeddings, scalar_embeddings))
+            embeddings = embedder.embed_batch(batch.embedding_texts)
+            result_queue.put((batch, embeddings))
 
     except Exception as e:
         thread_errors.append(e)
@@ -576,13 +576,13 @@ def db_import_wikidata_dump(
                 # Embedder is done — all batches processed
                 break
 
-            batch, embeddings, scalar_embeddings = result
+            batch, embeddings = result
 
             # Insert into database (main thread owns SQLite writes)
             if batch.record_type == "people":
-                person_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
+                person_database.insert_batch(batch.records, embeddings)
             elif batch.record_type == "org" and org_database:
-                org_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
+                org_database.insert_batch(batch.records, embeddings)
 
             # Update progress from batch metadata
             people_count = batch.people_count
@@ -611,11 +611,11 @@ def db_import_wikidata_dump(
                 result = result_queue.get_nowait()
                 if result is None:
                     break
-                batch, embeddings, scalar_embeddings = result
+                batch, embeddings = result
                 if batch.record_type == "people":
-                    person_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
+                    person_database.insert_batch(batch.records, embeddings)
                 elif batch.record_type == "org" and org_database:
-                    org_database.insert_batch(batch.records, embeddings, scalar_embeddings=scalar_embeddings)
+                    org_database.insert_batch(batch.records, embeddings)
                 people_count = batch.people_count
                 orgs_count = batch.orgs_count
                 last_entity_index = batch.last_entity_index
