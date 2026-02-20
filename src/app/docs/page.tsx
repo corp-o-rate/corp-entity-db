@@ -165,7 +165,7 @@ export default function DocsPage() {
                 PyPI
               </a>
               <a
-                href="https://huggingface.co/Corp-o-Rate-Community/entity-references"
+                href="https://huggingface.co/datasets/Corp-o-Rate-Community/entity-references"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-sm text-gray-600 hover:text-indigo-600 transition-colors"

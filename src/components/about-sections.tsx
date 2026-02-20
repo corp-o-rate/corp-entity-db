@@ -21,18 +21,21 @@ export function HowItWorks() {
                 Embedding-Based Search
               </h4>
               <p className="text-sm text-gray-600">
-                Uses google/embeddinggemma-300m (300M params) to generate dense vector embeddings.
-                USearch HNSW indexes enable sub-millisecond approximate nearest neighbor lookups.
+                Search is semantic (so that CEO and boss are similar, Andy and Andrew are similar) not textual. The index is a USearch HNSW index which enables extremely fast approximate nearest neighbor lookups over millions of embeddings
+                We use the Gemma Embedding  model (300M params) to generate vector embeddings and quantize them to 8 bit integers for reduced storage and memory overhead.
+
               </p>
             </div>
             <div className="bg-gray-50 p-4 rounded-lg border">
               <h4 className="font-semibold mb-2 flex items-center gap-2">
                 <Database className="w-4 h-4 text-red-600" />
-                Hybrid Search
+                SQLite Database
               </h4>
               <p className="text-sm text-gray-600">
-                Combines text filtering with embedding similarity for higher precision.
-                SQLite with 256MB mmap, 500MB page cache, and WAL journal mode.
+                The details of each person/org are stored in a SQLite database along with the choice of
+                canonical representation. Each person+role+org has a separate entry but if we know that
+                the same underlying person is represented one is taken as canonical. E.g. 'Barack Obama, President' over
+                'Barack Obama, Senator'.
               </p>
             </div>
             <div className="bg-gray-50 p-4 rounded-lg border">
@@ -41,9 +44,10 @@ export function HowItWorks() {
                 Multi-Source Data
               </h4>
               <p className="text-sm text-gray-600">
+                Data comes from the following sources:
                 ~9.9M organizations from GLEIF, SEC Edgar, Companies House, and Wikidata.
                 ~66.9M people from Wikidata and Companies House officers.
-                Canonicalization links equivalent records across sources.
+                Canonicalization links equivalent records across multiple sources.
               </p>
             </div>
             <div className="bg-gray-50 p-4 rounded-lg border">

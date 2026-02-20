@@ -50,7 +50,7 @@ def db_search_people(query: str, db_path: Optional[str], top_k: int, hybrid: boo
     click.echo(f"\nFound {len(results)} results:\n")
     for i, (record, similarity) in enumerate(results, 1):
         role_str = f" ({record.known_for_role})" if record.known_for_role else ""
-        org_str = f" at {record.known_for_org}" if record.known_for_org else ""
+        org_str = f" at {record.known_for_org_name}" if record.known_for_org_name else ""
         country_str = f" [{record.country}]" if record.country else ""
         click.echo(f"  {i}. {record.name}{role_str}{org_str}{country_str}")
         click.echo(f"     Source: wikidata:{record.source_id}, Type: {record.person_type.value}, Score: {similarity:.3f}")
@@ -484,7 +484,7 @@ def db_search_people_perf_test(
             if for_llm and not top1_match:
                 top_results = [
                     {"rank": r, "name": rec.name, "score": round(sc, 4),
-                     "person_type": rec.person_type.value, "role": rec.known_for_role, "org": rec.known_for_org}
+                     "person_type": rec.person_type.value, "role": rec.known_for_role, "org": rec.known_for_org_name}
                     for r, (rec, sc) in enumerate(results, 1)
                 ]
                 llm_issues.append({

@@ -701,12 +701,6 @@ class WikidataDumpImporter:
         # Reverse lookup: person_qid → [(org_qid, role, start_date, end_date), ...] from org executive properties
         # Built during org processing, used to backfill people missing known_for_org
         self._reverse_person_orgs: dict[str, list[tuple[str, str, Optional[str], Optional[str]]]] = {}
-        # Track QIDs that need label resolution (country, role)
-        self._unresolved_qids: set[str] = set()
-        # Label cache built during dump processing
-        self._label_cache: dict[str, str] = {}
-        # Track labels added since last flush (avoids scanning full cache)
-        self._new_labels: dict[str, str] = {}
         # Cache position item → jurisdiction QID (e.g. Q11696 "President of the United States" → Q30 "United States")
         # Built from all entities with P31=Q4164871 (position) that have P1001 or P17.
         # Used to backfill org context for P39 claims without qualifier-level org.
@@ -993,18 +987,12 @@ class WikidataDumpImporter:
                     entity = _json_loads(line)
                     entity_id = entity.get("id", "")
 
-                    # Cache label for entities we actually process
-                    self._cache_entity_label(entity)
                     # Cache jurisdiction for position items (cheap — just check for P1001/P17)
                     self._cache_position_jurisdiction(entity)
                     entity_count += 1
 
                     if entity_count >= next_log_threshold:
-                        logger.info(
-                            f"Processed {entity_count:,} entities, "
-                            f"label cache: {len(self._label_cache):,}, "
-                            f"unresolved QIDs: {len(self._unresolved_qids):,}"
-                        )
+                        logger.info(f"Processed {entity_count:,} entities")
                         if next_log_threshold < 100_000:
                             next_log_threshold = 100_000
                         elif next_log_threshold < 1_000_000:
@@ -1200,41 +1188,49 @@ class WikidataDumpImporter:
         dump_path: Optional[Path] = None,
         people_limit: Optional[int] = None,
         orgs_limit: Optional[int] = None,
+        locations_limit: Optional[int] = None,
         import_people: bool = True,
         import_orgs: bool = True,
+        import_locations: bool = True,
         require_enwiki: bool = False,
         skip_people_ids: Optional[set[str]] = None,
         skip_org_ids: Optional[set[str]] = None,
+        skip_location_ids: Optional[set[str]] = None,
         start_index: int = 0,
         progress_callback: Optional[Callable[[int, str, int, int], None]] = None,
     ) -> Iterator[tuple[str, ImportRecord]]:
         """
-        Import both people and organizations in a single pass through the dump.
+        Import people, organizations, and locations in a single pass through the dump.
 
-        This is more efficient than calling import_people() and import_organizations()
-        separately, as it only reads the ~100GB dump file once.
+        This is more efficient than calling import methods separately,
+        as it only reads the ~100GB dump file once.
 
         Args:
             dump_path: Path to dump file (uses self._dump_path if not provided)
             people_limit: Optional maximum number of people records
             orgs_limit: Optional maximum number of org records
+            locations_limit: Optional maximum number of location records
             import_people: Whether to import people (default: True)
             import_orgs: Whether to import organizations (default: True)
+            import_locations: Whether to import locations (default: True)
             require_enwiki: If True, only include entities with English Wikipedia articles
             skip_people_ids: Optional set of people source_ids (Q codes) to skip
             skip_org_ids: Optional set of org source_ids (Q codes) to skip
+            skip_location_ids: Optional set of location source_ids (Q codes) to skip
             start_index: Entity index to start from (for resume support)
             progress_callback: Optional callback(entity_index, entity_id, people_count, orgs_count)
                               called periodically. Useful for saving progress.
 
         Yields:
-            Tuples of (record_type, record) where record_type is "person" or "org"
+            Tuples of (record_type, record) where record_type is "person", "org", or "location"
         """
         path = dump_path or self._dump_path
         people_count = 0
         orgs_count = 0
+        locations_count = 0
         people_skipped = 0
         orgs_skipped = 0
+        locations_skipped = 0
         current_entity_index = start_index
 
         logger.info("Starting combined import from Wikidata dump...")
@@ -1248,12 +1244,17 @@ class WikidataDumpImporter:
             logger.info(f"Importing organizations (limit: {orgs_limit or 'none'})")
             if skip_org_ids:
                 logger.info(f"  Skipping {len(skip_org_ids):,} existing org Q codes")
+        if import_locations:
+            logger.info(f"Importing locations (limit: {locations_limit or 'none'})")
+            if skip_location_ids:
+                logger.info(f"  Skipping {len(skip_location_ids):,} existing location Q codes")
 
-        # Check if we've hit both limits
+        # Check if we've hit all limits
         def limits_reached() -> bool:
             people_done = not import_people or (people_limit and people_count >= people_limit)
             orgs_done = not import_orgs or (orgs_limit and orgs_count >= orgs_limit)
-            return bool(people_done and orgs_done)
+            locations_done = not import_locations or (locations_limit and locations_count >= locations_limit)
+            return bool(people_done and orgs_done and locations_done)
 
         def track_entity(entity_index: int, entity_id: str) -> None:
             nonlocal current_entity_index
@@ -1280,12 +1281,12 @@ class WikidataDumpImporter:
                                 break
                         if people_count % 10_000 == 0:
                             logger.info(
-                                f"Progress: {people_count:,} people, {orgs_count:,} orgs "
-                                f"(entity {current_entity_index:,})"
+                                f"Progress: {people_count:,} people, {orgs_count:,} orgs, "
+                                f"{locations_count:,} locations (entity {current_entity_index:,})"
                             )
                         if progress_callback:
                             progress_callback(current_entity_index, entity_id, people_count, orgs_count)
-                        continue  # Entity was a person, don't check for org
+                        continue  # Entity was a person, don't check for org/location
 
             # Try to process as organization (if importing orgs and not at limit)
             if import_orgs and (not orgs_limit or orgs_count < orgs_limit):
@@ -1298,16 +1299,35 @@ class WikidataDumpImporter:
                         orgs_count += 1
                         if orgs_count % 10_000 == 0:
                             logger.info(
-                                f"Progress: {people_count:,} people, {orgs_count:,} orgs "
-                                f"(entity {current_entity_index:,})"
+                                f"Progress: {people_count:,} people, {orgs_count:,} orgs, "
+                                f"{locations_count:,} locations (entity {current_entity_index:,})"
                             )
                         if progress_callback:
                             progress_callback(current_entity_index, entity_id, people_count, orgs_count)
                         yield ("org", org_record)
+                        continue  # Entity was an org, don't check for location
+
+            # Try to process as location (if importing locations and not at limit)
+            if import_locations and (not locations_limit or locations_count < locations_limit):
+                if skip_location_ids and entity_id in skip_location_ids:
+                    locations_skipped += 1
+                else:
+                    location_record = self._process_location_entity(entity, require_enwiki=require_enwiki)
+                    if location_record:
+                        locations_count += 1
+                        if locations_count % 10_000 == 0:
+                            logger.info(
+                                f"Progress: {people_count:,} people, {orgs_count:,} orgs, "
+                                f"{locations_count:,} locations (entity {current_entity_index:,})"
+                            )
+                        if progress_callback:
+                            progress_callback(current_entity_index, entity_id, people_count, orgs_count)
+                        yield ("location", location_record)
 
         logger.info(
-            f"Combined import complete: {people_count:,} people, {orgs_count:,} orgs "
-            f"(skipped {people_skipped:,} people, {orgs_skipped:,} orgs)"
+            f"Combined import complete: {people_count:,} people, {orgs_count:,} orgs, "
+            f"{locations_count:,} locations "
+            f"(skipped {people_skipped:,} people, {orgs_skipped:,} orgs, {locations_skipped:,} locations)"
         )
 
     def _process_person_entity(
@@ -1739,7 +1759,6 @@ class WikidataDumpImporter:
         # Get country (P27 - country of citizenship)
         countries = self._get_claim_values(entity, "P27")
         country_qid = countries[0] if countries else ""
-        country_label = self._resolve_qid(country_qid) if country_qid else ""
 
         # Get birth and death dates (P569, P570)
         birth_date = self._get_time_claim(claims, "P569")
@@ -1766,12 +1785,12 @@ class WikidataDumpImporter:
             extra_context: Optional[dict] = None,
             role_label_override: str = "",
         ) -> PersonRecord:
-            role_label = role_label_override or (self._resolve_qid(role_qid) if role_qid else "")
-            org_label = self._resolve_qid(org_qid) if org_qid else ""
+            role_label = role_label_override
+            org_label = ""
 
             # Track discovered org
             if org_qid:
-                self._discovered_orgs[org_qid] = org_label
+                self._discovered_orgs[org_qid] = org_qid
 
             record_data = {
                 **base_record_data,
@@ -1785,10 +1804,10 @@ class WikidataDumpImporter:
                 name=label,
                 source="wikidata",
                 source_id=qid,
-                country=country_label,
+                country="",
                 person_type=person_type,
                 known_for_role=role_label,
-                known_for_org=org_label,
+                known_for_org_name=org_label,
                 from_date=start_date,
                 to_date=end_date,
                 birth_date=birth_date,
@@ -1910,9 +1929,6 @@ class WikidataDumpImporter:
         countries = self._get_claim_values(entity, "P17")
         country_qid = countries[0] if countries else ""
 
-        # Resolve country QID to label
-        country_label = self._resolve_qid(country_qid) if country_qid else ""
-
         # Get LEI (P1278)
         lei = self._get_string_claim(claims, "P1278")
 
@@ -1978,7 +1994,7 @@ class WikidataDumpImporter:
             name=label,
             source="wikipedia",  # Use "wikipedia" per existing convention
             source_id=qid,
-            region=country_label,
+            region="",
             entity_type=entity_type,
             from_date=inception,
             to_date=dissolution,
@@ -2274,66 +2290,113 @@ class WikidataDumpImporter:
         """
         return self._reverse_person_orgs
 
-    def get_unresolved_qids(self) -> set[str]:
-        """Get QIDs that need label resolution."""
-        return self._unresolved_qids.copy()
-
-    def get_label_cache(self, copy: bool = True) -> dict[str, str]:
-        """Get the label cache built during import.
-
-        Args:
-            copy: If True, return a copy (thread-safe). If False, return
-                  the live dict (caller must not mutate).
+    def import_fk_relations(
+        self,
+        dump_path: Optional[Path] = None,
+        start_index: int = 0,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+    ) -> Iterator[tuple[str, str, dict]]:
         """
-        return dict(self._label_cache) if copy else self._label_cache
+        Second pass: yield FK relationship data for each entity.
 
-    def set_label_cache(self, labels: dict[str, str]) -> None:
+        Re-reads the dump and extracts only cross-table FK references
+        (country QIDs, parent QIDs, org QIDs) without building full records.
+        Also rebuilds _reverse_person_orgs for backfill.
+
+        Yields:
+            (entity_type, qid, fk_data) where fk_data contains QID references
         """
-        Set initial label cache from existing data (e.g., from database).
+        path = dump_path or self._dump_path
+        count = 0
 
-        Args:
-            labels: Mapping of QID -> label to seed the cache
-        """
-        self._label_cache.update(labels)
-        logger.info(f"Seeded label cache with {len(labels)} existing labels")
+        # Clear and rebuild reverse person orgs during pass 2
+        self._reverse_person_orgs.clear()
 
-    def get_new_labels_since(self, known_qids: set[str] | None = None) -> dict[str, str]:
-        """
-        Get labels added since last flush (or since known set).
+        logger.info("Starting FK relations pass (pass 2)...")
 
-        Uses the efficient _new_labels tracking dict instead of scanning
-        the entire label cache. Call flush_new_labels() after persisting.
+        for entity in self.iter_entities(path, start_index=start_index, progress_callback=progress_callback):
+            if entity.get("type") != "item":
+                continue
 
-        Args:
-            known_qids: Deprecated, ignored. Kept for backwards compatibility.
+            entity_id = entity.get("id", "")
+            if not entity_id:
+                continue
 
-        Returns:
-            Dict of new QID -> label mappings
-        """
-        # Snapshot the _new_labels dict (much smaller than full cache)
-        result = dict(self._new_labels)
-        return result
+            claims = entity.get("claims", {})
 
-    def flush_new_labels(self) -> None:
-        """Clear the new-labels tracker after persisting to DB."""
-        self._new_labels.clear()
+            # Check entity type using same detection as pass 1
+            if self._is_human(entity):
+                # Person: extract country (P27) and org QID from positions/employer
+                countries = self._get_claim_values(entity, "P27")
+                country_qid = countries[0] if countries else ""
 
-    def _cache_entity_label(self, entity: dict) -> None:
-        """
-        Cache the English label for an entity during dump processing.
+                # Get best org QID from positions
+                positions = self._get_positions_with_org(claims)
+                _, _, org_qid, _, _, _ = self._get_best_role_org(positions)
 
-        This builds up a lookup table as we iterate through the dump,
-        so we can resolve QID references (countries, roles) to labels.
-        """
-        qid = entity.get("id", "")
-        if not qid:
-            return
+                # Fallback: P108 employer
+                if not org_qid:
+                    employers = self._get_claim_values(entity, "P108")
+                    if employers:
+                        org_qid = employers[0]
 
-        labels = entity.get("labels", {})
-        en_label = labels.get("en", {}).get("value", "")
-        if en_label:
-            self._label_cache[qid] = en_label
-            self._new_labels[qid] = en_label
+                if country_qid or org_qid:
+                    fk_data: dict[str, str] = {}
+                    if country_qid:
+                        fk_data["country_qid"] = country_qid
+                    if org_qid:
+                        fk_data["org_qid"] = org_qid
+                    count += 1
+                    yield ("person", entity_id, fk_data)
+
+            elif self._get_org_type(entity) is not None:
+                # Org: extract country (P17) and rebuild reverse person orgs
+                countries = self._get_claim_values(entity, "P17")
+                country_qid = countries[0] if countries else ""
+
+                # Rebuild reverse person orgs from executive properties
+                executive_props = [
+                    ("P169", "chief executive officer"),
+                    ("P488", "chairperson"),
+                    ("P112", "founded by"),
+                    ("P1037", "director/manager"),
+                    ("P3320", "board member"),
+                ]
+                for prop, role_desc in executive_props:
+                    for claim in claims.get(prop, []):
+                        mainsnak = claim.get("mainsnak", {})
+                        person_qid = mainsnak.get("datavalue", {}).get("value", {}).get("id")
+                        if not person_qid:
+                            continue
+                        qualifiers = claim.get("qualifiers", {})
+                        start_date = self._get_time_qualifier(qualifiers, "P580")
+                        end_date = self._get_time_qualifier(qualifiers, "P582")
+                        self._reverse_person_orgs.setdefault(person_qid, []).append(
+                            (entity_id, role_desc, start_date, end_date)
+                        )
+
+                if country_qid:
+                    count += 1
+                    yield ("org", entity_id, {"country_qid": country_qid})
+
+            elif self._get_location_type(entity) is not None:
+                # Location: extract parent QIDs (P131) and country QIDs (P17)
+                parent_qids = self._get_claim_values(entity, "P131")
+                country_qids = self._get_claim_values(entity, "P17")
+
+                if parent_qids or country_qids:
+                    fk_data = {}
+                    if parent_qids:
+                        fk_data["parent_qids"] = parent_qids
+                    if country_qids:
+                        fk_data["country_qids"] = country_qids
+                    count += 1
+                    yield ("location", entity_id, fk_data)
+
+            if count % 100_000 == 0 and count > 0:
+                logger.info(f"FK relations pass: {count:,} entities with FKs extracted")
+
+        logger.info(f"FK relations pass complete: {count:,} entities with FK data")
 
     def _cache_position_jurisdiction(self, entity: dict) -> None:
         """
@@ -2367,155 +2430,3 @@ class WikidataDumpImporter:
                     self._position_jurisdictions[qid] = jur_qid
                     return
 
-    def _resolve_qid(self, qid: str) -> str:
-        """
-        Resolve a QID to a label using the in-memory cache.
-
-        Returns the label if cached, otherwise returns the raw QID and tracks it
-        for batch resolution after import completes. No network calls during import.
-        """
-        if not qid or not qid.startswith("Q"):
-            return qid
-
-        if qid in self._label_cache:
-            return self._label_cache[qid]
-
-        # Track for post-import batch SPARQL resolution — no blocking network calls
-        self._unresolved_qids.add(qid)
-        return qid
-
-    def _resolve_single_qid_sparql(self, qid: str) -> Optional[str]:
-        """
-        Resolve a single QID to a label via SPARQL.
-
-        Args:
-            qid: Wikidata QID (e.g., 'Q30')
-
-        Returns:
-            Label string or None if not found
-        """
-        import json
-        import urllib.parse
-        import urllib.request
-
-        query = f"""
-        SELECT ?label WHERE {{
-          wd:{qid} rdfs:label ?label FILTER(LANG(?label) = "en") .
-        }}
-        LIMIT 1
-        """
-
-        try:
-            params = urllib.parse.urlencode({
-                "query": query,
-                "format": "json",
-            })
-            url = f"https://query.wikidata.org/sparql?{params}"
-
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "Accept": "application/sparql-results+json",
-                    "User-Agent": "corp-extractor/1.0 (QID resolver)",
-                }
-            )
-
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode("utf-8"))
-
-            bindings = data.get("results", {}).get("bindings", [])
-            if bindings:
-                return bindings[0].get("label", {}).get("value")
-
-        except Exception as e:
-            logger.debug(f"SPARQL lookup failed for {qid}: {e}")
-
-        return None
-
-    def resolve_qids_via_sparql(
-        self,
-        qids: Optional[set[str]] = None,
-        batch_size: int = 50,
-        delay_seconds: float = 1.0,
-    ) -> dict[str, str]:
-        """
-        Resolve QIDs to labels via Wikidata SPARQL queries.
-
-        This is used after import to resolve any QIDs that weren't found
-        in the dump (e.g., if import was limited or dump was incomplete).
-
-        Args:
-            qids: Set of QIDs to resolve (defaults to unresolved_qids)
-            batch_size: Number of QIDs per SPARQL query (default 50)
-            delay_seconds: Delay between queries to avoid rate limiting
-
-        Returns:
-            Dict mapping QID -> label for resolved QIDs
-        """
-        import json
-        import time
-        import urllib.parse
-        import urllib.request
-
-        if qids is None:
-            qids = self._unresolved_qids
-
-        if not qids:
-            return {}
-
-        resolved: dict[str, str] = {}
-        qid_list = list(qids)
-
-        logger.info(f"Resolving {len(qid_list)} QIDs via SPARQL...")
-
-        for i in range(0, len(qid_list), batch_size):
-            batch = qid_list[i:i + batch_size]
-
-            # Build VALUES clause
-            values = " ".join(f"wd:{qid}" for qid in batch)
-            query = f"""
-            SELECT ?item ?itemLabel WHERE {{
-              VALUES ?item {{ {values} }}
-              ?item rdfs:label ?itemLabel FILTER(LANG(?itemLabel) = "en") .
-            }}
-            """
-
-            try:
-                params = urllib.parse.urlencode({
-                    "query": query,
-                    "format": "json",
-                })
-                url = f"https://query.wikidata.org/sparql?{params}"
-
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "Accept": "application/sparql-results+json",
-                        "User-Agent": "corp-extractor/1.0 (QID resolver)",
-                    }
-                )
-
-                with urllib.request.urlopen(req, timeout=60) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-
-                for binding in data.get("results", {}).get("bindings", []):
-                    item_uri = binding.get("item", {}).get("value", "")
-                    label = binding.get("itemLabel", {}).get("value", "")
-                    if item_uri and label:
-                        qid = item_uri.split("/")[-1]
-                        resolved[qid] = label
-                        self._label_cache[qid] = label
-
-                logger.debug(f"Resolved batch {i // batch_size + 1}: {len(batch)} QIDs")
-
-            except Exception as e:
-                logger.warning(f"SPARQL batch failed: {e}")
-
-            if i + batch_size < len(qid_list):
-                time.sleep(delay_seconds)
-
-        # Update unresolved set
-        self._unresolved_qids -= set(resolved.keys())
-
-        logger.info(f"Resolved {len(resolved)} QIDs, {len(self._unresolved_qids)} remaining unresolved")
-        return resolved

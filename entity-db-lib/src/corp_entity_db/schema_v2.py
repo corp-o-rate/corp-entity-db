@@ -9,7 +9,6 @@ Changes from v1:
 - New tables: roles, locations, simplified_location_types
 - organizations_v2: source_id FK, entity_type_id FK, region_id FK (to locations)
 - people_v2: source_id FK, person_type_id FK, country_id FK, known_for_role_id FK
-- qid_labels: qid stored as INTEGER (Q prefix stripped)
 - Human-readable views with JOINs
 """
 
@@ -153,7 +152,6 @@ CREATE INDEX IF NOT EXISTS idx_orgs_source_identifier ON organizations(source_id
 CREATE INDEX IF NOT EXISTS idx_orgs_region_id ON organizations(region_id);
 CREATE INDEX IF NOT EXISTS idx_orgs_entity_type_id ON organizations(entity_type_id);
 CREATE INDEX IF NOT EXISTS idx_orgs_canon_id ON organizations(canon_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_orgs_name_region_source ON organizations(name, region_id, source_id);
 """
 
 # =============================================================================
@@ -171,8 +169,8 @@ CREATE TABLE IF NOT EXISTS people (
     country_id INTEGER,
     person_type_id INTEGER NOT NULL DEFAULT 15,
     known_for_role_id INTEGER,
-    known_for_org TEXT NOT NULL DEFAULT '',
     known_for_org_id INTEGER,
+    known_for_org_location_id INTEGER,
     from_date TEXT DEFAULT NULL,
     to_date TEXT DEFAULT NULL,
     birth_date TEXT DEFAULT NULL,
@@ -186,6 +184,7 @@ CREATE TABLE IF NOT EXISTS people (
     FOREIGN KEY (person_type_id) REFERENCES people_types(id),
     FOREIGN KEY (known_for_role_id) REFERENCES roles(id),
     FOREIGN KEY (known_for_org_id) REFERENCES organizations(id),
+    FOREIGN KEY (known_for_org_location_id) REFERENCES locations(id),
     UNIQUE(source_identifier, source_id, known_for_role_id, known_for_org_id)
 );
 """
@@ -200,18 +199,8 @@ CREATE INDEX IF NOT EXISTS idx_people_country_id ON people(country_id);
 CREATE INDEX IF NOT EXISTS idx_people_person_type_id ON people(person_type_id);
 CREATE INDEX IF NOT EXISTS idx_people_known_for_role_id ON people(known_for_role_id);
 CREATE INDEX IF NOT EXISTS idx_people_known_for_org_id ON people(known_for_org_id);
+CREATE INDEX IF NOT EXISTS idx_people_known_for_org_location_id ON people(known_for_org_location_id);
 CREATE INDEX IF NOT EXISTS idx_people_canon_id ON people(canon_id);
-"""
-
-# =============================================================================
-# QID LABELS TABLE (V2 - INTEGER QID)
-# =============================================================================
-
-CREATE_QID_LABELS_V2 = """
-CREATE TABLE IF NOT EXISTS qid_labels (
-    qid INTEGER PRIMARY KEY,
-    label TEXT NOT NULL
-);
 """
 
 # =============================================================================
@@ -265,8 +254,9 @@ SELECT
     l.name as country,
     pt.name as person_type,
     r.name as known_for_role,
-    p.known_for_org,
+    COALESCE(kfo.name, kfl.name) as known_for_org,
     p.known_for_org_id,
+    p.known_for_org_location_id,
     p.from_date,
     p.to_date,
     p.birth_date,
@@ -277,7 +267,9 @@ FROM people p
 JOIN source_types s ON p.source_id = s.id
 LEFT JOIN locations l ON p.country_id = l.id
 JOIN people_types pt ON p.person_type_id = pt.id
-LEFT JOIN roles r ON p.known_for_role_id = r.id;
+LEFT JOIN roles r ON p.known_for_role_id = r.id
+LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
+LEFT JOIN locations kfl ON p.known_for_org_location_id = kfl.id;
 """
 
 CREATE_ROLES_VIEW = """
@@ -338,8 +330,6 @@ ALL_DDL_STATEMENTS = [
     CREATE_ORGANIZATIONS_V2_INDEXES,
     CREATE_PEOPLE_V2,
     CREATE_PEOPLE_V2_INDEXES,
-    # Reference tables
-    CREATE_QID_LABELS_V2,
     # Metadata
     CREATE_DB_INFO,
 ]

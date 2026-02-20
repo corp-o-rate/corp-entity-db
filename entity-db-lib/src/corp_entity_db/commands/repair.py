@@ -13,7 +13,6 @@ from ._common import _configure_logging, _resolve_db_path
 
 def _insert_discovered_org(
     conn,
-    is_v2: Optional[bool],
     org_qid: str,
     org_label: str,
     discovered_from: str,
@@ -22,27 +21,29 @@ def _insert_discovered_org(
 
     Embeddings will be generated later by ``db post-import``.
     """
+    from corp_entity_db.seed_data import SOURCE_NAME_TO_ID, ORG_TYPE_NAME_TO_ID
+
     name_normalized = org_label.lower().strip()
     record_json = json.dumps({
         "wikidata_id": org_qid,
         "discovered_from": discovered_from,
         "needs_label_resolution": org_label == org_qid,
     })
-    if is_v2:
-        from corp_entity_db.seed_data import SOURCE_NAME_TO_ID, ORG_TYPE_NAME_TO_ID
-        source_type_id = SOURCE_NAME_TO_ID.get("wikipedia", 4)
-        entity_type_id = ORG_TYPE_NAME_TO_ID.get("business", 17)
-        conn.execute("""
-            INSERT OR IGNORE INTO organizations
-            (name, name_normalized, source_id, source_identifier, entity_type_id, from_date, to_date, record)
-            VALUES (?, ?, ?, ?, ?, '', '', ?)
-        """, (org_label, name_normalized, source_type_id, org_qid, entity_type_id, record_json))
-    else:
-        conn.execute("""
-            INSERT OR IGNORE INTO organizations
-            (name, name_normalized, source, source_id, region, entity_type, from_date, to_date, record)
-            VALUES (?, ?, 'wikipedia', ?, '', 'business', '', '', ?)
-        """, (org_label, name_normalized, org_qid, record_json))
+    source_type_id = SOURCE_NAME_TO_ID.get("wikipedia", 4)
+    entity_type_id = ORG_TYPE_NAME_TO_ID.get("business", 17)
+
+    # Parse QID integer from org_qid (e.g. "Q312" -> 312)
+    qid = None
+    if org_qid.startswith("Q"):
+        qid_str = org_qid[1:]
+        if qid_str.isdigit():
+            qid = int(qid_str)
+
+    conn.execute("""
+        INSERT OR IGNORE INTO organizations
+        (name, name_normalized, source_id, source_identifier, qid, entity_type_id, from_date, to_date, record)
+        VALUES (?, ?, ?, ?, ?, ?, '', '', ?)
+    """, (org_label, name_normalized, source_type_id, org_qid, qid, entity_type_id, record_json))
 
 
 @click.command("repair-resume")
@@ -123,35 +124,14 @@ def db_repair_resume(db_path: Optional[str], verbose: bool):
         person_database.close()
         return
 
-    # Step 2: Resolve org QIDs to labels
-    click.echo("\n=== Step 2: Resolve org QIDs to labels ===", err=True)
-    all_labels = person_database.get_all_qid_labels()
-    click.echo(f"  Loaded {len(all_labels):,} QID labels from DB", err=True)
-
-    resolved_map: dict[str, list[tuple[str, str, str | None, str | None]]] = {}
-    for person_qid, entries in reverse_person_orgs.items():
-        resolved_entries: list[tuple[str, str, str | None, str | None]] = []
-        for org_qid, role, start_date, end_date in entries:
-            org_label = all_labels.get(org_qid, "")
-            # Fallback: look up org name from organizations table
-            if not org_label:
-                org_rec = org_database.get_by_source_id("wikipedia", org_qid)
-                if org_rec:
-                    org_label = org_rec.name
-            if org_label:
-                resolved_entries.append((org_label, role, start_date, end_date))
-        if resolved_entries:
-            resolved_map[person_qid] = resolved_entries
-
-    click.echo(f"  Resolved {len(resolved_map):,} people with org labels", err=True)
-
-    # Step 3: Backfill people
-    click.echo("\n=== Step 3: Backfill known_for_org ===", err=True)
-    if resolved_map:
-        backfilled = person_database.backfill_known_for_org(resolved_map)
+    # Step 2: Backfill known_for_org_id/known_for_org_location_id
+    click.echo("\n=== Step 2: Backfill known_for_org FKs ===", err=True)
+    if reverse_person_orgs:
+        # Pass org QIDs directly — backfill resolves to org/location FKs
+        backfilled = person_database.backfill_known_for_org(reverse_person_orgs)
         click.echo(f"  Updated {backfilled:,} people records", err=True)
     else:
-        click.echo("  No resolved mappings to backfill", err=True)
+        click.echo("  No reverse mappings to backfill", err=True)
 
     # Step 4: Insert discovered orgs referenced by people but not in orgs table
     click.echo("\n=== Step 4: Check for missing discovered orgs ===", err=True)
@@ -166,8 +146,7 @@ def db_repair_resume(db_path: Optional[str], verbose: bool):
         record_data = person_record.record or {}
         org_qid = record_data.get("org_qid", "")
         if org_qid and org_qid not in existing_org_ids:
-            org_label = all_labels.get(org_qid, org_qid)
-            _insert_discovered_org(conn, org_database_rw._is_v2, org_qid, org_label, "repair_resume")
+            _insert_discovered_org(conn, org_qid, org_qid, "repair_resume")
             existing_org_ids.add(org_qid)
             missing_orgs += 1
             if missing_orgs % 10000 == 0:
@@ -196,7 +175,7 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
     Creates additional people records from org→person executive mappings
     (e.g. Microsoft P169→Bill Gates creates a "Bill Gates, CEO, Microsoft" record),
     and backfills position jurisdictions (e.g. "President of the United States"
-    gets known_for_org="United States").
+    gets known_for_org_location_id pointing to "United States").
 
     This scans the full dump (~100GB) — step 1 is JSON-only, steps 3b/3c need
     the embedder for new/updated records.
@@ -403,18 +382,12 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                 continue  # Already has executives, skip
             record_data["executives"] = exec_list
             # Update record JSON in DB
-            if org_database._is_v2:
-                from corp_entity_db.store import SOURCE_NAME_TO_ID
-                source_type_id = SOURCE_NAME_TO_ID.get("wikipedia", 4)
-                conn.execute(
-                    "UPDATE organizations SET record = ? WHERE source_id = ? AND source_identifier = ?",
-                    (json.dumps(record_data), source_type_id, org_qid),
-                )
-            else:
-                conn.execute(
-                    "UPDATE organizations SET record = ? WHERE source = 'wikipedia' AND source_id = ?",
-                    (json.dumps(record_data), org_qid),
-                )
+            from corp_entity_db.store import SOURCE_NAME_TO_ID
+            source_type_id = SOURCE_NAME_TO_ID.get("wikipedia", 4)
+            conn.execute(
+                "UPDATE organizations SET record = ? WHERE source_id = ? AND source_identifier = ?",
+                (json.dumps(record_data), source_type_id, org_qid),
+            )
             updated_orgs += 1
             if updated_orgs % 10000 == 0:
                 conn.commit()
@@ -429,41 +402,15 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
     elif from_step <= 2:
         click.echo("\n=== Step 2: No org executives found to backfill ===", err=True)
 
-    # ==================== Step 3: Resolve and backfill people ====================
+    # ==================== Step 3: Backfill known_for_org FKs ====================
     if from_step <= 3 and reverse_person_orgs:
-        click.echo("\n=== Step 3: Resolve and backfill known_for_org ===", err=True)
+        click.echo("\n=== Step 3: Backfill known_for_org FKs ===", err=True)
         person_database = get_person_database(db_path=db_path_obj, readonly=False)
-        org_database = get_database(db_path=db_path_obj, readonly=True)
 
-        # Load labels from DB and importer cache
-        all_labels = person_database.get_all_qid_labels()
-        if importer:
-            all_labels.update(importer.get_label_cache(copy=False))
-        click.echo(f"  Loaded {len(all_labels):,} QID labels", err=True)
+        # Pass org QIDs directly — backfill resolves to org/location FKs
+        backfilled = person_database.backfill_known_for_org(reverse_person_orgs)
+        click.echo(f"  Updated {backfilled:,} people records", err=True)
 
-        resolved_map: dict[str, list[tuple[str, str, str | None, str | None]]] = {}
-        for person_qid, entries in reverse_person_orgs.items():
-            resolved_entries: list[tuple[str, str, str | None, str | None]] = []
-            for org_qid, role, start_date, end_date in entries:
-                org_label = all_labels.get(org_qid, "")
-                if not org_label:
-                    org_rec = org_database.get_by_source_id("wikipedia", org_qid)
-                    if org_rec:
-                        org_label = org_rec.name
-                if org_label:
-                    resolved_entries.append((org_label, role, start_date, end_date))
-            if resolved_entries:
-                resolved_map[person_qid] = resolved_entries
-
-        click.echo(f"  Resolved {len(resolved_map):,} people with org labels", err=True)
-
-        if resolved_map:
-            backfilled = person_database.backfill_known_for_org(resolved_map)
-            click.echo(f"  Updated {backfilled:,} people records", err=True)
-        else:
-            click.echo("  No resolved mappings to backfill", err=True)
-
-        org_database.close()
         person_database.close()
     elif from_step <= 3:
         click.echo("\n=== Step 3: No reverse mappings to backfill ===", err=True)
@@ -480,10 +427,6 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
         person_database = get_person_database(db_path=db_path_obj, readonly=False)
         org_database = get_database(db_path=db_path_obj, readonly=True)
         embedder = CompanyEmbedder()
-
-        all_labels = person_database.get_all_qid_labels()
-        if importer:
-            all_labels.update(importer.get_label_cache(copy=False))
 
         conn = person_database._connect()
         roles_db = get_roles_database(db_path=db_path_obj, readonly=False)
@@ -508,12 +451,13 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                 continue
 
             existing = conn.execute(
-                "SELECT known_for_org FROM people WHERE qid = ?", (qid_int,)
+                "SELECT known_for_org_id, known_for_org_location_id FROM people WHERE qid = ?", (qid_int,)
             ).fetchall()
             if not existing:
                 continue  # Person not in DB at all, skip
 
-            existing_orgs = {row[0].lower() for row in existing if row[0]}
+            # Track existing org/location FK pairs to avoid duplicates
+            existing_fks = {(row[0], row[1]) for row in existing}
             base_row = conn.execute(
                 "SELECT name, country_id, person_type_id, birth_date, death_date, record FROM people WHERE qid = ? LIMIT 1",
                 (qid_int,),
@@ -529,16 +473,31 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
             base_record_json = base_row[5] or "{}"
 
             for rev_org_qid, rev_role, rev_start, rev_end in entries:
-                org_label = all_labels.get(rev_org_qid, "")
-                if not org_label:
-                    org_rec = org_database.get_by_source_id("wikipedia", rev_org_qid)
-                    if org_rec:
-                        org_label = org_rec.name
-                if not org_label:
+                # Resolve org QID to org_id or location_id (wikidata→wikidata)
+                resolved_org_id = org_database.get_id_by_source_id("wikipedia", rev_org_qid)
+                resolved_loc_id = None
+                if resolved_org_id is None:
+                    org_qid_int = int(rev_org_qid.lstrip("Q")) if rev_org_qid.startswith("Q") else None
+                    if org_qid_int is not None:
+                        loc_row = conn.execute(
+                            "SELECT id FROM locations WHERE qid = ? AND source_id = 4", (org_qid_int,)
+                        ).fetchone()
+                        if loc_row:
+                            resolved_loc_id = loc_row[0]
+
+                if resolved_org_id is None and resolved_loc_id is None:
                     skipped += 1
                     continue
 
-                if org_label.lower() in existing_orgs:
+                # Skip if this person already has a record with this org/location FK
+                if (resolved_org_id, resolved_loc_id) in existing_fks:
+                    continue
+
+                # Get org label for embedding text
+                org_rec = org_database.get_by_source_id("wikipedia", rev_org_qid)
+                org_label = org_rec.name if org_rec else ""
+                if not org_label:
+                    skipped += 1
                     continue
 
                 embed_text = f"{base_name}, {rev_role}, {org_label}" if rev_role else f"{base_name}, {org_label}"
@@ -559,7 +518,8 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                     "country_id": base_country_id,
                     "person_type_id": base_person_type_id,
                     "role_id": role_id,
-                    "org_label": org_label,
+                    "org_id": resolved_org_id,
+                    "location_id": resolved_loc_id,
                     "from_date": rev_start or "",
                     "to_date": rev_end or "",
                     "birth_date": base_birth_date,
@@ -567,7 +527,7 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                     "record_json": json.dumps(record_data),
                     "embed_text": embed_text,
                 })
-                existing_orgs.add(org_label.lower())
+                existing_fks.add((resolved_org_id, resolved_loc_id))
 
         click.echo(f"\n  Collected {len(pending):,} records to insert ({skipped:,} skipped, no org label)", err=True)
 
@@ -616,13 +576,14 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                     cursor = conn.execute(
                         """INSERT INTO people
                         (qid, name, name_normalized, source_id, source_identifier, country_id,
-                         person_type_id, known_for_role_id, known_for_org, from_date, to_date,
-                         birth_date, death_date, record, embedding)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         person_type_id, known_for_role_id, known_for_org_id, known_for_org_location_id,
+                         from_date, to_date, birth_date, death_date, record, embedding)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             rec["qid_int"], rec["name"], rec["name_normalized"],
                             4, rec["person_qid"], rec["country_id"],
-                            rec["person_type_id"], rec["role_id"], rec["org_label"],
+                            rec["person_type_id"], rec["role_id"],
+                            rec.get("org_id"), rec.get("location_id"),
                             rec["from_date"], rec["to_date"],
                             rec["birth_date"], rec["death_date"],
                             rec["record_json"],
@@ -658,14 +619,10 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
         embedder = CompanyEmbedder()
         conn = person_database._connect()
 
-        all_labels = person_database.get_all_qid_labels()
-        if importer:
-            all_labels.update(importer.get_label_cache(copy=False))
-
         rows = conn.execute(
-            "SELECT id, qid, name, record FROM people WHERE (known_for_org = '' OR known_for_org IS NULL) AND source_id = 4"
+            "SELECT id, qid, name, record FROM people WHERE known_for_org_id IS NULL AND known_for_org_location_id IS NULL AND source_id = 4"
         ).fetchall()
-        click.echo(f"  Found {len(rows):,} people with empty known_for_org", err=True)
+        click.echo(f"  Found {len(rows):,} people with no known_for_org FK", err=True)
 
         # Phase 1: Collect updates (no embedding yet — fast)
         click.echo("  Phase 1: Resolving jurisdictions...", err=True)
@@ -683,14 +640,27 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
             for pos_qid in positions:
                 jur_qid = position_jurisdictions.get(pos_qid, "")
                 if jur_qid:
-                    jur_label = all_labels.get(jur_qid, "")
-                    if jur_label:
-                        pos_label = all_labels.get(pos_qid, "")
+                    # Resolve jurisdiction QID to location_id
+                    jur_qid_int = int(jur_qid.lstrip("Q")) if jur_qid.startswith("Q") else None
+                    if jur_qid_int is None:
+                        continue
+                    loc_row = conn.execute(
+                        "SELECT id, name FROM locations WHERE qid = ? AND source_id = 4", (jur_qid_int,)
+                    ).fetchone()
+                    if loc_row:
+                        jur_label = loc_row["name"]
+                        # Look up position label from roles table by QID
+                        pos_qid_int = int(pos_qid.lstrip("Q")) if pos_qid.startswith("Q") else None
+                        pos_label = ""
+                        if pos_qid_int:
+                            role_row = conn.execute("SELECT id, name FROM roles WHERE qid = ? LIMIT 1", (pos_qid_int,)).fetchone()
+                            if role_row:
+                                pos_label = role_row["name"]
                         role_id = roles_db.get_or_create(pos_label, source_id=4) if pos_label else None
                         embed_text = f"{name}, {pos_label}, {jur_label}" if pos_label else f"{name}, {jur_label}"
                         pending_updates.append({
                             "person_id": person_id,
-                            "jur_label": jur_label,
+                            "location_id": loc_row["id"],
                             "role_id": role_id,
                             "embed_text": embed_text,
                         })
@@ -737,11 +707,11 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
 
                 for i, rec in enumerate(batch):
                     conn.execute(
-                        """UPDATE people SET known_for_org = ?,
+                        """UPDATE people SET known_for_org_location_id = ?,
                            known_for_role_id = COALESCE(known_for_role_id, ?),
                            embedding = ?
                         WHERE id = ?""",
-                        (rec["jur_label"], rec["role_id"], fp32_embs[i].tobytes(), rec["person_id"]),
+                        (rec["location_id"], rec["role_id"], fp32_embs[i].tobytes(), rec["person_id"]),
                     )
                     updated += 1
 
@@ -768,10 +738,6 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
     org_database = get_database(db_path=db_path_obj, readonly=False)
     conn = org_database._connect()
 
-    # Load labels for resolving org names
-    all_labels = person_database.get_all_qid_labels()
-    click.echo(f"  Loaded {len(all_labels):,} QID labels", err=True)
-
     existing_org_ids = org_database.get_all_source_ids(source="wikipedia")
     click.echo(f"  Existing orgs: {len(existing_org_ids):,}", err=True)
 
@@ -782,8 +748,8 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
         record_data = person_record.record or {}
         org_qid = record_data.get("org_qid", "")
         if org_qid and org_qid not in existing_org_ids:
-            org_label = all_labels.get(org_qid, org_qid)
-            _insert_discovered_org(conn, org_database._is_v2, org_qid, org_label, "fix_resume")
+            org_label = org_qid
+            _insert_discovered_org(conn, org_qid, org_label, "fix_resume")
             existing_org_ids.add(org_qid)
             missing_orgs += 1
             if missing_orgs % 10000 == 0:
@@ -796,8 +762,8 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
     # Also insert from dump-discovered orgs (if step 1 was run)
     for org_qid in discovered_orgs:
         if org_qid not in existing_org_ids:
-            org_label = all_labels.get(org_qid, org_qid)
-            _insert_discovered_org(conn, org_database._is_v2, org_qid, org_label, "fix_resume")
+            org_label = org_qid
+            _insert_discovered_org(conn, org_qid, org_label, "fix_resume")
             existing_org_ids.add(org_qid)
             missing_orgs += 1
 

@@ -39,8 +39,8 @@ erDiagram
         text country
         int person_type_id FK
         text known_for_role
-        text known_for_org
         int known_for_org_id FK
+        int known_for_org_location_id FK
         text from_date
         text to_date
         text birth_date
@@ -138,7 +138,7 @@ The **lite database** drops all embedding tables entirely. Search is performed v
 
 <span id="usearch-indexes" />
 
-USearch provides sub-millisecond approximate nearest neighbor search on 50M+ vectors. Index files are co-located with the database:
+USearch provides rapid approximate nearest neighbor search on 50M+ vectors. Index files are co-located with the database:
 
 <table>
   <thead>

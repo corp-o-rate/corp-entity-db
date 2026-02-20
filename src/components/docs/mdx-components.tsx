@@ -1,6 +1,7 @@
 'use client';
 
 import { Pre, CodeBlock } from './code-block';
+import { CodeTabs } from './code-tabs';
 import { MermaidCodeBlock } from './mermaid';
 import Link from 'next/link';
 import { ExternalLink } from 'lucide-react';
@@ -189,6 +190,7 @@ export function useMDXComponents(components: MDXComponents): MDXComponents {
 
     // Custom components
     CodeBlock,
+    CodeTabs,
 
     ...components,
   };

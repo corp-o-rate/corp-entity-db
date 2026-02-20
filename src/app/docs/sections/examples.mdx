@@ -44,7 +44,7 @@ vec = embedder.embed("Elon Musk")
 results = db.search(vec, top_k=5, query_text="Elon Musk")
 
 for record, score in results:
-    role_info = f"{record.known_for_role} at {record.known_for_org}" if record.known_for_role else ""
+    role_info = f"{record.known_for_role} at {record.known_for_org_name}" if record.known_for_role else ""
     print(f"  {record.name} — {role_info} (score: {score:.3f})")
     print(f"    Type: {record.person_type}, Born: {record.birth_date or 'unknown'}")
 ```

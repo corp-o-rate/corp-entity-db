@@ -286,7 +286,7 @@ class CompaniesHouseOfficersImporter:
             country="GB",
             person_type=person_type,
             known_for_role=role,
-            known_for_org=self._current_company_name,
+            known_for_org_name=self._current_company_name,
             from_date=appointment_date,
             to_date=resignation_date,
             birth_date=birth_date,

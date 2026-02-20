@@ -47,16 +47,24 @@ The simplest deployment is running everything locally. The library downloads mod
   </tbody>
 </table>
 
-```bash
-# Install
+<CodeTabs tabs={[
+  { label: "pip", language: "bash", code: `# Install
 pip install corp-entity-db
 
 # Download database + indexes
 corp-entity-db download
 
 # Start searching
-corp-entity-db search "Microsoft"
-```
+corp-entity-db search "Microsoft"` },
+  { label: "uv", language: "bash", code: `# Install
+uv add corp-entity-db
+
+# Download database + indexes
+uv run corp-entity-db download
+
+# Start searching
+uv run corp-entity-db search "Microsoft"` },
+]} />
 
 For Python usage, the database auto-downloads on first access:
 
@@ -122,8 +130,8 @@ Configure your RunPod endpoint with:
 
 For self-hosted Docker deployments:
 
-```bash
-# Minimal Dockerfile
+<CodeTabs tabs={[
+  { label: "pip", language: "bash", code: `# Minimal Dockerfile
 FROM python:3.12-slim
 
 # Install the library with serve extra
@@ -136,8 +144,25 @@ RUN corp-entity-db download
 EXPOSE 8222
 
 # Run the server
-CMD ["corp-entity-db", "serve", "--host", "0.0.0.0", "--port", "8222"]
-```
+CMD ["corp-entity-db", "serve", "--host", "0.0.0.0", "--port", "8222"]` },
+  { label: "uv", language: "bash", code: `# Minimal Dockerfile
+FROM python:3.12-slim
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Install the library with serve extra
+RUN uv pip install --system "corp-entity-db[serve]"
+
+# Download database on build (bakes it into the image)
+RUN corp-entity-db download
+
+# Expose the server port
+EXPOSE 8222
+
+# Run the server
+CMD ["corp-entity-db", "serve", "--host", "0.0.0.0", "--port", "8222"]` },
+]} />
 
 The Docker image is significantly lighter than the `corp-extractor` deployment because it does not require the T5-Gemma model (~1.5GB) or GLiNER2 (~200MB). The main size contributors are:
 - Python + dependencies (~500MB)

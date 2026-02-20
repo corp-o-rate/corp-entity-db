@@ -61,7 +61,7 @@ query_vec = embedder.embed("Tim Cook")
 results = db.search(query_vec, top_k=5, query_text="Tim Cook")
 
 for record, score in results:
-    print(f"{record.name} | {record.known_for_role} at {record.known_for_org}")
+    print(f"{record.name} | {record.known_for_role} at {record.known_for_org_name}")
     print(f"  Type: {record.person_type}, Score: {score:.3f}")
     if record.is_historic:
         print(f"  Historic: {record.birth_date} - {record.death_date}")
@@ -128,7 +128,7 @@ print(embedder.embedding_dim)  # 768
 
 <span id="hub-functions" />
 
-Download and upload databases from [HuggingFace Hub](https://huggingface.co/Corp-o-Rate-Community/entity-references).
+Download and upload databases from [HuggingFace Hub](https://huggingface.co/datasets/Corp-o-Rate-Community/entity-references).
 
 ```python
 from corp_entity_db import download_database, get_database_path, upload_database
@@ -225,7 +225,7 @@ record = PersonRecord(
     source_id="Q265398",
     person_type=PersonType.EXECUTIVE,
     known_for_role="CEO",
-    known_for_org="Apple Inc.",
+    known_for_org_name="Apple Inc.",
     birth_date="1960-11-01",
 )
 print(record.canonical_id)   # "wikidata:Q265398"

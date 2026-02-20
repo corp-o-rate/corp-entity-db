@@ -101,9 +101,6 @@ from .management import (
     db_repair_embeddings,
     db_build_index,
     db_post_import,
-    db_migrate,
-    db_migrate_embeddings,
-    db_migrate_v2,
 )
 
 main.add_command(db_status)
@@ -114,9 +111,6 @@ main.add_command(db_create_lite)
 main.add_command(db_repair_embeddings)
 main.add_command(db_build_index)
 main.add_command(db_post_import)
-main.add_command(db_migrate)
-main.add_command(db_migrate_embeddings)
-main.add_command(db_migrate_v2)
 
 from .repair import db_repair_resume, db_fix_resume
 

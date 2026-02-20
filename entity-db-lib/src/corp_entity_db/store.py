@@ -27,6 +27,7 @@ from .models import (
     RoleRecord,
     SimplifiedLocationType,
 )
+from .schema_v2 import create_all_tables
 from .seed_data import (
     LOCATION_TYPE_NAME_TO_ID,
     LOCATION_TYPE_QID_TO_ID,
@@ -109,6 +110,11 @@ def _get_shared_connection(
         conn.row_factory = sqlite3.Row
 
         _apply_pragmas(conn, readonly=False)
+
+        # Ensure all v3 schema tables exist (CREATE IF NOT EXISTS is idempotent)
+        create_all_tables(conn, embedding_dim)
+        seed_all_enums(conn)
+        seed_pycountry_locations(conn)
 
         _shared_connections[path_key] = conn
         logger.debug(f"Created shared database connection for {path_key}")
@@ -730,112 +736,7 @@ class OrganizationDatabase:
                     self._schema_version = int(row[0])
                     logger.debug(f"Detected schema version {self._schema_version} from db_info")
 
-        # Create tables (idempotent) - only for v1 schema or fresh databases
-        # v2 databases already have their schema from migration
-        # Skip table creation in readonly mode
-        if not self._is_v2 and not self._readonly:
-            self._create_tables()
-
         return self._conn
-
-    @property
-    def _org_table(self) -> str:
-        """Return table/view name for organization queries needing text fields."""
-        return "organizations_view" if self._is_v2 else "organizations"
-
-    def _create_tables(self) -> None:
-        """Create database tables including sqlite-vec virtual table."""
-        conn = self._conn
-        assert conn is not None
-
-        # Main organization records table
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS organizations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                name_normalized TEXT NOT NULL,
-                source TEXT NOT NULL,
-                source_id TEXT NOT NULL,
-                region TEXT NOT NULL DEFAULT '',
-                entity_type TEXT NOT NULL DEFAULT 'unknown',
-                from_date TEXT NOT NULL DEFAULT '',
-                to_date TEXT NOT NULL DEFAULT '',
-                record TEXT NOT NULL,
-                UNIQUE(source, source_id)
-            )
-        """)
-
-        # Add region column if it doesn't exist (migration for existing DBs)
-        try:
-            conn.execute("ALTER TABLE organizations ADD COLUMN region TEXT NOT NULL DEFAULT ''")
-            logger.info("Added region column to organizations table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Add entity_type column if it doesn't exist (migration for existing DBs)
-        try:
-            conn.execute("ALTER TABLE organizations ADD COLUMN entity_type TEXT NOT NULL DEFAULT 'unknown'")
-            logger.info("Added entity_type column to organizations table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Add from_date column if it doesn't exist (migration for existing DBs)
-        try:
-            conn.execute("ALTER TABLE organizations ADD COLUMN from_date TEXT NOT NULL DEFAULT ''")
-            logger.info("Added from_date column to organizations table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Add to_date column if it doesn't exist (migration for existing DBs)
-        try:
-            conn.execute("ALTER TABLE organizations ADD COLUMN to_date TEXT NOT NULL DEFAULT ''")
-            logger.info("Added to_date column to organizations table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Add canon_id column if it doesn't exist (migration for canonicalization)
-        try:
-            conn.execute("ALTER TABLE organizations ADD COLUMN canon_id INTEGER DEFAULT NULL")
-            logger.info("Added canon_id column to organizations table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Add canon_size column if it doesn't exist (migration for canonicalization)
-        try:
-            conn.execute("ALTER TABLE organizations ADD COLUMN canon_size INTEGER DEFAULT 1")
-            logger.info("Added canon_size column to organizations table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Create indexes on main table
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_name ON organizations(name)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_name_normalized ON organizations(name_normalized)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_source ON organizations(source)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_source_id ON organizations(source, source_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_region ON organizations(region)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_entity_type ON organizations(entity_type)")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orgs_name_region_source ON organizations(name, region, source)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_canon_id ON organizations(canon_id)")
-
-        # Create sqlite-vec virtual table for embeddings (float32)
-        # vec0 is the recommended virtual table type
-        conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS organization_embeddings USING vec0(
-                org_id INTEGER PRIMARY KEY,
-                embedding float[{self._embedding_dim}] distance_metric=cosine
-            )
-        """)
-
-        # Create sqlite-vec virtual table for scalar embeddings (int8)
-        # Provides 75% storage reduction with ~92% recall at top-100
-        conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS organization_embeddings_scalar USING vec0(
-                org_id INTEGER PRIMARY KEY,
-                embedding int8[{self._embedding_dim}] distance_metric=cosine
-            )
-        """)
-
-        conn.commit()
 
     def close(self) -> None:
         """Clear connection reference (shared connection remains open)."""
@@ -863,17 +764,35 @@ class OrganizationDatabase:
         name_normalized = _normalize_name(record.name)
         embedding_blob = embedding.astype(np.float32).tobytes()
 
+        # v2+ schema: use FK IDs instead of TEXT columns
+        source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
+        entity_type_id = ORG_TYPE_NAME_TO_ID.get(record.entity_type.value, 17)  # 17 = unknown
+
+        # Resolve region to location_id if provided
+        region_id = None
+        if record.region:
+            locations_db = get_locations_database(db_path=self._db_path, readonly=False)
+            region_id = locations_db.resolve_region_text(record.region)
+
+        # Parse QID integer from source_id for wikidata entries (e.g. "Q312" -> 312)
+        qid = None
+        if record.source in ("wikidata", "wikipedia") and record.source_id.startswith("Q"):
+            qid_str = record.source_id[1:]
+            if qid_str.isdigit():
+                qid = int(qid_str)
+
         cursor = conn.execute("""
             INSERT OR REPLACE INTO organizations
-            (name, name_normalized, source, source_id, region, entity_type, from_date, to_date, record, embedding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (name, name_normalized, source_id, source_identifier, qid, region_id, entity_type_id, from_date, to_date, record, embedding)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             record.name,
             name_normalized,
-            record.source,
+            source_type_id,
             record.source_id,
-            record.region,
-            record.entity_type.value,
+            qid,
+            region_id,
+            entity_type_id,
             record.from_date or "",
             record.to_date or "",
             record_json,
@@ -889,15 +808,15 @@ class OrganizationDatabase:
     def insert_batch(
         self,
         records: list[CompanyRecord],
-        embeddings: np.ndarray,
+        embeddings: Optional[np.ndarray] = None,
         batch_size: int = 1000,
     ) -> int:
         """
-        Insert multiple organization records with embeddings.
+        Insert multiple organization records, optionally with embeddings.
 
         Args:
             records: List of organization records
-            embeddings: Matrix of embeddings (N x dim) - float32
+            embeddings: Matrix of embeddings (N x dim) - float32, or None to insert NULL
             batch_size: Commit batch size
 
         Returns:
@@ -906,57 +825,42 @@ class OrganizationDatabase:
         conn = self._connect()
         count = 0
 
-        for i, (record, embedding) in enumerate(zip(records, embeddings)):
+        for i, record in enumerate(records):
             record_json = json.dumps(record.record)
             name_normalized = _normalize_name(record.name)
-            embedding_blob = embedding.astype(np.float32).tobytes()
+            embedding_blob = embeddings[i].astype(np.float32).tobytes() if embeddings is not None else None
 
-            if self._is_v2:
-                # v2 schema: use FK IDs instead of TEXT columns
-                source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
-                entity_type_id = ORG_TYPE_NAME_TO_ID.get(record.entity_type.value, 17)  # 17 = unknown
+            # v2+ schema: use FK IDs instead of TEXT columns
+            source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
+            entity_type_id = ORG_TYPE_NAME_TO_ID.get(record.entity_type.value, 17)  # 17 = unknown
 
-                # Resolve region to location_id if provided
-                region_id = None
-                if record.region:
-                    # Use readonly=False to avoid immutable mode conflicts with write connection
-                    locations_db = get_locations_database(db_path=self._db_path, readonly=False)
-                    region_id = locations_db.resolve_region_text(record.region)
+            # region_id is resolved in pass 2 (resolve_fks) for wikidata imports
+            region_id = None
 
-                cursor = conn.execute("""
-                    INSERT OR REPLACE INTO organizations
-                    (name, name_normalized, source_id, source_identifier, region_id, entity_type_id, from_date, to_date, record, embedding)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    record.name,
-                    name_normalized,
-                    source_type_id,
-                    record.source_id,
-                    region_id,
-                    entity_type_id,
-                    record.from_date or "",
-                    record.to_date or "",
-                    record_json,
-                    embedding_blob,
-                ))
-            else:
-                # v1 schema: use TEXT columns
-                cursor = conn.execute("""
-                    INSERT OR REPLACE INTO organizations
-                    (name, name_normalized, source, source_id, region, entity_type, from_date, to_date, record, embedding)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    record.name,
-                    name_normalized,
-                    record.source,
-                    record.source_id,
-                    record.region,
-                    record.entity_type.value,
-                    record.from_date or "",
-                    record.to_date or "",
-                    record_json,
-                    embedding_blob,
-                ))
+            # Parse QID integer from source_id for wikidata entries (e.g. "Q312" -> 312)
+            qid = None
+            if record.source in ("wikidata", "wikipedia") and record.source_id.startswith("Q"):
+                qid_str = record.source_id[1:]
+                if qid_str.isdigit():
+                    qid = int(qid_str)
+
+            cursor = conn.execute("""
+                INSERT OR REPLACE INTO organizations
+                (name, name_normalized, source_id, source_identifier, qid, region_id, entity_type_id, from_date, to_date, record, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                record.name,
+                name_normalized,
+                source_type_id,
+                record.source_id,
+                qid,
+                region_id,
+                entity_type_id,
+                record.from_date or "",
+                record.to_date or "",
+                record_json,
+                embedding_blob,
+            ))
 
             count += 1
 
@@ -966,6 +870,60 @@ class OrganizationDatabase:
 
         conn.commit()
         return count
+
+    def resolve_fks(self, qid_fk_data: dict[int, dict]) -> int:
+        """
+        Pass 2: Resolve cross-table FKs for organizations inserted during pass 1.
+
+        Updates region_id by resolving country QIDs to location IDs.
+
+        Args:
+            qid_fk_data: Mapping of QID int → {"country_qid": "Q30"}
+
+        Returns:
+            Number of records updated
+        """
+        if not qid_fk_data:
+            return 0
+
+        conn = self._connect()
+        locations_db = get_locations_database(db_path=self._db_path, readonly=True)
+
+        # Preload QID → location_id lookup
+        cursor = conn.execute("SELECT qid, id FROM locations WHERE qid IS NOT NULL")
+        qid_to_location_id: dict[int, int] = {row[0]: row[1] for row in cursor}
+
+        updated = 0
+        batch_count = 0
+        for org_qid, fk_data in qid_fk_data.items():
+            country_qid_str = fk_data.get("country_qid", "")
+            if not country_qid_str:
+                continue
+
+            # Parse country QID to int
+            if country_qid_str.startswith("Q") and country_qid_str[1:].isdigit():
+                country_qid_int = int(country_qid_str[1:])
+            else:
+                continue
+
+            region_id = qid_to_location_id.get(country_qid_int)
+            if region_id is None:
+                continue
+
+            result = conn.execute(
+                "UPDATE organizations SET region_id = ? WHERE qid = ? AND region_id IS NULL",
+                (region_id, org_qid),
+            )
+            updated += result.rowcount
+            batch_count += 1
+
+            if batch_count % 10000 == 0:
+                conn.commit()
+                logger.info(f"Resolved {updated:,} org region FKs...")
+
+        conn.commit()
+        logger.info(f"Resolved {updated:,} org region FKs total")
+        return updated
 
     def search(
         self,
@@ -1325,19 +1283,12 @@ class OrganizationDatabase:
         conn = self._conn
         assert conn is not None
 
-        if self._is_v2:
-            # v2 schema: use view for text fields, but need record from base table
-            cursor = conn.execute("""
-                SELECT v.id, v.name, v.source, v.source_identifier, v.region, v.entity_type, v.canon_id, o.record
-                FROM organizations_view v
-                JOIN organizations o ON v.id = o.id
-                WHERE v.id = ?
-            """, (org_id,))
-        else:
-            cursor = conn.execute("""
-                SELECT id, name, source, source_id, region, entity_type, record, canon_id
-                FROM organizations WHERE id = ?
-            """, (org_id,))
+        cursor = conn.execute("""
+            SELECT v.id, v.name, v.source, v.source_identifier, v.region, v.entity_type, v.canon_id, o.record
+            FROM organizations_view v
+            JOIN organizations o ON v.id = o.id
+            WHERE v.id = ?
+        """, (org_id,))
 
         row = cursor.fetchone()
         if row:
@@ -1345,11 +1296,10 @@ class OrganizationDatabase:
             # Add db_id and canon_id to record dict for canon-aware search
             record_data["db_id"] = row["id"]
             record_data["canon_id"] = row["canon_id"]
-            source_id_field = "source_identifier" if self._is_v2 else "source_id"
             return CompanyRecord(
                 name=row["name"],
                 source=row["source"],
-                source_id=row[source_id_field],
+                source_id=row["source_identifier"],
                 region=row["region"] or "",
                 entity_type=EntityType(row["entity_type"]) if row["entity_type"] else EntityType.UNKNOWN,
                 record=record_data,
@@ -1360,29 +1310,20 @@ class OrganizationDatabase:
         """Get an organization record by source and source_id."""
         conn = self._connect()
 
-        if self._is_v2:
-            # v2 schema: join view with base table for record
-            source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-            cursor = conn.execute("""
-                SELECT v.name, v.source, v.source_identifier, v.region, v.entity_type, o.record
-                FROM organizations_view v
-                JOIN organizations o ON v.id = o.id
-                WHERE o.source_id = ? AND o.source_identifier = ?
-            """, (source_type_id, source_id))
-        else:
-            cursor = conn.execute("""
-                SELECT name, source, source_id, region, entity_type, record
-                FROM organizations
-                WHERE source = ? AND source_id = ?
-            """, (source, source_id))
+        source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
+        cursor = conn.execute("""
+            SELECT v.name, v.source, v.source_identifier, v.region, v.entity_type, o.record
+            FROM organizations_view v
+            JOIN organizations o ON v.id = o.id
+            WHERE o.source_id = ? AND o.source_identifier = ?
+        """, (source_type_id, source_id))
 
         row = cursor.fetchone()
         if row:
-            source_id_field = "source_identifier" if self._is_v2 else "source_id"
             return CompanyRecord(
                 name=row["name"],
                 source=row["source"],
-                source_id=row[source_id_field],
+                source_id=row["source_identifier"],
                 region=row["region"] or "",
                 entity_type=EntityType(row["entity_type"]) if row["entity_type"] else EntityType.UNKNOWN,
                 record=json.loads(row["record"]),
@@ -1393,17 +1334,11 @@ class OrganizationDatabase:
         """Get the internal database ID for an organization by source and source_id."""
         conn = self._connect()
 
-        if self._is_v2:
-            source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-            cursor = conn.execute("""
-                SELECT id FROM organizations
-                WHERE source_id = ? AND source_identifier = ?
-            """, (source_type_id, source_id))
-        else:
-            cursor = conn.execute("""
-                SELECT id FROM organizations
-                WHERE source = ? AND source_id = ?
-            """, (source, source_id))
+        source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
+        cursor = conn.execute("""
+            SELECT id FROM organizations
+            WHERE source_id = ? AND source_identifier = ?
+        """, (source_type_id, source_id))
 
         row = cursor.fetchone()
         if row:
@@ -1418,18 +1353,13 @@ class OrganizationDatabase:
         cursor = conn.execute("SELECT COUNT(*) FROM organizations")
         total = cursor.fetchone()[0]
 
-        # Count by source - handle both v1 and v2 schema
-        if self._is_v2:
-            # v2 schema - join with source_types
-            cursor = conn.execute("""
-                SELECT st.name as source, COUNT(*) as cnt
-                FROM organizations o
-                JOIN source_types st ON o.source_id = st.id
-                GROUP BY o.source_id
-            """)
-        else:
-            # v1 schema
-            cursor = conn.execute("SELECT source, COUNT(*) as cnt FROM organizations GROUP BY source")
+        # Count by source - join with source_types
+        cursor = conn.execute("""
+            SELECT st.name as source, COUNT(*) as cnt
+            FROM organizations o
+            JOIN source_types st ON o.source_id = st.id
+            GROUP BY o.source_id
+        """)
         by_source = {row["source"]: row["cnt"] for row in cursor}
 
         # Database file size
@@ -1456,24 +1386,14 @@ class OrganizationDatabase:
         """
         conn = self._connect()
 
-        if self._is_v2:
-            id_col = "source_identifier"
-            if source:
-                source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-                cursor = conn.execute(
-                    f"SELECT DISTINCT {id_col} FROM organizations WHERE source_id = ?",
-                    (source_type_id,)
-                )
-            else:
-                cursor = conn.execute(f"SELECT DISTINCT {id_col} FROM organizations")
+        if source:
+            source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
+            cursor = conn.execute(
+                "SELECT DISTINCT source_identifier FROM organizations WHERE source_id = ?",
+                (source_type_id,)
+            )
         else:
-            if source:
-                cursor = conn.execute(
-                    "SELECT DISTINCT source_id FROM organizations WHERE source = ?",
-                    (source,)
-                )
-            else:
-                cursor = conn.execute("SELECT DISTINCT source_id FROM organizations")
+            cursor = conn.execute("SELECT DISTINCT source_identifier FROM organizations")
 
         return {row[0] for row in cursor}
 
@@ -1481,51 +1401,29 @@ class OrganizationDatabase:
         """Iterate over all records, optionally filtered by source."""
         conn = self._connect()
 
-        if self._is_v2:
-            if source:
-                source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-                cursor = conn.execute("""
-                    SELECT v.name, v.source, v.source_identifier, v.region, v.entity_type, o.record
-                    FROM organizations_view v
-                    JOIN organizations o ON v.id = o.id
-                    WHERE o.source_id = ?
-                """, (source_type_id,))
-            else:
-                cursor = conn.execute("""
-                    SELECT v.name, v.source, v.source_identifier, v.region, v.entity_type, o.record
-                    FROM organizations_view v
-                    JOIN organizations o ON v.id = o.id
-                """)
-            for row in cursor:
-                yield CompanyRecord(
-                    name=row["name"],
-                    source=row["source"],
-                    source_id=row["source_identifier"],
-                    region=row["region"] or "",
-                    entity_type=EntityType(row["entity_type"]) if row["entity_type"] else EntityType.UNKNOWN,
-                    record=json.loads(row["record"]),
-                )
+        if source:
+            source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
+            cursor = conn.execute("""
+                SELECT v.name, v.source, v.source_identifier, v.region, v.entity_type, o.record
+                FROM organizations_view v
+                JOIN organizations o ON v.id = o.id
+                WHERE o.source_id = ?
+            """, (source_type_id,))
         else:
-            if source:
-                cursor = conn.execute("""
-                    SELECT name, source, source_id, region, entity_type, record
-                    FROM organizations
-                    WHERE source = ?
-                """, (source,))
-            else:
-                cursor = conn.execute("""
-                    SELECT name, source, source_id, region, entity_type, record
-                    FROM organizations
-                """)
-            for row in cursor:
-                yield CompanyRecord(
-                    name=row["name"],
-                    source=row["source"],
-                    source_id=row["source_id"],
-                    region=row["region"] or "",
-                    entity_type=EntityType(row["entity_type"]) if row["entity_type"] else EntityType.UNKNOWN,
-                    record=json.loads(row["record"]),
-                )
+            cursor = conn.execute("""
+                SELECT v.name, v.source, v.source_identifier, v.region, v.entity_type, o.record
+                FROM organizations_view v
+                JOIN organizations o ON v.id = o.id
+            """)
+        for row in cursor:
+            yield CompanyRecord(
+                name=row["name"],
+                source=row["source"],
+                source_id=row["source_identifier"],
+                region=row["region"] or "",
+                entity_type=EntityType(row["entity_type"]) if row["entity_type"] else EntityType.UNKNOWN,
+                record=json.loads(row["record"]),
+            )
 
     def canonicalize(self, batch_size: int = 10000) -> dict[str, int]:
         """
@@ -1569,18 +1467,12 @@ class OrganizationDatabase:
         sources: dict[int, str] = {}  # org_id -> source
         all_org_ids: list[int] = []
 
-        if self._is_v2:
-            cursor = conn.execute("""
-                SELECT o.id, s.name as source, o.source_identifier as source_id, o.name, l.name as region, o.record
-                FROM organizations o
-                JOIN source_types s ON o.source_id = s.id
-                LEFT JOIN locations l ON o.region_id = l.id
-            """)
-        else:
-            cursor = conn.execute("""
-                SELECT id, source, source_id, name, region, record
-                FROM organizations
-            """)
+        cursor = conn.execute("""
+            SELECT o.id, s.name as source, o.source_identifier as source_id, o.name, l.name as region, o.record
+            FROM organizations o
+            JOIN source_types s ON o.source_id = s.id
+            LEFT JOIN locations l ON o.region_id = l.id
+        """)
 
         count = 0
         for row in cursor:
@@ -1838,11 +1730,8 @@ class OrganizationDatabase:
         """Delete all records from a specific source."""
         conn = self._connect()
 
-        if self._is_v2:
-            source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-            cursor = conn.execute("DELETE FROM organizations WHERE source_id = ?", (source_type_id,))
-        else:
-            cursor = conn.execute("DELETE FROM organizations WHERE source = ?", (source,))
+        source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
+        cursor = conn.execute("DELETE FROM organizations WHERE source_id = ?", (source_type_id,))
 
         deleted = cursor.rowcount
 
@@ -1850,142 +1739,6 @@ class OrganizationDatabase:
 
         logger.info(f"Deleted {deleted} records from source '{source}'")
         return deleted
-
-    def migrate_from_legacy_schema(self) -> dict[str, str]:
-        """
-        Migrate database from legacy schema (companies/company_embeddings tables)
-        to new schema (organizations/organization_embeddings tables).
-
-        This handles:
-        - Renaming 'companies' table to 'organizations'
-        - Renaming 'company_embeddings' table to 'organization_embeddings'
-        - Renaming 'company_id' column to 'org_id' in embeddings table
-        - Updating indexes to use new naming
-
-        Returns:
-            Dict of migrations performed (table_name -> action)
-        """
-        conn = self._connect()
-        migrations = {}
-
-        # Check what tables exist
-        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        existing_tables = {row[0] for row in cursor}
-
-        has_companies = "companies" in existing_tables
-        has_organizations = "organizations" in existing_tables
-        has_company_embeddings = "company_embeddings" in existing_tables
-        has_org_embeddings = "organization_embeddings" in existing_tables
-
-        if not has_companies and not has_company_embeddings:
-            if has_organizations and has_org_embeddings:
-                logger.info("Database already uses new schema, no migration needed")
-                return {}
-            else:
-                logger.info("No legacy tables found, database will use new schema")
-                return {}
-
-        logger.info("Migrating database from legacy schema...")
-        conn.execute("BEGIN")
-
-        try:
-            # Migrate companies -> organizations
-            if has_companies:
-                if has_organizations:
-                    # Both exist - merge data from companies into organizations
-                    logger.info("Merging companies table into organizations...")
-                    conn.execute("""
-                        INSERT OR IGNORE INTO organizations
-                        (name, name_normalized, source, source_id, region, entity_type, record)
-                        SELECT name, name_normalized, source, source_id,
-                               COALESCE(region, ''), COALESCE(entity_type, 'unknown'), record
-                        FROM companies
-                    """)
-                    conn.execute("DROP TABLE companies")
-                    migrations["companies"] = "merged_into_organizations"
-                else:
-                    # Just rename
-                    logger.info("Renaming companies table to organizations...")
-                    conn.execute("ALTER TABLE companies RENAME TO organizations")
-                    migrations["companies"] = "renamed_to_organizations"
-
-                # Update indexes
-                for old_idx in ["idx_companies_name", "idx_companies_name_normalized",
-                               "idx_companies_source", "idx_companies_source_id",
-                               "idx_companies_region", "idx_companies_entity_type",
-                               "idx_companies_name_region_source"]:
-                    try:
-                        conn.execute(f"DROP INDEX IF EXISTS {old_idx}")
-                    except Exception:
-                        pass
-
-                # Create new indexes
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_name ON organizations(name)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_name_normalized ON organizations(name_normalized)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_source ON organizations(source)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_source_id ON organizations(source, source_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_region ON organizations(region)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_entity_type ON organizations(entity_type)")
-                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orgs_name_region_source ON organizations(name, region, source)")
-
-            # Migrate company_embeddings -> organization_embeddings
-            if has_company_embeddings:
-                if has_org_embeddings:
-                    # Both exist - merge
-                    logger.info("Merging company_embeddings into organization_embeddings...")
-                    # Get column info to check for company_id vs org_id
-                    cursor = conn.execute("PRAGMA table_info(company_embeddings)")
-                    cols = {row[1] for row in cursor}
-                    id_col = "company_id" if "company_id" in cols else "org_id"
-
-                    conn.execute(f"""
-                        INSERT OR IGNORE INTO organization_embeddings (org_id, embedding)
-                        SELECT {id_col}, embedding FROM company_embeddings
-                    """)
-                    conn.execute("DROP TABLE company_embeddings")
-                    migrations["company_embeddings"] = "merged_into_organization_embeddings"
-                else:
-                    # Need to recreate with new column name
-                    logger.info("Migrating company_embeddings to organization_embeddings...")
-
-                    # Check if it has company_id or org_id column
-                    cursor = conn.execute("PRAGMA table_info(company_embeddings)")
-                    cols = {row[1] for row in cursor}
-                    id_col = "company_id" if "company_id" in cols else "org_id"
-
-                    # Create new virtual table
-                    conn.execute(f"""
-                        CREATE VIRTUAL TABLE organization_embeddings USING vec0(
-                            org_id INTEGER PRIMARY KEY,
-                            embedding float[{self._embedding_dim}] distance_metric=cosine
-                        )
-                    """)
-
-                    # Copy data
-                    conn.execute(f"""
-                        INSERT INTO organization_embeddings (org_id, embedding)
-                        SELECT {id_col}, embedding FROM company_embeddings
-                    """)
-
-                    # Drop old table
-                    conn.execute("DROP TABLE company_embeddings")
-                    migrations["company_embeddings"] = "renamed_to_organization_embeddings"
-
-            conn.execute("COMMIT")
-            logger.info(f"Migration complete: {migrations}")
-
-        except Exception as e:
-            conn.execute("ROLLBACK")
-            logger.error(f"Migration failed: {e}")
-            raise
-
-        # Vacuum to clean up - outside try block since COMMIT already succeeded
-        try:
-            conn.execute("VACUUM")
-        except Exception as e:
-            logger.warning(f"VACUUM failed (migration was successful): {e}")
-
-        return migrations
 
     def get_missing_embedding_count(self) -> int:
         """Get count of organizations without embeddings."""
@@ -2125,107 +1878,6 @@ class OrganizationDatabase:
         conn.commit()
         return count
 
-    def resolve_qid_labels(
-        self,
-        label_map: dict[str, str],
-        batch_size: int = 1000,
-    ) -> tuple[int, int]:
-        """
-        Update organization records that have QIDs instead of labels in region field.
-
-        If resolving would create a duplicate of an existing record with
-        resolved labels, the QID version is deleted instead.
-
-        Args:
-            label_map: Mapping of QID -> label for resolution
-            batch_size: Commit batch size
-
-        Returns:
-            Tuple of (records updated, duplicates deleted)
-        """
-        conn = self._connect()
-
-        # v2 schema uses region_id (FK to locations) instead of region text - this method doesn't apply
-        if self._is_v2:
-            logger.debug("Skipping resolve_qid_labels for v2 schema (region stored as FK)")
-            return 0, 0
-
-        # Find records with QIDs in region field (starts with 'Q' followed by digits)
-        region_updates = 0
-        cursor = conn.execute("""
-            SELECT id, region FROM organizations
-            WHERE region LIKE 'Q%' AND region GLOB 'Q[0-9]*'
-        """)
-        rows = cursor.fetchall()
-
-        duplicates_deleted = 0
-        for row in rows:
-            org_id = row["id"]
-            qid = row["region"]
-            if qid in label_map:
-                resolved_region = label_map[qid]
-                # Check if this update would create a duplicate
-                # Get the name and source of the current record
-                org_cursor = conn.execute(
-                    "SELECT name, source FROM organizations WHERE id = ?",
-                    (org_id,)
-                )
-                org_row = org_cursor.fetchone()
-                if org_row is None:
-                    continue
-
-                org_name = org_row["name"]
-                org_source = org_row["source"]
-
-                # Check if a record with the resolved region already exists
-                existing_cursor = conn.execute(
-                    "SELECT id FROM organizations WHERE name = ? AND region = ? AND source = ? AND id != ?",
-                    (org_name, resolved_region, org_source, org_id)
-                )
-                existing = existing_cursor.fetchone()
-
-                if existing is not None:
-                    # Duplicate would be created - delete the QID-based record
-                    conn.execute("DELETE FROM organizations WHERE id = ?", (org_id,))
-                    duplicates_deleted += 1
-                else:
-                    # Safe to update
-                    conn.execute(
-                        "UPDATE organizations SET region = ? WHERE id = ?",
-                        (resolved_region, org_id)
-                    )
-                    region_updates += 1
-
-                if (region_updates + duplicates_deleted) % batch_size == 0:
-                    conn.commit()
-                    logger.info(f"Resolved QID labels: {region_updates} updates, {duplicates_deleted} deletes...")
-
-        conn.commit()
-        logger.info(f"Resolved QID labels: {region_updates} organization regions, {duplicates_deleted} duplicates deleted")
-        return region_updates, duplicates_deleted
-
-    def get_unresolved_qids(self) -> set[str]:
-        """
-        Get all QIDs that still need resolution in the organizations table.
-
-        Returns:
-            Set of QIDs (starting with 'Q') found in region field
-        """
-        # v2 schema uses region_id (FK to locations) instead of region text - no QIDs to resolve
-        if self._is_v2:
-            return set()
-
-        conn = self._connect()
-        qids: set[str] = set()
-
-        cursor = conn.execute("""
-            SELECT DISTINCT region FROM organizations
-            WHERE region LIKE 'Q%' AND region GLOB 'Q[0-9]*'
-        """)
-        for row in cursor:
-            qids.add(row["region"])
-
-        return qids
 
 
 def get_person_database(
@@ -2320,211 +1972,7 @@ class PersonDatabase:
                     self._schema_version = int(row[0])
                     logger.debug(f"Detected schema version {self._schema_version} from db_info")
 
-        # Create tables (idempotent) - only for v1 schema or fresh databases
-        # v2 databases already have their schema from migration
-        if not self._is_v2 and not self._readonly:
-            self._create_tables()
-
         return self._conn
-
-    @property
-    def _people_table(self) -> str:
-        """Return table/view name for people queries needing text fields."""
-        return "people_view" if self._is_v2 else "people"
-
-    def _create_tables(self) -> None:
-        """Create database tables including sqlite-vec virtual table."""
-        conn = self._conn
-        assert conn is not None
-
-        # Check if we need to migrate from old schema (unique on source+source_id only)
-        self._migrate_people_schema_if_needed(conn)
-
-        # Main people records table
-        # Unique constraint on source+source_id+role+org allows multiple records
-        # for the same person with different role/org combinations
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS people (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                name_normalized TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'wikidata',
-                source_id TEXT NOT NULL,
-                country TEXT NOT NULL DEFAULT '',
-                person_type TEXT NOT NULL DEFAULT 'unknown',
-                known_for_role TEXT NOT NULL DEFAULT '',
-                known_for_org TEXT NOT NULL DEFAULT '',
-                known_for_org_id INTEGER DEFAULT NULL,
-                from_date TEXT NOT NULL DEFAULT '',
-                to_date TEXT NOT NULL DEFAULT '',
-                birth_date TEXT NOT NULL DEFAULT '',
-                death_date TEXT NOT NULL DEFAULT '',
-                record TEXT NOT NULL,
-                UNIQUE(source, source_id, known_for_role, known_for_org),
-                FOREIGN KEY (known_for_org_id) REFERENCES organizations(id)
-            )
-        """)
-
-        # Create indexes on main table
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_people_name ON people(name)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_people_name_normalized ON people(name_normalized)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_people_source ON people(source)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_people_source_id ON people(source, source_id, known_for_role, known_for_org)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_people_known_for_org ON people(known_for_org)")
-
-        # Add from_date column if it doesn't exist (migration for existing DBs)
-        try:
-            conn.execute("ALTER TABLE people ADD COLUMN from_date TEXT NOT NULL DEFAULT ''")
-            logger.info("Added from_date column to people table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Add to_date column if it doesn't exist (migration for existing DBs)
-        try:
-            conn.execute("ALTER TABLE people ADD COLUMN to_date TEXT NOT NULL DEFAULT ''")
-            logger.info("Added to_date column to people table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Add known_for_org_id column if it doesn't exist (migration for existing DBs)
-        # This is a foreign key to the organizations table (nullable)
-        try:
-            conn.execute("ALTER TABLE people ADD COLUMN known_for_org_id INTEGER DEFAULT NULL")
-            logger.info("Added known_for_org_id column to people table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Create index on known_for_org_id for joins (only if column exists)
-        try:
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_people_known_for_org_id ON people(known_for_org_id)")
-        except sqlite3.OperationalError:
-            pass  # Column doesn't exist yet (will be added on next connection)
-
-        # Add birth_date column if it doesn't exist (migration for existing DBs)
-        try:
-            conn.execute("ALTER TABLE people ADD COLUMN birth_date TEXT NOT NULL DEFAULT ''")
-            logger.info("Added birth_date column to people table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Add death_date column if it doesn't exist (migration for existing DBs)
-        try:
-            conn.execute("ALTER TABLE people ADD COLUMN death_date TEXT NOT NULL DEFAULT ''")
-            logger.info("Added death_date column to people table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Add canon_id column if it doesn't exist (migration for canonicalization)
-        try:
-            conn.execute("ALTER TABLE people ADD COLUMN canon_id INTEGER DEFAULT NULL")
-            logger.info("Added canon_id column to people table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Add canon_size column if it doesn't exist (migration for canonicalization)
-        try:
-            conn.execute("ALTER TABLE people ADD COLUMN canon_size INTEGER DEFAULT 1")
-            logger.info("Added canon_size column to people table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Create index on canon_id for joins
-        try:
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_people_canon_id ON people(canon_id)")
-        except sqlite3.OperationalError:
-            pass  # Column doesn't exist yet
-
-        # Add embedding column if it doesn't exist (migration for existing DBs)
-        try:
-            conn.execute("ALTER TABLE people ADD COLUMN embedding BLOB DEFAULT NULL")
-            logger.info("Added embedding column to people table")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # Create QID labels lookup table for Wikidata QID -> label mappings
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS qid_labels (
-                qid TEXT PRIMARY KEY,
-                label TEXT NOT NULL
-            )
-        """)
-
-        conn.commit()
-
-    def _migrate_people_schema_if_needed(self, conn: sqlite3.Connection) -> None:
-        """Migrate people table from old schema if needed."""
-        # Check if people table exists
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='people'"
-        )
-        if not cursor.fetchone():
-            return  # Table doesn't exist, no migration needed
-
-        # Check the unique constraint - look at index info
-        # Old schema: UNIQUE(source, source_id)
-        # New schema: UNIQUE(source, source_id, known_for_role, known_for_org)
-        cursor = conn.execute("PRAGMA index_list(people)")
-        indexes = cursor.fetchall()
-
-        needs_migration = False
-        for idx in indexes:
-            idx_name = idx[1]
-            if "sqlite_autoindex_people" in idx_name:
-                # Check columns in this unique index
-                cursor = conn.execute(f"PRAGMA index_info('{idx_name}')")
-                cols = [row[2] for row in cursor.fetchall()]
-                # Old schema has only 2 columns in unique constraint
-                if cols == ["source", "source_id"]:
-                    needs_migration = True
-                    logger.info("Detected old people schema, migrating to new unique constraint...")
-                    break
-
-        if not needs_migration:
-            return
-
-        # Migrate: create new table, copy data, drop old, rename new
-        logger.info("Migrating people table to new schema with (source, source_id, role, org) unique constraint...")
-
-        conn.execute("""
-            CREATE TABLE people_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                name_normalized TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'wikidata',
-                source_id TEXT NOT NULL,
-                country TEXT NOT NULL DEFAULT '',
-                person_type TEXT NOT NULL DEFAULT 'unknown',
-                known_for_role TEXT NOT NULL DEFAULT '',
-                known_for_org TEXT NOT NULL DEFAULT '',
-                known_for_org_id INTEGER DEFAULT NULL,
-                from_date TEXT NOT NULL DEFAULT '',
-                to_date TEXT NOT NULL DEFAULT '',
-                record TEXT NOT NULL,
-                UNIQUE(source, source_id, known_for_role, known_for_org),
-                FOREIGN KEY (known_for_org_id) REFERENCES organizations(id)
-            )
-        """)
-
-        # Copy data (old IDs will change, but embeddings table references them)
-        # Note: old table may not have from_date/to_date columns, so use defaults
-        conn.execute("""
-            INSERT INTO people_new (name, name_normalized, source, source_id, country,
-                                    person_type, known_for_role, known_for_org, record)
-            SELECT name, name_normalized, source, source_id, country,
-                   person_type, known_for_role, known_for_org, record
-            FROM people
-        """)
-
-        # Drop old table and embeddings (IDs changed, embeddings are invalid)
-        conn.execute("DROP TABLE IF EXISTS person_embeddings")
-        conn.execute("DROP TABLE people")
-        conn.execute("ALTER TABLE people_new RENAME TO people")
-
-        # Drop old index if it exists
-        conn.execute("DROP INDEX IF EXISTS idx_people_source_id")
-
-        conn.commit()
-        logger.info("Migration complete. Note: person embeddings were cleared and need to be regenerated.")
 
     def close(self) -> None:
         """Clear connection reference (shared connection remains open)."""
@@ -2552,22 +2000,46 @@ class PersonDatabase:
         name_normalized = _normalize_person_name(record.name)
         embedding_blob = embedding.astype(np.float32).tobytes()
 
+        # v2+ schema: use FK IDs instead of TEXT columns
+        source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
+        person_type_id = PEOPLE_TYPE_NAME_TO_ID.get(record.person_type.value, 15)  # 15 = unknown
+
+        # Resolve country to location_id if provided
+        country_id = None
+        if record.country:
+            locations_db = get_locations_database(db_path=self._db_path, readonly=False)
+            country_id = locations_db.resolve_region_text(record.country)
+
+        # Resolve known_for_role to role_id if provided
+        role_id = None
+        if record.known_for_role:
+            roles_db = get_roles_database(db_path=self._db_path, readonly=False)
+            role_id = roles_db.get_or_create(record.known_for_role, source_id=source_type_id)
+
+        # Parse QID integer from source_id for wikidata entries (e.g. "Q265398" -> 265398)
+        qid = None
+        if record.source == "wikidata" and record.source_id.startswith("Q"):
+            qid_str = record.source_id[1:]
+            if qid_str.isdigit():
+                qid = int(qid_str)
+
         cursor = conn.execute("""
             INSERT OR REPLACE INTO people
-            (name, name_normalized, source, source_id, country, person_type,
-             known_for_role, known_for_org, known_for_org_id, from_date, to_date,
+            (name, name_normalized, source_id, source_identifier, qid, country_id, person_type_id,
+             known_for_role_id, known_for_org_id, known_for_org_location_id, from_date, to_date,
              birth_date, death_date, record, embedding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             record.name,
             name_normalized,
-            record.source,
+            source_type_id,
             record.source_id,
-            record.country,
-            record.person_type.value,
-            record.known_for_role,
-            record.known_for_org,
-            record.known_for_org_id,  # Can be None
+            qid,
+            country_id,
+            person_type_id,
+            role_id,
+            record.known_for_org_id,
+            record.known_for_org_location_id,
             record.from_date or "",
             record.to_date or "",
             record.birth_date or "",
@@ -2585,15 +2057,15 @@ class PersonDatabase:
     def insert_batch(
         self,
         records: list[PersonRecord],
-        embeddings: np.ndarray,
+        embeddings: Optional[np.ndarray] = None,
         batch_size: int = 1000,
     ) -> int:
         """
-        Insert multiple person records with embeddings.
+        Insert multiple person records, optionally with embeddings.
 
         Args:
             records: List of person records
-            embeddings: Matrix of embeddings (N x dim) - float32
+            embeddings: Matrix of embeddings (N x dim) - float32, or None to insert NULL
             batch_size: Commit batch size
 
         Returns:
@@ -2602,77 +2074,55 @@ class PersonDatabase:
         conn = self._connect()
         count = 0
 
-        for i, (record, embedding) in enumerate(zip(records, embeddings)):
+        for i, record in enumerate(records):
             record_json = json.dumps(record.record)
             name_normalized = _normalize_person_name(record.name)
-            embedding_blob = embedding.astype(np.float32).tobytes()
+            embedding_blob = embeddings[i].astype(np.float32).tobytes() if embeddings is not None else None
 
-            if self._is_v2:
-                # v2 schema: use FK IDs instead of TEXT columns
-                source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
-                person_type_id = PEOPLE_TYPE_NAME_TO_ID.get(record.person_type.value, 15)  # 15 = unknown
+            # v2+ schema: use FK IDs instead of TEXT columns
+            source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
+            person_type_id = PEOPLE_TYPE_NAME_TO_ID.get(record.person_type.value, 15)  # 15 = unknown
 
-                # Resolve country to location_id if provided
-                country_id = None
-                if record.country:
-                    # Use readonly=False to avoid immutable mode conflicts with write connection
-                    locations_db = get_locations_database(db_path=self._db_path, readonly=False)
-                    country_id = locations_db.resolve_region_text(record.country)
+            # country_id is resolved in pass 2 (resolve_fks) for wikidata imports
+            country_id = None
 
-                # Resolve known_for_role to role_id if provided
-                role_id = None
-                if record.known_for_role:
-                    roles_db = get_roles_database(db_path=self._db_path, readonly=False)
-                    role_id = roles_db.get_or_create(record.known_for_role, source_id=source_type_id)
+            # Resolve known_for_role to role_id if provided
+            role_id = None
+            if record.known_for_role:
+                roles_db = get_roles_database(db_path=self._db_path, readonly=False)
+                role_id = roles_db.get_or_create(record.known_for_role, source_id=source_type_id)
 
-                cursor = conn.execute("""
-                    INSERT OR REPLACE INTO people
-                    (name, name_normalized, source_id, source_identifier, country_id, person_type_id,
-                     known_for_role_id, known_for_org, known_for_org_id, from_date, to_date,
-                     birth_date, death_date, record, embedding)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    record.name,
-                    name_normalized,
-                    source_type_id,
-                    record.source_id,
-                    country_id,
-                    person_type_id,
-                    role_id,
-                    record.known_for_org,
-                    record.known_for_org_id,  # Can be None
-                    record.from_date or "",
-                    record.to_date or "",
-                    record.birth_date or "",
-                    record.death_date or "",
-                    record_json,
-                    embedding_blob,
-                ))
-            else:
-                # v1 schema: use TEXT columns
-                cursor = conn.execute("""
-                    INSERT OR REPLACE INTO people
-                    (name, name_normalized, source, source_id, country, person_type,
-                     known_for_role, known_for_org, known_for_org_id, from_date, to_date,
-                     birth_date, death_date, record, embedding)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    record.name,
-                    name_normalized,
-                    record.source,
-                    record.source_id,
-                    record.country,
-                    record.person_type.value,
-                    record.known_for_role,
-                    record.known_for_org,
-                    record.known_for_org_id,  # Can be None
-                    record.from_date or "",
-                    record.to_date or "",
-                    record.birth_date or "",
-                    record.death_date or "",
-                    record_json,
-                    embedding_blob,
-                ))
+            # Parse QID integer from source_id for wikidata entries (e.g. "Q265398" -> 265398)
+            qid = None
+            if record.source == "wikidata" and record.source_id.startswith("Q"):
+                qid_str = record.source_id[1:]
+                if qid_str.isdigit():
+                    qid = int(qid_str)
+
+            cursor = conn.execute("""
+                INSERT OR REPLACE INTO people
+                (name, name_normalized, source_id, source_identifier, qid, country_id, person_type_id,
+                 known_for_role_id, known_for_org_id, known_for_org_location_id, from_date, to_date,
+                 birth_date, death_date, record, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                record.name,
+                name_normalized,
+                source_type_id,
+                record.source_id,
+                qid,
+                country_id,
+                person_type_id,
+                role_id,
+                record.known_for_org_id,
+                record.known_for_org_location_id,
+                record.from_date or "",
+                record.to_date or "",
+                record.birth_date or "",
+                record.death_date or "",
+                record_json,
+                embedding_blob,
+            ))
 
             count += 1
 
@@ -2682,6 +2132,88 @@ class PersonDatabase:
 
         conn.commit()
         return count
+
+    def resolve_fks(self, qid_fk_data: dict[int, dict]) -> int:
+        """
+        Pass 2: Resolve cross-table FKs for people inserted during pass 1.
+
+        Updates country_id, known_for_org_id, and known_for_org_location_id
+        by resolving QIDs to database IDs.
+
+        Args:
+            qid_fk_data: Mapping of QID int → {"country_qid": "Q30", "org_qid": "Q312"}
+
+        Returns:
+            Number of records updated
+        """
+        if not qid_fk_data:
+            return 0
+
+        conn = self._connect()
+
+        # Preload QID → location_id lookup
+        cursor = conn.execute("SELECT qid, id FROM locations WHERE qid IS NOT NULL")
+        qid_to_location_id: dict[int, int] = {row[0]: row[1] for row in cursor}
+
+        # Preload QID → org_id lookup (wikidata orgs use source_id=4 "wikipedia")
+        cursor = conn.execute("SELECT qid, id, region_id FROM organizations WHERE qid IS NOT NULL")
+        qid_to_org: dict[int, tuple[int, Optional[int]]] = {
+            row[0]: (row[1], row[2]) for row in cursor
+        }
+
+        updated = 0
+        batch_count = 0
+        for person_qid, fk_data in qid_fk_data.items():
+            country_qid_str = fk_data.get("country_qid", "")
+            org_qid_str = fk_data.get("org_qid", "")
+
+            # Resolve country
+            country_id = None
+            if country_qid_str and country_qid_str.startswith("Q") and country_qid_str[1:].isdigit():
+                country_id = qid_to_location_id.get(int(country_qid_str[1:]))
+
+            # Resolve org → (org_id, org_location_id)
+            org_id = None
+            org_location_id = None
+            if org_qid_str and org_qid_str.startswith("Q") and org_qid_str[1:].isdigit():
+                org_info = qid_to_org.get(int(org_qid_str[1:]))
+                if org_info:
+                    org_id, org_location_id = org_info
+                else:
+                    # Fall back to location (org QID might be a location)
+                    org_location_id = qid_to_location_id.get(int(org_qid_str[1:]))
+
+            if country_id is None and org_id is None and org_location_id is None:
+                continue
+
+            # Update country_id unconditionally, org FKs only when NULL
+            if org_id is not None or org_location_id is not None:
+                result = conn.execute(
+                    """UPDATE people SET
+                        country_id = COALESCE(?, country_id),
+                        known_for_org_id = COALESCE(known_for_org_id, ?),
+                        known_for_org_location_id = COALESCE(known_for_org_location_id, ?)
+                    WHERE qid = ?""",
+                    (country_id, org_id, org_location_id, person_qid),
+                )
+            elif country_id is not None:
+                result = conn.execute(
+                    "UPDATE people SET country_id = ? WHERE qid = ? AND country_id IS NULL",
+                    (country_id, person_qid),
+                )
+            else:
+                continue
+
+            updated += result.rowcount
+            batch_count += 1
+
+            if batch_count % 10000 == 0:
+                conn.commit()
+                logger.info(f"Resolved {updated:,} person FKs...")
+
+        conn.commit()
+        logger.info(f"Resolved {updated:,} person FKs total")
+        return updated
 
     def update_dates(self, source: str, source_id: str, from_date: Optional[str], to_date: Optional[str]) -> bool:
         """
@@ -2698,17 +2230,11 @@ class PersonDatabase:
         """
         conn = self._connect()
 
-        if self._is_v2:
-            source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-            cursor = conn.execute("""
-                UPDATE people SET from_date = ?, to_date = ?
-                WHERE source_id = ? AND source_identifier = ?
-            """, (from_date or "", to_date or "", source_type_id, source_id))
-        else:
-            cursor = conn.execute("""
-                UPDATE people SET from_date = ?, to_date = ?
-                WHERE source = ? AND source_id = ?
-            """, (from_date or "", to_date or "", source, source_id))
+        source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
+        cursor = conn.execute("""
+            UPDATE people SET from_date = ?, to_date = ?
+            WHERE source_id = ? AND source_identifier = ?
+        """, (from_date or "", to_date or "", source_type_id, source_id))
 
         conn.commit()
         return cursor.rowcount > 0
@@ -2718,8 +2244,8 @@ class PersonDatabase:
         source: str,
         source_id: str,
         known_for_role: str,
-        known_for_org: str,
         known_for_org_id: Optional[int],
+        known_for_org_location_id: Optional[int],
         new_embedding: np.ndarray,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
@@ -2731,8 +2257,8 @@ class PersonDatabase:
             source: Data source (e.g., 'wikidata')
             source_id: Source identifier (e.g., QID)
             known_for_role: Role/position title
-            known_for_org: Organization name
-            known_for_org_id: Organization internal ID (FK) or None
+            known_for_org_id: Organization FK or None
+            known_for_org_location_id: Location FK (for jurisdictions) or None
             new_embedding: New embedding vector based on updated data
             from_date: Start date in ISO format or None
             to_date: End date in ISO format or None
@@ -2743,17 +2269,11 @@ class PersonDatabase:
         conn = self._connect()
 
         # First get the person's internal ID
-        if self._is_v2:
-            source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-            row = conn.execute(
-                "SELECT id FROM people WHERE source_id = ? AND source_identifier = ?",
-                (source_type_id, source_id)
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT id FROM people WHERE source = ? AND source_id = ?",
-                (source, source_id)
-            ).fetchone()
+        source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
+        row = conn.execute(
+            "SELECT id FROM people WHERE source_id = ? AND source_identifier = ?",
+            (source_type_id, source_id)
+        ).fetchone()
 
         if not row:
             return False
@@ -2763,11 +2283,11 @@ class PersonDatabase:
         # Update the person record (including dates)
         conn.execute("""
             UPDATE people SET
-                known_for_role = ?, known_for_org = ?, known_for_org_id = ?,
+                known_for_org_id = ?, known_for_org_location_id = ?,
                 from_date = COALESCE(?, from_date, ''),
                 to_date = COALESCE(?, to_date, '')
             WHERE id = ?
-        """, (known_for_role, known_for_org, known_for_org_id, from_date, to_date, person_id))
+        """, (known_for_org_id, known_for_org_location_id, from_date, to_date, person_id))
 
         # Update the embedding
         embedding_bytes = new_embedding.astype(np.float32).tobytes()
@@ -2780,15 +2300,14 @@ class PersonDatabase:
         self, qid_to_orgs: dict[str, list[tuple[str, str, Optional[str], Optional[str]]]]
     ) -> int:
         """
-        Backfill known_for_org (and dates) for people using QID→org mappings.
+        Backfill known_for_org_id/known_for_org_location_id for people using QID→org mappings.
 
-        Only updates records where known_for_org is currently empty. Uses the
-        first reverse mapping entry for each person QID to fill in org label,
-        role, and from/to dates.
+        Only updates records where both known_for_org_id and known_for_org_location_id are NULL.
+        Resolves org QIDs to organization or location FKs (same source: wikidata→wikidata).
 
         Args:
             qid_to_orgs: Mapping of person Wikidata QID →
-                [(org_label, role_description, start_date, end_date), ...]
+                [(org_qid, role_description, start_date, end_date), ...]
 
         Returns:
             Number of records updated
@@ -2797,23 +2316,43 @@ class PersonDatabase:
             return 0
 
         conn = self._connect()
+        org_database = OrganizationDatabase(db_path=self._db_path, readonly=True)
+        locations_db = get_locations_database(db_path=self._db_path, readonly=True)
         updated = 0
         for person_qid, entries in qid_to_orgs.items():
             if not entries:
                 continue
-            # Use the first entry with an org label
-            org_label = ""
+            # Use the first entry with an org QID that resolves
+            org_id: Optional[int] = None
+            location_id: Optional[int] = None
             role = ""
             start_date: Optional[str] = None
             end_date: Optional[str] = None
-            for entry_org, entry_role, entry_start, entry_end in entries:
-                if entry_org:
-                    org_label = entry_org
+            for entry_org_qid, entry_role, entry_start, entry_end in entries:
+                if not entry_org_qid:
+                    continue
+                # Try organization first (same source: wikidata)
+                resolved_org_id = org_database.get_id_by_source_id("wikipedia", entry_org_qid)
+                if resolved_org_id is not None:
+                    org_id = resolved_org_id
                     role = entry_role
                     start_date = entry_start
                     end_date = entry_end
                     break
-            if not org_label:
+                # Fall back to location (same source: wikidata)
+                qid_int_org = int(entry_org_qid.lstrip("Q")) if entry_org_qid.startswith("Q") else None
+                if qid_int_org is not None:
+                    loc_row = conn.execute(
+                        "SELECT id FROM locations WHERE qid = ? AND source_id = 4", (qid_int_org,)
+                    ).fetchone()
+                    if loc_row:
+                        location_id = loc_row[0]
+                        role = entry_role
+                        start_date = entry_start
+                        end_date = entry_end
+                        break
+
+            if org_id is None and location_id is None:
                 continue
 
             # Strip Q prefix if present for integer QID column
@@ -2821,31 +2360,21 @@ class PersonDatabase:
             if qid_int is None:
                 continue
 
-            # Resolve role to role_id for v2 schema
+            # Resolve role to role_id
             role_id = None
-            if role and self._is_v2:
+            if role:
                 roles_db = get_roles_database(db_path=self._db_path, readonly=False)
                 role_id = roles_db.get_or_create(role, source_id=4)  # 4 = wikidata
 
-            # Update records missing known_for_org, also backfill dates and role
-            if self._is_v2:
-                result = conn.execute(
-                    """UPDATE people SET known_for_org = ?,
-                       known_for_role_id = COALESCE(known_for_role_id, ?),
-                       from_date = CASE WHEN from_date IS NULL OR from_date = '' THEN ? ELSE from_date END,
-                       to_date = CASE WHEN to_date IS NULL OR to_date = '' THEN ? ELSE to_date END
-                    WHERE qid = ? AND (known_for_org = '' OR known_for_org IS NULL)""",
-                    (org_label, role_id, start_date or "", end_date or "", qid_int),
-                )
-            else:
-                result = conn.execute(
-                    """UPDATE people SET known_for_org = ?,
-                       known_for_role = CASE WHEN known_for_role = '' OR known_for_role IS NULL THEN ? ELSE known_for_role END,
-                       from_date = CASE WHEN from_date IS NULL OR from_date = '' THEN ? ELSE from_date END,
-                       to_date = CASE WHEN to_date IS NULL OR to_date = '' THEN ? ELSE to_date END
-                    WHERE source_id = ? AND source = 'wikidata' AND (known_for_org = '' OR known_for_org IS NULL)""",
-                    (org_label, role, start_date or "", end_date or "", person_qid),
-                )
+            # Update records missing org/location FKs, also backfill dates and role
+            result = conn.execute(
+                """UPDATE people SET known_for_org_id = ?, known_for_org_location_id = ?,
+                   known_for_role_id = COALESCE(known_for_role_id, ?),
+                   from_date = CASE WHEN from_date IS NULL OR from_date = '' THEN ? ELSE from_date END,
+                   to_date = CASE WHEN to_date IS NULL OR to_date = '' THEN ? ELSE to_date END
+                WHERE qid = ? AND known_for_org_id IS NULL AND known_for_org_location_id IS NULL""",
+                (org_id, location_id, role_id, start_date or "", end_date or "", qid_int),
+            )
             updated += result.rowcount
             if updated % 1000 == 0 and updated > 0:
                 conn.commit()
@@ -3039,82 +2568,64 @@ class PersonDatabase:
 
         return results
 
+    def _row_to_person_record(self, row: sqlite3.Row) -> PersonRecord:
+        """Build a PersonRecord from a DB row (view)."""
+        source_id_field = "source_identifier"
+        # known_for_org comes from COALESCE in people_view (computed from org/location FKs)
+        known_for_org_name = row["known_for_org"] or "" if "known_for_org" in row.keys() else ""
+        return PersonRecord(
+            name=row["name"],
+            source=row["source"],
+            source_id=row[source_id_field],
+            country=row["country"] or "",
+            person_type=PersonType(row["person_type"]) if row["person_type"] else PersonType.UNKNOWN,
+            known_for_role=row["known_for_role"] or "",
+            known_for_org_id=row["known_for_org_id"],
+            known_for_org_location_id=row["known_for_org_location_id"] if "known_for_org_location_id" in row.keys() else None,
+            known_for_org_name=known_for_org_name,
+            birth_date=row["birth_date"] or "",
+            death_date=row["death_date"] or "",
+            record=json.loads(row["record"]),
+        )
+
     def _get_record_by_id(self, person_id: int) -> Optional[PersonRecord]:
         """Get a person record by ID."""
         conn = self._conn
         assert conn is not None
 
-        if self._is_v2:
-            # v2 schema: join view with base table for record
-            cursor = conn.execute("""
-                SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
-                       v.known_for_role, v.known_for_org, v.known_for_org_id,
-                       v.birth_date, v.death_date, p.record
-                FROM people_view v
-                JOIN people p ON v.id = p.id
-                WHERE v.id = ?
-            """, (person_id,))
-        else:
-            cursor = conn.execute("""
-                SELECT name, source, source_id, country, person_type, known_for_role, known_for_org, known_for_org_id, birth_date, death_date, record
-                FROM people WHERE id = ?
-            """, (person_id,))
+        cursor = conn.execute("""
+            SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
+                   v.known_for_role, v.known_for_org, v.known_for_org_id,
+                   v.known_for_org_location_id,
+                   v.birth_date, v.death_date, p.record
+            FROM people_view v
+            JOIN people p ON v.id = p.id
+            WHERE v.id = ?
+        """, (person_id,))
 
         row = cursor.fetchone()
         if row:
-            source_id_field = "source_identifier" if self._is_v2 else "source_id"
-            return PersonRecord(
-                name=row["name"],
-                source=row["source"],
-                source_id=row[source_id_field],
-                country=row["country"] or "",
-                person_type=PersonType(row["person_type"]) if row["person_type"] else PersonType.UNKNOWN,
-                known_for_role=row["known_for_role"] or "",
-                known_for_org=row["known_for_org"] or "",
-                known_for_org_id=row["known_for_org_id"],  # Can be None
-                birth_date=row["birth_date"] or "",
-                death_date=row["death_date"] or "",
-                record=json.loads(row["record"]),
-            )
+            return self._row_to_person_record(row)
         return None
 
     def get_by_source_id(self, source: str, source_id: str) -> Optional[PersonRecord]:
         """Get a person record by source and source_id."""
         conn = self._connect()
 
-        if self._is_v2:
-            source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-            cursor = conn.execute("""
-                SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
-                       v.known_for_role, v.known_for_org, v.known_for_org_id,
-                       v.birth_date, v.death_date, p.record
-                FROM people_view v
-                JOIN people p ON v.id = p.id
-                WHERE p.source_id = ? AND p.source_identifier = ?
-            """, (source_type_id, source_id))
-        else:
-            cursor = conn.execute("""
-                SELECT name, source, source_id, country, person_type, known_for_role, known_for_org, known_for_org_id, birth_date, death_date, record
-                FROM people
-                WHERE source = ? AND source_id = ?
-            """, (source, source_id))
+        source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
+        cursor = conn.execute("""
+            SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
+                   v.known_for_role, v.known_for_org, v.known_for_org_id,
+                   v.known_for_org_location_id,
+                   v.birth_date, v.death_date, p.record
+            FROM people_view v
+            JOIN people p ON v.id = p.id
+            WHERE p.source_id = ? AND p.source_identifier = ?
+        """, (source_type_id, source_id))
 
         row = cursor.fetchone()
         if row:
-            source_id_field = "source_identifier" if self._is_v2 else "source_id"
-            return PersonRecord(
-                name=row["name"],
-                source=row["source"],
-                source_id=row[source_id_field],
-                country=row["country"] or "",
-                person_type=PersonType(row["person_type"]) if row["person_type"] else PersonType.UNKNOWN,
-                known_for_role=row["known_for_role"] or "",
-                known_for_org=row["known_for_org"] or "",
-                known_for_org_id=row["known_for_org_id"],  # Can be None
-                birth_date=row["birth_date"] or "",
-                death_date=row["death_date"] or "",
-                record=json.loads(row["record"]),
-            )
+            return self._row_to_person_record(row)
         return None
 
     def get_stats(self) -> dict:
@@ -3125,32 +2636,22 @@ class PersonDatabase:
         cursor = conn.execute("SELECT COUNT(*) FROM people")
         total = cursor.fetchone()[0]
 
-        # Count by person_type - handle both v1 and v2 schema
-        if self._is_v2:
-            # v2 schema - join with people_types
-            cursor = conn.execute("""
-                SELECT pt.name as person_type, COUNT(*) as cnt
-                FROM people p
-                JOIN people_types pt ON p.person_type_id = pt.id
-                GROUP BY p.person_type_id
-            """)
-        else:
-            # v1 schema
-            cursor = conn.execute("SELECT person_type, COUNT(*) as cnt FROM people GROUP BY person_type")
+        # Count by person_type - join with people_types
+        cursor = conn.execute("""
+            SELECT pt.name as person_type, COUNT(*) as cnt
+            FROM people p
+            JOIN people_types pt ON p.person_type_id = pt.id
+            GROUP BY p.person_type_id
+        """)
         by_type = {row["person_type"]: row["cnt"] for row in cursor}
 
-        # Count by source - handle both v1 and v2 schema
-        if self._is_v2:
-            # v2 schema - join with source_types
-            cursor = conn.execute("""
-                SELECT st.name as source, COUNT(*) as cnt
-                FROM people p
-                JOIN source_types st ON p.source_id = st.id
-                GROUP BY p.source_id
-            """)
-        else:
-            # v1 schema
-            cursor = conn.execute("SELECT source, COUNT(*) as cnt FROM people GROUP BY source")
+        # Count by source - join with source_types
+        cursor = conn.execute("""
+            SELECT st.name as source, COUNT(*) as cnt
+            FROM people p
+            JOIN source_types st ON p.source_id = st.id
+            GROUP BY p.source_id
+        """)
         by_source = {row["source"]: row["cnt"] for row in cursor}
 
         return {
@@ -3195,22 +2696,30 @@ class PersonDatabase:
 
     def get_missing_embedding_ids(self, batch_size: int = 1000) -> Iterator[list[tuple[int, str]]]:
         """
-        Yield batches of (person_id, name) tuples for records missing embeddings.
+        Yield batches of (person_id, embedding_text) tuples for records missing embeddings.
+
+        Embedding text is built as "Name | Role | Org/Location" by JOINing
+        against roles, organizations, and locations tables.
 
         Args:
             batch_size: Number of IDs per batch
 
         Yields:
-            Lists of (person_id, name) tuples needing embeddings
+            Lists of (person_id, embedding_text) tuples needing embeddings
         """
         conn = self._connect()
 
         last_id = 0
         while True:
             cursor = conn.execute("""
-                SELECT id, name FROM people
-                WHERE embedding IS NULL AND id > ?
-                ORDER BY id
+                SELECT p.id, p.name, r.name as role_name,
+                       COALESCE(kfo.name, kfl.name) as org_name
+                FROM people p
+                LEFT JOIN roles r ON p.known_for_role_id = r.id
+                LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
+                LEFT JOIN locations kfl ON p.known_for_org_location_id = kfl.id
+                WHERE p.embedding IS NULL AND p.id > ?
+                ORDER BY p.id
                 LIMIT ?
             """, (last_id, batch_size))
 
@@ -3218,7 +2727,10 @@ class PersonDatabase:
             if not rows:
                 break
 
-            results = [(row["id"], row["name"]) for row in rows]
+            results = [
+                (row["id"], " | ".join(filter(None, [row["name"], row["role_name"], row["org_name"]])))
+                for row in rows
+            ]
             yield results
             last_id = results[-1][0]
 
@@ -3262,24 +2774,14 @@ class PersonDatabase:
         """
         conn = self._connect()
 
-        if self._is_v2:
-            id_col = "source_identifier"
-            if source:
-                source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-                cursor = conn.execute(
-                    f"SELECT DISTINCT {id_col} FROM people WHERE source_id = ?",
-                    (source_type_id,)
-                )
-            else:
-                cursor = conn.execute(f"SELECT DISTINCT {id_col} FROM people")
+        if source:
+            source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
+            cursor = conn.execute(
+                "SELECT DISTINCT source_identifier FROM people WHERE source_id = ?",
+                (source_type_id,)
+            )
         else:
-            if source:
-                cursor = conn.execute(
-                    "SELECT DISTINCT source_id FROM people WHERE source = ?",
-                    (source,)
-                )
-            else:
-                cursor = conn.execute("SELECT DISTINCT source_id FROM people")
+            cursor = conn.execute("SELECT DISTINCT source_identifier FROM people")
 
         return {row[0] for row in cursor}
 
@@ -3287,290 +2789,28 @@ class PersonDatabase:
         """Iterate over all person records, optionally filtered by source."""
         conn = self._connect()
 
-        if self._is_v2:
-            if source:
-                source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-                cursor = conn.execute("""
-                    SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
-                           v.known_for_role, v.known_for_org, v.known_for_org_id,
-                           v.birth_date, v.death_date, p.record
-                    FROM people_view v
-                    JOIN people p ON v.id = p.id
-                    WHERE p.source_id = ?
-                """, (source_type_id,))
-            else:
-                cursor = conn.execute("""
-                    SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
-                           v.known_for_role, v.known_for_org, v.known_for_org_id,
-                           v.birth_date, v.death_date, p.record
-                    FROM people_view v
-                    JOIN people p ON v.id = p.id
-                """)
-            for row in cursor:
-                yield PersonRecord(
-                    name=row["name"],
-                    source=row["source"],
-                    source_id=row["source_identifier"],
-                    country=row["country"] or "",
-                    person_type=PersonType(row["person_type"]) if row["person_type"] else PersonType.UNKNOWN,
-                    known_for_role=row["known_for_role"] or "",
-                    known_for_org=row["known_for_org"] or "",
-                    known_for_org_id=row["known_for_org_id"],  # Can be None
-                    birth_date=row["birth_date"] or "",
-                    death_date=row["death_date"] or "",
-                    record=json.loads(row["record"]),
-                )
+        if source:
+            source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
+            cursor = conn.execute("""
+                SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
+                       v.known_for_role, v.known_for_org, v.known_for_org_id,
+                       v.known_for_org_location_id,
+                       v.birth_date, v.death_date, p.record
+                FROM people_view v
+                JOIN people p ON v.id = p.id
+                WHERE p.source_id = ?
+            """, (source_type_id,))
         else:
-            if source:
-                cursor = conn.execute("""
-                    SELECT name, source, source_id, country, person_type, known_for_role, known_for_org, known_for_org_id, birth_date, death_date, record
-                    FROM people
-                    WHERE source = ?
-                """, (source,))
-            else:
-                cursor = conn.execute("""
-                    SELECT name, source, source_id, country, person_type, known_for_role, known_for_org, known_for_org_id, birth_date, death_date, record
-                    FROM people
-                """)
-
-            for row in cursor:
-                yield PersonRecord(
-                    name=row["name"],
-                    source=row["source"],
-                    source_id=row["source_id"],
-                    country=row["country"] or "",
-                    person_type=PersonType(row["person_type"]) if row["person_type"] else PersonType.UNKNOWN,
-                    known_for_role=row["known_for_role"] or "",
-                    known_for_org=row["known_for_org"] or "",
-                    known_for_org_id=row["known_for_org_id"],  # Can be None
-                    birth_date=row["birth_date"] or "",
-                    death_date=row["death_date"] or "",
-                    record=json.loads(row["record"]),
-                )
-
-    def resolve_qid_labels(
-        self,
-        label_map: dict[str, str],
-        batch_size: int = 1000,
-    ) -> tuple[int, int]:
-        """
-        Update records that have QIDs instead of labels.
-
-        This is called after dump import to resolve any QIDs that were
-        stored because labels weren't available in the cache at import time.
-
-        If resolving would create a duplicate of an existing record with
-        resolved labels, the QID version is deleted instead.
-
-        Args:
-            label_map: Mapping of QID -> label for resolution
-            batch_size: Commit batch size
-
-        Returns:
-            Tuple of (updates, deletes)
-        """
-        conn = self._connect()
-
-        # v2 schema stores QIDs as integers, not text - this method doesn't apply
-        if self._is_v2:
-            logger.debug("Skipping resolve_qid_labels for v2 schema (QIDs stored as integers)")
-            return 0, 0
-
-        # Find all records with QIDs in any field (role or org - these are in unique constraint)
-        # Country is not part of unique constraint so can be updated directly
-        cursor = conn.execute("""
-            SELECT id, source, source_id, country, known_for_role, known_for_org
-            FROM people
-            WHERE (country LIKE 'Q%' AND country GLOB 'Q[0-9]*')
-               OR (known_for_role LIKE 'Q%' AND known_for_role GLOB 'Q[0-9]*')
-               OR (known_for_org LIKE 'Q%' AND known_for_org GLOB 'Q[0-9]*')
-        """)
-        rows = cursor.fetchall()
-
-        updates = 0
-        deletes = 0
-
-        for row in rows:
-            person_id = row["id"]
-            source = row["source"]
-            source_id = row["source_id"]
-            country = row["country"]
-            role = row["known_for_role"]
-            org = row["known_for_org"]
-
-            # Resolve QIDs to labels
-            new_country = label_map.get(country, country) if country.startswith("Q") and country[1:].isdigit() else country
-            new_role = label_map.get(role, role) if role.startswith("Q") and role[1:].isdigit() else role
-            new_org = label_map.get(org, org) if org.startswith("Q") and org[1:].isdigit() else org
-
-            # Skip if nothing changed
-            if new_country == country and new_role == role and new_org == org:
-                continue
-
-            # Check if resolved values would duplicate an existing record
-            # (unique constraint is on source, source_id, known_for_role, known_for_org)
-            if new_role != role or new_org != org:
-                cursor2 = conn.execute("""
-                    SELECT id FROM people
-                    WHERE source = ? AND source_id = ? AND known_for_role = ? AND known_for_org = ?
-                    AND id != ?
-                """, (source, source_id, new_role, new_org, person_id))
-                existing = cursor2.fetchone()
-
-                if existing:
-                    # Duplicate would exist - delete the QID version
-                    conn.execute("DELETE FROM people WHERE id = ?", (person_id,))
-                    conn.execute("DELETE FROM person_embeddings WHERE person_id = ?", (person_id,))
-                    deletes += 1
-                    logger.debug(f"Deleted duplicate QID record {person_id} (source_id={source_id})")
-                    continue
-
-            # No duplicate - update in place
-            conn.execute("""
-                UPDATE people SET country = ?, known_for_role = ?, known_for_org = ?
-                WHERE id = ?
-            """, (new_country, new_role, new_org, person_id))
-            updates += 1
-
-            if (updates + deletes) % batch_size == 0:
-                conn.commit()
-                logger.info(f"Resolved QID labels: {updates} updates, {deletes} deletes...")
-
-        conn.commit()
-        logger.info(f"Resolved QID labels: {updates} updates, {deletes} deletes")
-        return updates, deletes
-
-    def get_unresolved_qids(self) -> set[str]:
-        """
-        Get all QIDs that still need resolution in the database.
-
-        Returns:
-            Set of QIDs (starting with 'Q') found in country, role, or org fields
-        """
-        conn = self._connect()
-
-        # v2 schema stores QIDs as integers, not text - this method doesn't apply
-        if self._is_v2:
-            return set()
-
-        qids: set[str] = set()
-
-        # Get QIDs from country field
-        cursor = conn.execute("""
-            SELECT DISTINCT country FROM people
-            WHERE country LIKE 'Q%' AND country GLOB 'Q[0-9]*'
-        """)
+            cursor = conn.execute("""
+                SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
+                       v.known_for_role, v.known_for_org, v.known_for_org_id,
+                       v.known_for_org_location_id,
+                       v.birth_date, v.death_date, p.record
+                FROM people_view v
+                JOIN people p ON v.id = p.id
+            """)
         for row in cursor:
-            qids.add(row["country"])
-
-        # Get QIDs from known_for_role field
-        cursor = conn.execute("""
-            SELECT DISTINCT known_for_role FROM people
-            WHERE known_for_role LIKE 'Q%' AND known_for_role GLOB 'Q[0-9]*'
-        """)
-        for row in cursor:
-            qids.add(row["known_for_role"])
-
-        # Get QIDs from known_for_org field
-        cursor = conn.execute("""
-            SELECT DISTINCT known_for_org FROM people
-            WHERE known_for_org LIKE 'Q%' AND known_for_org GLOB 'Q[0-9]*'
-        """)
-        for row in cursor:
-            qids.add(row["known_for_org"])
-
-        return qids
-
-    def insert_qid_labels(
-        self,
-        label_map: dict[str, str],
-        batch_size: int = 1000,
-    ) -> int:
-        """
-        Insert QID -> label mappings into the lookup table.
-
-        Args:
-            label_map: Mapping of QID -> label
-            batch_size: Commit batch size
-
-        Returns:
-            Number of labels inserted/updated
-        """
-        conn = self._connect()
-        count = 0
-        skipped = 0
-
-        for qid, label in label_map.items():
-            # Skip non-Q IDs (e.g., property IDs like P19)
-            if not qid.startswith("Q"):
-                skipped += 1
-                continue
-
-            # v2 schema stores QID as integer without Q prefix
-            if self._is_v2:
-                try:
-                    qid_val: str | int = int(qid[1:])
-                except ValueError:
-                    skipped += 1
-                    continue
-            else:
-                qid_val = qid
-
-            conn.execute(
-                "INSERT OR REPLACE INTO qid_labels (qid, label) VALUES (?, ?)",
-                (qid_val, label)
-            )
-            count += 1
-
-            if count % batch_size == 0:
-                conn.commit()
-                logger.debug(f"Inserted {count} QID labels...")
-
-        conn.commit()
-        logger.info(f"Inserted {count} QID labels into lookup table")
-        return count
-
-    def get_qid_label(self, qid: str) -> Optional[str]:
-        """
-        Get the label for a QID from the lookup table.
-
-        Args:
-            qid: Wikidata QID (e.g., 'Q30')
-
-        Returns:
-            Label string or None if not found
-        """
-        conn = self._connect()
-
-        # v2 schema stores QID as integer without Q prefix
-        if self._is_v2:
-            qid_val: str | int = int(qid[1:]) if qid.startswith("Q") else int(qid)
-        else:
-            qid_val = qid
-
-        cursor = conn.execute(
-            "SELECT label FROM qid_labels WHERE qid = ?",
-            (qid_val,)
-        )
-        row = cursor.fetchone()
-        return row["label"] if row else None
-
-    def get_all_qid_labels(self) -> dict[str, str]:
-        """
-        Get all QID -> label mappings from the lookup table.
-
-        Returns:
-            Dict mapping QID -> label
-        """
-        conn = self._connect()
-        cursor = conn.execute("SELECT qid, label FROM qid_labels")
-        return {row["qid"]: row["label"] for row in cursor}
-
-    def get_qid_labels_count(self) -> int:
-        """Get the number of QID labels in the lookup table."""
-        conn = self._connect()
-        cursor = conn.execute("SELECT COUNT(*) FROM qid_labels")
-        return cursor.fetchone()[0]
+            yield self._row_to_person_record(row)
 
     def canonicalize(self, batch_size: int = 10000) -> dict[str, int]:
         """
@@ -3603,19 +2843,12 @@ class PersonDatabase:
         logger.info("Phase 1: Building person index...")
 
         # Load all people with their normalized names and org info
-        if self._is_v2:
-            cursor = conn.execute("""
-                SELECT p.id, p.name, p.name_normalized, s.name as source, p.source_identifier as source_id,
-                       p.known_for_org, p.known_for_org_id, p.from_date, p.to_date
-                FROM people p
-                JOIN source_types s ON p.source_id = s.id
-            """)
-        else:
-            cursor = conn.execute("""
-                SELECT id, name, name_normalized, source, source_id,
-                       known_for_org, known_for_org_id, from_date, to_date
-                FROM people
-            """)
+        cursor = conn.execute("""
+            SELECT p.id, p.name, p.name_normalized, s.name as source, p.source_identifier as source_id,
+                   p.known_for_org_id, p.known_for_org_location_id, p.from_date, p.to_date
+            FROM people p
+            JOIN source_types s ON p.source_id = s.id
+        """)
 
         people: list[dict] = []
         for row in cursor:
@@ -3625,8 +2858,8 @@ class PersonDatabase:
                 "name_normalized": row["name_normalized"],
                 "source": row["source"],
                 "source_id": row["source_id"],
-                "known_for_org": row["known_for_org"],
                 "known_for_org_id": row["known_for_org_id"],
+                "known_for_org_location_id": row["known_for_org_location_id"],
                 "from_date": row["from_date"],
                 "to_date": row["to_date"],
             })
@@ -3655,11 +2888,15 @@ class PersonDatabase:
             if len(same_name) < 2:
                 continue
 
-            # Group by organization (using known_for_org_id if available, else known_for_org)
+            # Group by organization (using known_for_org_id, falling back to known_for_org_location_id)
             org_groups: dict[str, list[dict]] = {}
             for p in same_name:
-                org_key = str(p["known_for_org_id"]) if p["known_for_org_id"] else p["known_for_org"]
-                if org_key:  # Only group if they have an org
+                org_key = (
+                    f"org:{p['known_for_org_id']}" if p["known_for_org_id"]
+                    else f"loc:{p['known_for_org_location_id']}" if p.get("known_for_org_location_id")
+                    else ""
+                )
+                if org_key:  # Only group if they have an org/location
                     org_groups.setdefault(org_key, []).append(p)
 
             # Union people with same name + same org
@@ -4617,6 +3854,66 @@ class LocationsDatabase:
 
         conn.commit()
         return inserted
+
+    def resolve_parent_ids(self, qid_fk_data: dict[int, dict]) -> int:
+        """
+        Pass 2: Resolve parent_ids for locations inserted during pass 1.
+
+        Resolves parent QIDs and country QIDs to location IDs and updates
+        the parent_ids JSON column.
+
+        Args:
+            qid_fk_data: Mapping of QID int → {"parent_qids": ["Q30"], "country_qids": ["Q30"]}
+
+        Returns:
+            Number of records updated
+        """
+        if not qid_fk_data:
+            return 0
+
+        conn = self._connect()
+
+        # Preload QID → location_id lookup
+        cursor = conn.execute("SELECT qid, id FROM locations WHERE qid IS NOT NULL")
+        qid_to_location_id: dict[int, int] = {row[0]: row[1] for row in cursor}
+
+        updated = 0
+        batch_count = 0
+        for loc_qid, fk_data in qid_fk_data.items():
+            parent_qids = fk_data.get("parent_qids", [])
+            country_qids = fk_data.get("country_qids", [])
+
+            # Combine parent + country QIDs, dedup
+            all_parent_qids = list(dict.fromkeys(parent_qids + country_qids))
+            if not all_parent_qids:
+                continue
+
+            # Resolve to location IDs
+            parent_ids: list[int] = []
+            for pqid in all_parent_qids:
+                if pqid.startswith("Q") and pqid[1:].isdigit():
+                    lid = qid_to_location_id.get(int(pqid[1:]))
+                    if lid is not None:
+                        parent_ids.append(lid)
+
+            if not parent_ids:
+                continue
+
+            parent_ids_json = json.dumps(parent_ids)
+            result = conn.execute(
+                "UPDATE locations SET parent_ids = ? WHERE qid = ? AND (parent_ids IS NULL OR parent_ids = '[]')",
+                (parent_ids_json, loc_qid),
+            )
+            updated += result.rowcount
+            batch_count += 1
+
+            if batch_count % 10000 == 0:
+                conn.commit()
+                logger.info(f"Resolved {updated:,} location parent_ids...")
+
+        conn.commit()
+        logger.info(f"Resolved {updated:,} location parent_ids total")
+        return updated
 
     def get_all_source_ids(self, source: str = "wikidata") -> set[str]:
         """

@@ -644,7 +644,7 @@ class WikidataPeopleImporter:
                 country=country or "",
                 person_type=person_type,
                 known_for_role="",  # To be enriched later
-                known_for_org="",   # To be enriched later
+                known_for_org_name="",   # To be enriched later
                 from_date=None,     # To be enriched later
                 to_date=None,       # To be enriched later
                 record=record_data,
@@ -739,7 +739,7 @@ class WikidataPeopleImporter:
                 country=country or "",
                 person_type=person_type,
                 known_for_role=role or "",
-                known_for_org=org_label or "",
+                known_for_org_name=org_label or "",
                 from_date=from_date,
                 to_date=to_date,
                 record=record_data,
@@ -831,7 +831,7 @@ class WikidataPeopleImporter:
                 country="",  # Not available from search API
                 person_type=person_type,
                 known_for_role="",
-                known_for_org="",
+                known_for_org_name="",
                 record={
                     "wikidata_id": qid,
                     "label": label,
@@ -962,7 +962,7 @@ class WikidataPeopleImporter:
 
             qid = person.source_id
             role = person.known_for_role
-            org = person.known_for_org
+            org = person.known_for_org_name
 
             from_date, to_date = self.enrich_person_dates(qid, role, org)
 
@@ -1121,7 +1121,7 @@ class WikidataPeopleImporter:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         # Filter to people that need enrichment
-        to_enrich = [p for p in people if not p.known_for_role and not p.known_for_org]
+        to_enrich = [p for p in people if not p.known_for_role and not p.known_for_org_name]
 
         if not to_enrich:
             logger.info("No people need enrichment")
@@ -1137,7 +1137,7 @@ class WikidataPeopleImporter:
 
                 if role or org:
                     person.known_for_role = role
-                    person.known_for_org = org
+                    person.known_for_org_name = org
                     if org_qid:
                         person.record["org_qid"] = org_qid
                     if from_date:
@@ -1161,7 +1161,7 @@ class WikidataPeopleImporter:
                 person, success = future.result()
                 if success:
                     enriched_count += 1
-                    logger.debug(f"Enriched {person.name}: {person.known_for_role} at {person.known_for_org}")
+                    logger.debug(f"Enriched {person.name}: {person.known_for_role} at {person.known_for_org_name}")
 
                 completed += 1
                 if completed % 100 == 0:

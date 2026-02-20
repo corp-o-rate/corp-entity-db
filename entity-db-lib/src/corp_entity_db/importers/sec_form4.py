@@ -354,7 +354,7 @@ class SecForm4Importer:
                 country="US",
                 person_type=person_type,
                 known_for_role=role,
-                known_for_org=issuer_name,
+                known_for_org_name=issuer_name,
                 # Note: known_for_org_id will be set during import if org exists in DB
                 from_date=period_of_report,
                 record=record_data,

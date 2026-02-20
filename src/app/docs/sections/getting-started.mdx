@@ -6,17 +6,18 @@
 
 <span id="installation" />
 
-```bash
-pip install corp-entity-db
-```
+<CodeTabs tabs={[
+  { label: "pip", language: "bash", code: "pip install corp-entity-db" },
+  { label: "uv", language: "bash", code: "uv add corp-entity-db" },
+]} />
 
 The embedding model (`google/embeddinggemma-300m`, 300M params) is downloaded automatically on first use. The default install includes only search dependencies. Install extras as needed:
 
-```bash
-# Default: search and resolve (no build dependencies)
+<CodeTabs tabs={[
+  { label: "pip", language: "bash", code: `# Default: search and resolve (no build dependencies)
 pip install corp-entity-db
 
-# With database build/import support (sqlite-vec, orjson, indexed-bzip2)
+# With database build/import support (orjson, indexed-bzip2)
 pip install "corp-entity-db[build]"
 
 # With HTTP server (corp-entity-db serve)
@@ -26,8 +27,22 @@ pip install "corp-entity-db[serve]"
 pip install "corp-entity-db[client]"
 
 # Everything
-pip install "corp-entity-db[all]"
-```
+pip install "corp-entity-db[all]"` },
+  { label: "uv", language: "bash", code: `# Default: search and resolve (no build dependencies)
+uv add corp-entity-db
+
+# With database build/import support (orjson, indexed-bzip2)
+uv add "corp-entity-db[build]"
+
+# With HTTP server (corp-entity-db serve)
+uv add "corp-entity-db[serve]"
+
+# With remote client (EntityDBClient via httpx)
+uv add "corp-entity-db[client]"
+
+# Everything
+uv add "corp-entity-db[all]"` },
+]} />
 
 ### Quick Start
 

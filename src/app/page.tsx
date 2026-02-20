@@ -102,7 +102,7 @@ export default function Home() {
                 >
                   USearch HNSW
                 </a>{' '}
-                indexes for sub-millisecond lookups. Data sourced from GLEIF, SEC Edgar,
+                indexes for fast lookups. Data sourced from GLEIF, SEC Edgar,
                 UK Companies House, and Wikidata.
               </p>
             </div>

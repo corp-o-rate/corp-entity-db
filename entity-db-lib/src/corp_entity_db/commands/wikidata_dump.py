@@ -13,13 +13,14 @@ from ._common import _configure_logging, _resolve_db_path
 
 class ImportBatch(NamedTuple):
     """A batch of records ready for embedding, produced by the reader thread."""
-    record_type: str          # "people" or "org"
-    records: list             # PersonRecord or CompanyRecord list
-    embedding_texts: list[str]
+    record_type: str          # "people", "org", or "location"
+    records: list             # PersonRecord, CompanyRecord, or LocationRecord list
+    embedding_texts: list[str]  # empty for locations (no embeddings needed)
     last_entity_index: int
     last_entity_id: str
     people_count: int         # cumulative people yielded so far
     orgs_count: int           # cumulative orgs yielded so far
+    locations_count: int = 0  # cumulative locations yielded so far
 
 
 def _reader_thread(
@@ -27,27 +28,35 @@ def _reader_thread(
     *,
     people: bool,
     orgs: bool,
+    locations: bool,
     limit: Optional[int],
     require_enwiki: bool,
     skip_updates: bool,
     existing_people_ids: set[str],
     existing_org_ids: set[str],
+    existing_location_ids: set[str],
     start_index: int,
     batch_size: int,
     embed_queue: queue.Queue,
+    location_queue: queue.Queue,
     shutdown_event: threading.Event,
     thread_errors: list[Exception],
 ) -> None:
-    """Reader thread: iterates the dump, accumulates batches, puts them on embed_queue."""
+    """Reader thread: iterates the dump, accumulates batches, puts them on embed_queue.
+
+    Location records are put on location_queue directly (no embedding needed).
+    """
     import logging
     logger = logging.getLogger(__name__)
 
     people_records: list = []
     org_records: list = []
+    location_records: list = []
     last_entity_index = start_index
     last_entity_id = ""
     people_yielded = 0
     orgs_yielded = 0
+    locations_yielded = 0
 
     def progress_callback(entity_index: int, entity_id: str, ppl_count: int, org_count: int) -> None:
         nonlocal last_entity_index, last_entity_id
@@ -67,6 +76,7 @@ def _reader_thread(
                 last_entity_id=last_entity_id,
                 people_count=people_yielded,
                 orgs_count=orgs_yielded,
+                locations_count=locations_yielded,
             )
             embed_queue.put(batch)
             people_records = []
@@ -84,19 +94,30 @@ def _reader_thread(
                 last_entity_id=last_entity_id,
                 people_count=people_yielded,
                 orgs_count=orgs_yielded,
+                locations_count=locations_yielded,
             )
             embed_queue.put(batch)
             org_records = []
+
+    def flush_locations() -> None:
+        nonlocal location_records, locations_yielded
+        if location_records and not shutdown_event.is_set():
+            locations_yielded += len(location_records)
+            location_queue.put(list(location_records))
+            location_records = []
 
     try:
         for record_type, record in importer.import_all(
             people_limit=limit if people else 0,
             orgs_limit=limit if orgs else 0,
+            locations_limit=limit if locations else 0,
             import_people=people,
             import_orgs=orgs,
+            import_locations=locations,
             require_enwiki=require_enwiki,
             skip_people_ids=existing_people_ids if skip_updates else None,
             skip_org_ids=existing_org_ids if skip_updates else None,
+            skip_location_ids=existing_location_ids if skip_updates else None,
             start_index=start_index,
             progress_callback=progress_callback,
         ):
@@ -108,52 +129,26 @@ def _reader_thread(
                 people_records.append(record)
                 if len(people_records) >= batch_size:
                     flush_people()
-            else:  # org
+            elif record_type == "org":
                 org_records.append(record)
                 if len(org_records) >= batch_size:
                     flush_orgs()
+            elif record_type == "location":
+                location_records.append(record)
+                if len(location_records) >= batch_size:
+                    flush_locations()
 
         # Flush remaining partial batches
         flush_people()
         flush_orgs()
+        flush_locations()
 
     except Exception as e:
         thread_errors.append(e)
     finally:
         # Sentinel: reader is done
         embed_queue.put(None)
-
-
-def _embedder_thread(
-    embedder,
-    *,
-    embed_queue: queue.Queue,
-    result_queue: queue.Queue,
-    shutdown_event: threading.Event,
-    thread_errors: list[Exception],
-) -> None:
-    """Embedder thread: consumes ImportBatch, produces (batch, embeddings)."""
-    import logging
-    logger = logging.getLogger(__name__)
-
-    try:
-        while True:
-            batch = embed_queue.get()
-            if batch is None:
-                # Reader is done
-                break
-            if shutdown_event.is_set():
-                logger.info("Embedder thread: shutdown requested, stopping")
-                break
-
-            embeddings = embedder.embed_batch(batch.embedding_texts)
-            result_queue.put((batch, embeddings))
-
-    except Exception as e:
-        thread_errors.append(e)
-    finally:
-        # Sentinel: embedder is done
-        result_queue.put(None)
+        location_queue.put(None)
 
 
 @click.command("import-wikidata-dump")
@@ -164,12 +159,13 @@ def _embedder_thread(
 @click.option("--db", "db_path", type=click.Path(), help="Database path")
 @click.option("--people/--no-people", default=True, help="Import people (default: yes)")
 @click.option("--orgs/--no-orgs", default=True, help="Import organizations (default: yes)")
-@click.option("--locations/--no-locations", default=False, help="Import locations (default: no)")
+@click.option("--locations/--no-locations", default=True, help="Import locations (default: yes)")
 @click.option("--require-enwiki", is_flag=True, help="Only import orgs with English Wikipedia articles")
 @click.option("--resume", is_flag=True, help="Resume from last position in dump file (tracks entity index)")
 @click.option("--skip-updates", is_flag=True, help="Skip Q codes already in database (no updates)")
 @click.option("--limit", type=int, help="Max records per type (people and/or orgs)")
 @click.option("--batch-size", type=int, default=10000, help="Batch size for commits (default: 10000)")
+@click.option("--fk-only", is_flag=True, help="Skip import, only resolve FK relations (pass 2)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def db_import_wikidata_dump(
     dump_path: Optional[str],
@@ -185,6 +181,7 @@ def db_import_wikidata_dump(
     skip_updates: bool,
     limit: Optional[int],
     batch_size: int,
+    fk_only: bool,
     verbose: bool,
 ):
     """
@@ -224,7 +221,6 @@ def db_import_wikidata_dump(
     _configure_logging(verbose)
 
     from corp_entity_db.store import get_person_database, get_database, get_locations_database
-    from corp_entity_db.embeddings import CompanyEmbedder
     from corp_entity_db.importers.wikidata_dump import WikidataDumpImporter, DumpProgress
 
     if not dump_path and not download:
@@ -306,25 +302,83 @@ def db_import_wikidata_dump(
     elif dump_path:
         click.echo(f"Using dump: {dump_path}", err=True)
 
-    # Initialize embedder (loads model, may take time on first run)
-    click.echo("Loading embedding model...", err=True)
-    sys.stderr.flush()
-    embedder = CompanyEmbedder()
-    click.echo("Embedding model loaded.", err=True)
-    sys.stderr.flush()
+    # === FK-only mode: skip import, just resolve FK relations ===
+    if fk_only:
+        click.echo("\n=== FK-only mode: Resolving FK relations ===", err=True)
+        sys.stderr.flush()
 
-    # Load existing QID labels from database and seed the importer's cache
-    # readonly=False because we also write new labels via persist_new_labels()
+        person_database = get_person_database(db_path=db_path_obj, readonly=False)
+        org_database = get_database(db_path=db_path_obj, readonly=False) if orgs else None
+        locations_database = get_locations_database(db_path=db_path_obj, readonly=False) if locations else None
+
+        person_fks: dict[int, dict] = {}
+        org_fks: dict[int, dict] = {}
+        location_fks: dict[int, dict] = {}
+        fk_count = 0
+
+        click.echo("Reading dump for FK data...", err=True)
+        for entity_type, qid, fk_data in importer.import_fk_relations():
+            if not qid.startswith("Q") or not qid[1:].isdigit():
+                continue
+            qid_int = int(qid[1:])
+            if entity_type == "person" and people:
+                person_fks[qid_int] = fk_data
+            elif entity_type == "org" and orgs:
+                org_fks[qid_int] = fk_data
+            elif entity_type == "location" and locations:
+                location_fks[qid_int] = fk_data
+            fk_count += 1
+            if fk_count % 500_000 == 0:
+                click.echo(
+                    f"\r  Reading FKs: {len(person_fks):,} people, {len(org_fks):,} orgs, "
+                    f"{len(location_fks):,} locations...",
+                    nl=False, err=True,
+                )
+                sys.stderr.flush()
+
+        click.echo(
+            f"\n  Extracted FK data: {len(person_fks):,} people, {len(org_fks):,} orgs, "
+            f"{len(location_fks):,} locations",
+            err=True,
+        )
+
+        # Resolve in order: locations first, then orgs, then people
+        if locations_database and location_fks:
+            resolved = locations_database.resolve_parent_ids(location_fks)
+            click.echo(f"  Resolved {resolved:,} location parent_ids", err=True)
+
+        if org_database and org_fks:
+            resolved = org_database.resolve_fks(org_fks)
+            click.echo(f"  Resolved {resolved:,} org region_ids", err=True)
+
+        if people and person_fks:
+            resolved = person_database.resolve_fks(person_fks)
+            click.echo(f"  Resolved {resolved:,} person FKs (country_id, known_for_org)", err=True)
+
+        # Backfill known_for_org from reverse mappings rebuilt during pass 2
+        reverse_map = importer.get_reverse_person_orgs()
+        if reverse_map and people:
+            backfilled = person_database.backfill_known_for_org(reverse_map)
+            click.echo(
+                f"  Backfilled known_for_org: {backfilled:,} updated ({len(reverse_map):,} reverse mappings)",
+                err=True,
+            )
+
+        person_database.close()
+        if org_database:
+            org_database.close()
+        if locations_database:
+            locations_database.close()
+
+        click.echo("\nFK resolution complete!", err=True)
+        return
+
     database = get_person_database(db_path=db_path_obj, readonly=False)
-    existing_labels = database.get_all_qid_labels()
-    if existing_labels:
-        click.echo(f"Loaded {len(existing_labels):,} existing QID labels from DB", err=True)
-        importer.set_label_cache(existing_labels)
-    del existing_labels  # Free memory — labels are now in the importer's cache
 
     # Load existing source_ids for skip_updates mode
     existing_people_ids: set[str] = set()
     existing_org_ids: set[str] = set()
+    existing_location_ids: set[str] = set()
     if skip_updates:
         click.echo("Loading existing records for --skip-updates...", err=True)
         if people:
@@ -335,6 +389,10 @@ def db_import_wikidata_dump(
             org_database = get_database(db_path=db_path_obj, readonly=False)
             existing_org_ids = org_database.get_all_source_ids(source="wikipedia")
             click.echo(f"  Found {len(existing_org_ids):,} existing org Q codes", err=True)
+        if locations:
+            locations_database = get_locations_database(db_path=db_path_obj, readonly=False)
+            existing_location_ids = locations_database.get_all_source_ids(source="wikidata")
+            click.echo(f"  Found {len(existing_location_ids):,} existing location Q codes", err=True)
 
     # Load progress for resume mode (position-based resume)
     progress: Optional[DumpProgress] = None
@@ -362,15 +420,6 @@ def db_import_wikidata_dump(
             dump_path=str(actual_dump_path),
             dump_size=actual_dump_path.stat().st_size if actual_dump_path.exists() else 0,
         )
-
-    # Helper to persist new labels after each batch
-    def persist_new_labels() -> int:
-        new_labels = importer.get_new_labels_since()
-        if new_labels:
-            database.insert_qid_labels(new_labels)
-            importer.flush_new_labels()
-            return len(new_labels)
-        return 0
 
     # ========================================
     # Location-only import (separate pass)
@@ -441,7 +490,7 @@ def db_import_wikidata_dump(
                         location_records.append(record)
                         if len(location_records) >= batch_size:
                             flush_location_batch()
-                            persist_new_labels()
+
                             save_location_progress()
             else:
                 # No limit - show counter updates
@@ -455,7 +504,7 @@ def db_import_wikidata_dump(
                     location_records.append(record)
                     if len(location_records) >= batch_size:
                         flush_location_batch()
-                        persist_new_labels()
+
                         save_location_progress()
                         click.echo(f"\r  Progress: {locations_count:,} locations...", nl=False, err=True)
                         sys.stderr.flush()
@@ -464,7 +513,6 @@ def db_import_wikidata_dump(
 
             # Final batches
             flush_location_batch()
-            persist_new_labels()
             save_location_progress()
 
         finally:
@@ -473,21 +521,26 @@ def db_import_wikidata_dump(
 
         click.echo(f"\nLocation import complete: {locations_count:,} locations", err=True)
 
-        # Final label resolution
-        click.echo("\n=== Final QID Label Resolution ===", err=True)
-        all_labels = importer.get_label_cache(copy=False)
-        click.echo(f"  Total labels in cache: {len(all_labels):,}", err=True)
+        # === Pass 2: Resolve FK relations (location parent_ids) ===
+        click.echo("\n=== Pass 2: Resolving FK relations ===", err=True)
+        sys.stderr.flush()
 
-        # Final stats
-        final_label_count = database.get_qid_labels_count()
-        click.echo(f"  Total labels in DB: {final_label_count:,}", err=True)
+        location_fks: dict[int, dict] = {}
+        for entity_type, qid, fk_data in importer.import_fk_relations():
+            if entity_type == "location" and qid.startswith("Q") and qid[1:].isdigit():
+                location_fks[int(qid[1:])] = fk_data
+
+        click.echo(f"  Extracted FK data for {len(location_fks):,} locations", err=True)
+
+        resolved_locs = locations_database.resolve_parent_ids(location_fks)
+        click.echo(f"  Resolved {resolved_locs:,} location parent_ids", err=True)
 
         locations_database.close()
         database.close()
         click.echo("\nWikidata dump import complete!", err=True)
         return
 
-    # Combined import - single pass through the dump for both people and orgs
+    # Combined import - single pass through the dump for people, orgs, and locations
     click.echo("\n=== Combined Import (single dump pass) ===", err=True)
     sys.stderr.flush()  # Ensure output is visible immediately
     if people:
@@ -500,21 +553,29 @@ def db_import_wikidata_dump(
             click.echo("    Filter: only orgs with English Wikipedia articles", err=True)
         if skip_updates and existing_org_ids:
             click.echo(f"    Skip updates: {len(existing_org_ids):,} existing Q codes", err=True)
+    if locations:
+        click.echo(f"  Locations: {'up to ' + str(limit) + ' records' if limit else 'unlimited'}", err=True)
+        if skip_updates and existing_location_ids:
+            click.echo(f"    Skip updates: {len(existing_location_ids):,} existing Q codes", err=True)
     if start_index > 0:
         click.echo(f"  Resuming from entity index {start_index:,}", err=True)
 
     # Initialize databases (readonly=False for import operations)
     person_database = get_person_database(db_path=db_path_obj, readonly=False)
     org_database = get_database(db_path=db_path_obj, readonly=False) if orgs else None
+    locations_database = get_locations_database(db_path=db_path_obj, readonly=False) if locations else None
 
-    # Pipeline: reader thread → embed_queue → embedder thread → result_queue → main thread (DB writes)
-    embed_queue: queue.Queue = queue.Queue(maxsize=2)
-    result_queue: queue.Queue = queue.Queue(maxsize=2)
+    # Pipeline: reader thread → write_queue → main thread (DB writes)
+    # Embeddings are deferred to post-import (needs FK resolution for rich text)
+    # Locations bypass the write_queue and go directly via location_queue
+    write_queue: queue.Queue = queue.Queue(maxsize=4)
+    location_queue: queue.Queue = queue.Queue(maxsize=4)
     shutdown_event = threading.Event()
     thread_errors: list[Exception] = []
 
     people_count = 0
     orgs_count = 0
+    locations_count = 0
     last_entity_index = start_index
     last_entity_id = ""
 
@@ -526,7 +587,21 @@ def db_import_wikidata_dump(
             progress.orgs_yielded = orgs_count
             progress.save()
 
-    click.echo("Starting parallel pipeline (reader → embedder → writer)...", err=True)
+    def drain_location_queue() -> None:
+        """Drain all pending location batches from the queue."""
+        nonlocal locations_count
+        while True:
+            try:
+                loc_batch = location_queue.get_nowait()
+                if loc_batch is None:
+                    break
+                if locations_database:
+                    inserted = locations_database.insert_batch(loc_batch)
+                    locations_count += inserted
+            except queue.Empty:
+                break
+
+    click.echo("Starting pipeline (reader → writer, embeddings deferred to post-import)...", err=True)
     sys.stderr.flush()
 
     reader = threading.Thread(
@@ -535,35 +610,25 @@ def db_import_wikidata_dump(
         kwargs=dict(
             people=people,
             orgs=orgs,
+            locations=locations,
             limit=limit,
             require_enwiki=require_enwiki,
             skip_updates=skip_updates,
             existing_people_ids=existing_people_ids,
             existing_org_ids=existing_org_ids,
+            existing_location_ids=existing_location_ids,
             start_index=start_index,
             batch_size=batch_size,
-            embed_queue=embed_queue,
+            embed_queue=write_queue,
+            location_queue=location_queue,
             shutdown_event=shutdown_event,
             thread_errors=thread_errors,
         ),
         daemon=True,
         name="wikidata-reader",
     )
-    embedder_th = threading.Thread(
-        target=_embedder_thread,
-        args=(embedder,),
-        kwargs=dict(
-            embed_queue=embed_queue,
-            result_queue=result_queue,
-            shutdown_event=shutdown_event,
-            thread_errors=thread_errors,
-        ),
-        daemon=True,
-        name="wikidata-embedder",
-    )
 
     reader.start()
-    embedder_th.start()
 
     try:
         while True:
@@ -571,18 +636,22 @@ def db_import_wikidata_dump(
             if thread_errors:
                 raise thread_errors[0]
 
-            result = result_queue.get()
-            if result is None:
-                # Embedder is done — all batches processed
+            # Drain location queue (non-blocking) while waiting for record batches
+            drain_location_queue()
+
+            try:
+                batch = write_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if batch is None:
+                # Reader is done — all batches sent
                 break
 
-            batch, embeddings = result
-
-            # Insert into database (main thread owns SQLite writes)
+            # Insert into database without embeddings (main thread owns SQLite writes)
             if batch.record_type == "people":
-                person_database.insert_batch(batch.records, embeddings)
+                person_database.insert_batch(batch.records)
             elif batch.record_type == "org" and org_database:
-                org_database.insert_batch(batch.records, embeddings)
+                org_database.insert_batch(batch.records)
 
             # Update progress from batch metadata
             people_count = batch.people_count
@@ -590,11 +659,17 @@ def db_import_wikidata_dump(
             last_entity_index = batch.last_entity_index
             last_entity_id = batch.last_entity_id
 
-            persist_new_labels()
             save_progress()
 
-            click.echo(f"\r  Progress: {people_count:,} people, {orgs_count:,} orgs...", nl=False, err=True)
+            click.echo(
+                f"\r  Progress: {people_count:,} people, {orgs_count:,} orgs, "
+                f"{locations_count:,} locations...",
+                nl=False, err=True,
+            )
             sys.stderr.flush()
+
+        # Drain any remaining location batches
+        drain_location_queue()
 
         click.echo("", err=True)  # Newline after counter
 
@@ -605,113 +680,103 @@ def db_import_wikidata_dump(
     except KeyboardInterrupt:
         click.echo("\n  Interrupted! Saving progress...", err=True)
         shutdown_event.set()
-        # Drain any completed batches from result_queue so we don't lose work
+        # Drain any completed batches from write_queue so we don't lose work
         while True:
             try:
-                result = result_queue.get_nowait()
-                if result is None:
+                batch = write_queue.get_nowait()
+                if batch is None:
                     break
-                batch, embeddings = result
                 if batch.record_type == "people":
-                    person_database.insert_batch(batch.records, embeddings)
+                    person_database.insert_batch(batch.records)
                 elif batch.record_type == "org" and org_database:
-                    org_database.insert_batch(batch.records, embeddings)
+                    org_database.insert_batch(batch.records)
                 people_count = batch.people_count
                 orgs_count = batch.orgs_count
                 last_entity_index = batch.last_entity_index
                 last_entity_id = batch.last_entity_id
             except queue.Empty:
                 break
-        persist_new_labels()
+        drain_location_queue()
         save_progress()
-        click.echo(f"  Saved: {people_count:,} people, {orgs_count:,} orgs", err=True)
+        click.echo(f"  Saved: {people_count:,} people, {orgs_count:,} orgs, {locations_count:,} locations", err=True)
         raise
     finally:
         save_progress()
         reader.join(timeout=5)
-        embedder_th.join(timeout=5)
 
-    click.echo(f"Import complete: {people_count:,} people, {orgs_count:,} orgs", err=True)
+    click.echo(f"Import complete: {people_count:,} people, {orgs_count:,} orgs, {locations_count:,} locations", err=True)
 
-    # Backfill known_for_org from reverse org→person mappings
-    # (P169 CEO, P488 chairperson, P112 founder, P1037 director, P3320 board member)
+    # === Pass 2: Resolve FK relations ===
+    click.echo("\n=== Pass 2: Resolving FK relations ===", err=True)
+    sys.stderr.flush()
+
+    person_fks: dict[int, dict] = {}
+    org_fks: dict[int, dict] = {}
+    location_fks: dict[int, dict] = {}
+    fk_count = 0
+
+    for entity_type, qid, fk_data in importer.import_fk_relations():
+        if not qid.startswith("Q") or not qid[1:].isdigit():
+            continue
+        qid_int = int(qid[1:])
+        if entity_type == "person":
+            person_fks[qid_int] = fk_data
+        elif entity_type == "org":
+            org_fks[qid_int] = fk_data
+        elif entity_type == "location":
+            location_fks[qid_int] = fk_data
+        fk_count += 1
+        if fk_count % 500_000 == 0:
+            click.echo(
+                f"\r  Reading FKs: {len(person_fks):,} people, {len(org_fks):,} orgs, "
+                f"{len(location_fks):,} locations...",
+                nl=False, err=True,
+            )
+            sys.stderr.flush()
+
+    click.echo(
+        f"\n  Extracted FK data: {len(person_fks):,} people, {len(org_fks):,} orgs, "
+        f"{len(location_fks):,} locations",
+        err=True,
+    )
+
+    # Resolve in order: locations first (others reference them), then orgs, then people
+    if locations and locations_database and location_fks:
+        resolved = locations_database.resolve_parent_ids(location_fks)
+        click.echo(f"  Resolved {resolved:,} location parent_ids", err=True)
+
+    if orgs and org_database and org_fks:
+        # Re-open org_database if it was closed
+        if org_database._conn is None:
+            org_database = get_database(db_path=db_path_obj, readonly=False)
+        resolved = org_database.resolve_fks(org_fks)
+        click.echo(f"  Resolved {resolved:,} org region_ids", err=True)
+
+    if people and person_fks:
+        resolved = person_database.resolve_fks(person_fks)
+        click.echo(f"  Resolved {resolved:,} person FKs (country_id, known_for_org)", err=True)
+
+    # Backfill known_for_org_id/known_for_org_location_id from reverse org→person mappings
+    # (rebuilt during pass 2: P169 CEO, P488 chairperson, P112 founder, P1037 director, P3320 board member)
     reverse_map = importer.get_reverse_person_orgs()
     if reverse_map and people:
-        # Resolve org QIDs to labels before backfilling (threads are joined, safe to read directly)
-        label_cache = importer.get_label_cache(copy=False)
-        resolved_map: dict[str, list[tuple[str, str, str | None, str | None]]] = {}
-        for person_qid, entries in reverse_map.items():
-            resolved_entries: list[tuple[str, str, str | None, str | None]] = []
-            for org_qid, role, start_date, end_date in entries:
-                org_label = label_cache.get(org_qid, "")
-                if org_label:
-                    resolved_entries.append((org_label, role, start_date, end_date))
-            if resolved_entries:
-                resolved_map[person_qid] = resolved_entries
-        del label_cache  # Release reference
-        if resolved_map:
-            backfilled = person_database.backfill_known_for_org(resolved_map)
-            click.echo(
-                f"Backfilled known_for_org from org executive properties: "
-                f"{backfilled:,} updated ({len(resolved_map):,} reverse mappings)",
-                err=True,
-            )
-        del resolved_map
+        # Pass org QIDs directly — backfill_known_for_org resolves to org/location FKs
+        backfilled = person_database.backfill_known_for_org(reverse_map)
+        click.echo(
+            f"Backfilled known_for_org from org executive properties: "
+            f"{backfilled:,} updated ({len(reverse_map):,} reverse mappings)",
+            err=True,
+        )
 
-    # Free reverse map memory — no longer needed
-    del reverse_map
+    # Free FK data and reverse map memory
+    del person_fks, org_fks, location_fks, reverse_map
 
     # Keep references for final label resolution
     database = person_database
     if org_database:
         org_database.close()
-
-    # Final label resolution pass for any remaining unresolved QIDs
-    click.echo("\n=== Final QID Label Resolution ===", err=True)
-
-    # Use the live label cache (threads are joined, single-threaded from here)
-    all_labels = importer.get_label_cache(copy=False)
-    click.echo(f"  Total labels in cache: {len(all_labels):,}", err=True)
-
-    # Check for any remaining unresolved QIDs in the database
-    people_unresolved = database.get_unresolved_qids()
-    click.echo(f"  Unresolved QIDs in people: {len(people_unresolved):,}", err=True)
-
-    org_unresolved: set[str] = set()
-    if orgs:
-        # readonly=False because we also call resolve_qid_labels later
-        org_database = get_database(db_path=db_path_obj, readonly=False)
-        org_unresolved = org_database.get_unresolved_qids()
-        click.echo(f"  Unresolved QIDs in orgs: {len(org_unresolved):,}", err=True)
-
-    all_unresolved = people_unresolved | org_unresolved
-    need_sparql = all_unresolved - set(all_labels.keys())
-
-    if need_sparql:
-        click.echo(f"  Resolving {len(need_sparql):,} remaining QIDs via SPARQL...", err=True)
-        sparql_resolved = importer.resolve_qids_via_sparql(need_sparql)
-        all_labels.update(sparql_resolved)
-        # Persist newly resolved labels
-        if sparql_resolved:
-            database.insert_qid_labels(sparql_resolved)
-            click.echo(f"  SPARQL resolved and stored: {len(sparql_resolved):,}", err=True)
-
-    # Update records with any newly resolved labels
-    if all_labels:
-        updates, deletes = database.resolve_qid_labels(all_labels)
-        if updates or deletes:
-            click.echo(f"  People: {updates:,} updated, {deletes:,} duplicates deleted", err=True)
-
-        if orgs:
-            org_database = get_database(db_path=db_path_obj, readonly=False)
-            org_updates, org_deletes = org_database.resolve_qid_labels(all_labels)
-            if org_updates or org_deletes:
-                click.echo(f"  Orgs: {org_updates:,} updated, {org_deletes:,} duplicates deleted", err=True)
-            org_database.close()
-
-    # Final stats
-    final_label_count = database.get_qid_labels_count()
-    click.echo(f"  Total labels in DB: {final_label_count:,}", err=True)
+    if locations_database:
+        locations_database.close()
 
     # Run canonicalization to link equivalent records across sources
     click.echo("\n=== Canonicalization ===", err=True)
