@@ -246,7 +246,6 @@ class PersonRecord(BaseModel):
     person_type: PersonType = Field(default=PersonType.UNKNOWN, description="Person type classification")
     known_for_role: str = Field(default="", description="Primary role (e.g., 'CEO', 'President')")
     known_for_org_id: Optional[int] = Field(default=None, description="Foreign key to organizations table")
-    known_for_org_location_id: Optional[int] = Field(default=None, description="Foreign key to locations table (for jurisdictions)")
     known_for_org_name: str = Field(default="", description="Transient display name from view COALESCE or importer, not persisted to DB")
     from_date: Optional[str] = Field(default=None, description="Start date of role (ISO format YYYY-MM-DD)")
     to_date: Optional[str] = Field(default=None, description="End date of role (ISO format YYYY-MM-DD)")
@@ -274,7 +273,6 @@ class PersonRecord(BaseModel):
             "person_type": self.person_type.value,
             "known_for_role": self.known_for_role,
             "known_for_org_id": self.known_for_org_id,
-            "known_for_org_location_id": self.known_for_org_location_id,
             "from_date": self.from_date or "",
             "to_date": self.to_date or "",
             "birth_date": self.birth_date or "",

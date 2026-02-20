@@ -53,10 +53,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from ..models import CompanyRecord, EntityType, LocationRecord, PersonRecord, PersonType, SimplifiedLocationType
+from ..models import CompanyRecord, EntityType, LocationRecord, PersonRecord, PersonType, RoleRecord, SimplifiedLocationType
 
 # Type alias for records that can be either people or orgs or locations
-ImportRecord = PersonRecord | CompanyRecord | LocationRecord
+ImportRecord = PersonRecord | CompanyRecord | LocationRecord | RoleRecord
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +310,40 @@ OCCUPATION_TO_TYPE: dict[str, PersonType] = {
     "Q131524": PersonType.ENTREPRENEUR,  # entrepreneur
     "Q43845": PersonType.ENTREPRENEUR,   # businessperson
 }
+
+# =============================================================================
+# ROLE/POSITION TYPE MAPPING (P31 - instance of)
+# Entities with these P31 values are position/office items referenced by P39.
+# =============================================================================
+
+ROLE_TYPE_QIDS: frozenset[str] = frozenset({
+    # Core position types
+    "Q4164871",    # position
+    "Q294414",     # public office
+    "Q12737077",   # occupation
+
+    # Political positions
+    "Q2285706",    # type of political position
+    "Q1553195",    # head of state
+    "Q30185",      # head of government
+    "Q15618781",   # legislative seat
+    "Q740464",     # judicial office
+    "Q4185145",    # civil service position
+    "Q107711",     # minister
+    "Q4175034",    # diplomat rank
+
+    # Military positions
+    "Q56019",      # military rank
+    "Q4338774",    # military appointment
+
+    # Academic / professional
+    "Q15711026",   # academic position
+    "Q193391",     # diplomatic rank
+    "Q736600",     # religious rank
+
+    # Corporate governance
+    "Q1075651",    # type of management position
+})
 
 # =============================================================================
 # ORGANIZATION TYPE MAPPING (P31 - instance of)
@@ -705,6 +739,9 @@ class WikidataDumpImporter:
         # Built from all entities with P31=Q4164871 (position) that have P1001 or P17.
         # Used to backfill org context for P39 claims without qualifier-level org.
         self._position_jurisdictions: dict[str, str] = {}
+        # Cache role QID → English label. Built as role entities are encountered in the dump.
+        # Used to populate known_for_role on person records during pass 1.
+        self._role_labels: dict[str, str] = {}
 
     def download_dump(
         self,
@@ -1189,9 +1226,11 @@ class WikidataDumpImporter:
         people_limit: Optional[int] = None,
         orgs_limit: Optional[int] = None,
         locations_limit: Optional[int] = None,
+        roles_limit: Optional[int] = None,
         import_people: bool = True,
         import_orgs: bool = True,
         import_locations: bool = True,
+        import_roles: bool = True,
         require_enwiki: bool = False,
         skip_people_ids: Optional[set[str]] = None,
         skip_org_ids: Optional[set[str]] = None,
@@ -1200,7 +1239,7 @@ class WikidataDumpImporter:
         progress_callback: Optional[Callable[[int, str, int, int], None]] = None,
     ) -> Iterator[tuple[str, ImportRecord]]:
         """
-        Import people, organizations, and locations in a single pass through the dump.
+        Import people, organizations, locations, and roles in a single pass through the dump.
 
         This is more efficient than calling import methods separately,
         as it only reads the ~100GB dump file once.
@@ -1210,9 +1249,11 @@ class WikidataDumpImporter:
             people_limit: Optional maximum number of people records
             orgs_limit: Optional maximum number of org records
             locations_limit: Optional maximum number of location records
+            roles_limit: Optional maximum number of role records
             import_people: Whether to import people (default: True)
             import_orgs: Whether to import organizations (default: True)
             import_locations: Whether to import locations (default: True)
+            import_roles: Whether to import roles (default: True)
             require_enwiki: If True, only include entities with English Wikipedia articles
             skip_people_ids: Optional set of people source_ids (Q codes) to skip
             skip_org_ids: Optional set of org source_ids (Q codes) to skip
@@ -1228,6 +1269,7 @@ class WikidataDumpImporter:
         people_count = 0
         orgs_count = 0
         locations_count = 0
+        roles_count = 0
         people_skipped = 0
         orgs_skipped = 0
         locations_skipped = 0
@@ -1254,7 +1296,8 @@ class WikidataDumpImporter:
             people_done = not import_people or (people_limit and people_count >= people_limit)
             orgs_done = not import_orgs or (orgs_limit and orgs_count >= orgs_limit)
             locations_done = not import_locations or (locations_limit and locations_count >= locations_limit)
-            return bool(people_done and orgs_done and locations_done)
+            roles_done = not import_roles or (roles_limit and roles_count >= roles_limit)
+            return bool(people_done and orgs_done and locations_done and roles_done)
 
         def track_entity(entity_index: int, entity_id: str) -> None:
             nonlocal current_entity_index
@@ -1265,6 +1308,18 @@ class WikidataDumpImporter:
                 break
 
             entity_id = entity.get("id", "")
+
+            # Check for role/position entities to cache labels and yield records.
+            # Roles are detected first since they tend to have lower QIDs in the dump,
+            # so their labels are cached before the people who reference them.
+            if import_roles and (not roles_limit or roles_count < roles_limit):
+                role_record = self._process_role_entity(entity)
+                if role_record:
+                    roles_count += 1
+                    yield ("role", role_record)
+                    if roles_count % 10_000 == 0:
+                        logger.info(f"Progress: {roles_count:,} roles cached (entity {current_entity_index:,})")
+                    continue  # Role entities aren't people/orgs/locations
 
             # Try to process as person first (if importing people and not at limit)
             if import_people and (not people_limit or people_count < people_limit):
@@ -1305,7 +1360,14 @@ class WikidataDumpImporter:
                         if progress_callback:
                             progress_callback(current_entity_index, entity_id, people_count, orgs_count)
                         yield ("org", org_record)
-                        continue  # Entity was an org, don't check for location
+                        # Also check if entity is a location (countries are both orgs and locations)
+                        if import_locations and (not locations_limit or locations_count < locations_limit):
+                            if not (skip_location_ids and entity_id in skip_location_ids):
+                                location_record = self._process_location_entity(entity, require_enwiki=require_enwiki)
+                                if location_record:
+                                    locations_count += 1
+                                    yield ("location", location_record)
+                        continue
 
             # Try to process as location (if importing locations and not at limit)
             if import_locations and (not locations_limit or locations_count < locations_limit):
@@ -1326,7 +1388,7 @@ class WikidataDumpImporter:
 
         logger.info(
             f"Combined import complete: {people_count:,} people, {orgs_count:,} orgs, "
-            f"{locations_count:,} locations "
+            f"{locations_count:,} locations, {roles_count:,} roles "
             f"(skipped {people_skipped:,} people, {orgs_skipped:,} orgs, {locations_skipped:,} locations)"
         )
 
@@ -1458,6 +1520,56 @@ class WikidataDumpImporter:
                 if qid in LOCATION_TYPE_QIDS:
                     return LOCATION_TYPE_QIDS[qid]
         return None
+
+    def _is_role_entity(self, entity: dict) -> bool:
+        """Check if entity has P31 matching a role/position type."""
+        claims = entity.get("claims", {})
+        for claim in claims.get("P31", []):
+            mainsnak = claim.get("mainsnak", {})
+            datavalue = mainsnak.get("datavalue", {})
+            value = datavalue.get("value", {})
+            if isinstance(value, dict):
+                qid = value.get("id", "")
+                if qid in ROLE_TYPE_QIDS:
+                    return True
+        return False
+
+    def _process_role_entity(self, entity: dict) -> Optional[RoleRecord]:
+        """Process an entity as a role/position, return RoleRecord if it qualifies.
+
+        Only includes entities with English labels.
+        """
+        if entity.get("type") != "item":
+            return None
+
+        if not self._is_role_entity(entity):
+            return None
+
+        qid = entity.get("id", "")
+        labels = entity.get("labels", {})
+        label = labels.get("en", {}).get("value", "")
+        if not label or not qid:
+            return None
+
+        # Cache the label for use in person processing
+        self._role_labels[qid] = label
+
+        qid_int = int(qid[1:]) if qid.startswith("Q") and qid[1:].isdigit() else None
+
+        descriptions = entity.get("descriptions", {})
+        description = descriptions.get("en", {}).get("value", "")
+
+        return RoleRecord(
+            name=label,
+            source="wikidata",
+            source_id=qid,
+            qid=qid_int,
+            record={
+                "wikidata_id": qid,
+                "label": label,
+                "description": description,
+            },
+        )
 
     def _get_claim_values(self, entity: dict, prop: str) -> list[str]:
         """

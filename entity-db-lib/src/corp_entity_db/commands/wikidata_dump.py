@@ -21,6 +21,7 @@ class ImportBatch(NamedTuple):
     people_count: int         # cumulative people yielded so far
     orgs_count: int           # cumulative orgs yielded so far
     locations_count: int = 0  # cumulative locations yielded so far
+    roles_count: int = 0      # cumulative roles yielded so far
 
 
 def _reader_thread(
@@ -39,12 +40,13 @@ def _reader_thread(
     batch_size: int,
     embed_queue: queue.Queue,
     location_queue: queue.Queue,
+    role_queue: queue.Queue,
     shutdown_event: threading.Event,
     thread_errors: list[Exception],
 ) -> None:
     """Reader thread: iterates the dump, accumulates batches, puts them on embed_queue.
 
-    Location records are put on location_queue directly (no embedding needed).
+    Location and role records are put on their own queues directly (no embedding needed).
     """
     import logging
     logger = logging.getLogger(__name__)
@@ -52,11 +54,13 @@ def _reader_thread(
     people_records: list = []
     org_records: list = []
     location_records: list = []
+    role_records: list = []
     last_entity_index = start_index
     last_entity_id = ""
     people_yielded = 0
     orgs_yielded = 0
     locations_yielded = 0
+    roles_yielded = 0
 
     def progress_callback(entity_index: int, entity_id: str, ppl_count: int, org_count: int) -> None:
         nonlocal last_entity_index, last_entity_id
@@ -106,6 +110,13 @@ def _reader_thread(
             location_queue.put(list(location_records))
             location_records = []
 
+    def flush_roles() -> None:
+        nonlocal role_records, roles_yielded
+        if role_records and not shutdown_event.is_set():
+            roles_yielded += len(role_records)
+            role_queue.put(list(role_records))
+            role_records = []
+
     try:
         for record_type, record in importer.import_all(
             people_limit=limit if people else 0,
@@ -137,11 +148,16 @@ def _reader_thread(
                 location_records.append(record)
                 if len(location_records) >= batch_size:
                     flush_locations()
+            elif record_type == "role":
+                role_records.append(record)
+                if len(role_records) >= batch_size:
+                    flush_roles()
 
         # Flush remaining partial batches
         flush_people()
         flush_orgs()
         flush_locations()
+        flush_roles()
 
     except Exception as e:
         thread_errors.append(e)
@@ -149,6 +165,68 @@ def _reader_thread(
         # Sentinel: reader is done
         embed_queue.put(None)
         location_queue.put(None)
+        role_queue.put(None)
+
+
+def _run_fk_only(db_path: Path, *, people: bool, orgs: bool, locations: bool) -> None:
+    """Resolve FK relations by reading FK data from the record JSON column in the database.
+
+    No dump re-read needed — all FK QIDs (country_qid, org_qid, parent_qids) are stored
+    in the record column during pass 1.
+    """
+    import json as _json
+    from corp_entity_db.store import get_person_database, get_database, get_locations_database
+
+    click.echo("\n=== FK-only mode: Resolving FK relations from database ===", err=True)
+
+    person_database = get_person_database(db_path=db_path, readonly=False)
+    org_database = get_database(db_path=db_path, readonly=False) if orgs else None
+    locations_database = get_locations_database(db_path=db_path, readonly=False) if locations else None
+
+    conn = person_database._connect()
+
+    # Location FKs: read parent_qids/country_qids from record column
+    if locations and locations_database:
+        click.echo("  Reading location FK data from database...", err=True)
+        location_fks: dict[int, dict] = {}
+        cursor = conn.execute("SELECT qid, record FROM locations WHERE qid IS NOT NULL AND source_id = 4")
+        for row in cursor:
+            rec = _json.loads(row[1]) if row[1] else {}
+            parent_qids = rec.get("parent_qids", [])
+            country_qids = rec.get("country_qids", [])
+            if parent_qids or country_qids:
+                location_fks[row[0]] = {"parent_qids": parent_qids, "country_qids": country_qids}
+        click.echo(f"  Loaded {len(location_fks):,} location FK records", err=True)
+        resolved = locations_database.resolve_parent_ids(location_fks)
+        click.echo(f"  Resolved {resolved:,} location parent_ids", err=True)
+
+    # Org FKs: read country_qid from record column
+    if orgs and org_database:
+        click.echo("  Reading org FK data from database...", err=True)
+        org_fks: dict[int, dict] = {}
+        cursor = conn.execute("SELECT qid, record FROM organizations WHERE qid IS NOT NULL")
+        for row in cursor:
+            rec = _json.loads(row[1]) if row[1] else {}
+            country_qid = rec.get("country_qid", "")
+            if country_qid:
+                org_fks[row[0]] = {"country_qid": country_qid}
+        click.echo(f"  Loaded {len(org_fks):,} org FK records", err=True)
+        resolved = org_database.resolve_fks(org_fks)
+        click.echo(f"  Resolved {resolved:,} org region_ids", err=True)
+
+    # People FKs: resolve_fks reads each row's record JSON directly
+    # Resolves country_id, known_for_org_id, and known_for_role_id
+    if people:
+        resolved = person_database.resolve_fks()
+        click.echo(f"  Resolved {resolved:,} person FKs (country_id, known_for_org, known_for_role)", err=True)
+
+    person_database.close()
+    if org_database:
+        org_database.close()
+    if locations_database:
+        locations_database.close()
+
+    click.echo("\nFK resolution complete!", err=True)
 
 
 @click.command("import-wikidata-dump")
@@ -223,7 +301,7 @@ def db_import_wikidata_dump(
     from corp_entity_db.store import get_person_database, get_database, get_locations_database
     from corp_entity_db.importers.wikidata_dump import WikidataDumpImporter, DumpProgress
 
-    if not dump_path and not download:
+    if not fk_only and not dump_path and not download:
         raise click.UsageError("Either --dump path or --download is required")
 
     if not people and not orgs and not locations:
@@ -233,6 +311,12 @@ def db_import_wikidata_dump(
     db_path_obj = _resolve_db_path(db_path)
 
     click.echo(f"Importing Wikidata dump to {db_path_obj}...", err=True)
+
+    # === FK-only mode: skip import, just resolve FK relations ===
+    # Reads FK data from the record JSON column in the database (no dump re-read needed).
+    if fk_only:
+        _run_fk_only(db_path_obj, people=people, orgs=orgs, locations=locations)
+        return
 
     # Initialize importer
     importer = WikidataDumpImporter(dump_path=dump_path)
@@ -302,76 +386,6 @@ def db_import_wikidata_dump(
     elif dump_path:
         click.echo(f"Using dump: {dump_path}", err=True)
 
-    # === FK-only mode: skip import, just resolve FK relations ===
-    if fk_only:
-        click.echo("\n=== FK-only mode: Resolving FK relations ===", err=True)
-        sys.stderr.flush()
-
-        person_database = get_person_database(db_path=db_path_obj, readonly=False)
-        org_database = get_database(db_path=db_path_obj, readonly=False) if orgs else None
-        locations_database = get_locations_database(db_path=db_path_obj, readonly=False) if locations else None
-
-        person_fks: dict[int, dict] = {}
-        org_fks: dict[int, dict] = {}
-        location_fks: dict[int, dict] = {}
-        fk_count = 0
-
-        click.echo("Reading dump for FK data...", err=True)
-        for entity_type, qid, fk_data in importer.import_fk_relations():
-            if not qid.startswith("Q") or not qid[1:].isdigit():
-                continue
-            qid_int = int(qid[1:])
-            if entity_type == "person" and people:
-                person_fks[qid_int] = fk_data
-            elif entity_type == "org" and orgs:
-                org_fks[qid_int] = fk_data
-            elif entity_type == "location" and locations:
-                location_fks[qid_int] = fk_data
-            fk_count += 1
-            if fk_count % 500_000 == 0:
-                click.echo(
-                    f"\r  Reading FKs: {len(person_fks):,} people, {len(org_fks):,} orgs, "
-                    f"{len(location_fks):,} locations...",
-                    nl=False, err=True,
-                )
-                sys.stderr.flush()
-
-        click.echo(
-            f"\n  Extracted FK data: {len(person_fks):,} people, {len(org_fks):,} orgs, "
-            f"{len(location_fks):,} locations",
-            err=True,
-        )
-
-        # Resolve in order: locations first, then orgs, then people
-        if locations_database and location_fks:
-            resolved = locations_database.resolve_parent_ids(location_fks)
-            click.echo(f"  Resolved {resolved:,} location parent_ids", err=True)
-
-        if org_database and org_fks:
-            resolved = org_database.resolve_fks(org_fks)
-            click.echo(f"  Resolved {resolved:,} org region_ids", err=True)
-
-        if people and person_fks:
-            resolved = person_database.resolve_fks(person_fks)
-            click.echo(f"  Resolved {resolved:,} person FKs (country_id, known_for_org)", err=True)
-
-        # Backfill known_for_org from reverse mappings rebuilt during pass 2
-        reverse_map = importer.get_reverse_person_orgs()
-        if reverse_map and people:
-            backfilled = person_database.backfill_known_for_org(reverse_map)
-            click.echo(
-                f"  Backfilled known_for_org: {backfilled:,} updated ({len(reverse_map):,} reverse mappings)",
-                err=True,
-            )
-
-        person_database.close()
-        if org_database:
-            org_database.close()
-        if locations_database:
-            locations_database.close()
-
-        click.echo("\nFK resolution complete!", err=True)
-        return
 
     database = get_person_database(db_path=db_path_obj, readonly=False)
 
@@ -561,21 +575,25 @@ def db_import_wikidata_dump(
         click.echo(f"  Resuming from entity index {start_index:,}", err=True)
 
     # Initialize databases (readonly=False for import operations)
+    from corp_entity_db.store import get_roles_database
     person_database = get_person_database(db_path=db_path_obj, readonly=False)
     org_database = get_database(db_path=db_path_obj, readonly=False) if orgs else None
     locations_database = get_locations_database(db_path=db_path_obj, readonly=False) if locations else None
+    roles_database = get_roles_database(db_path=db_path_obj, readonly=False)
 
     # Pipeline: reader thread → write_queue → main thread (DB writes)
     # Embeddings are deferred to post-import (needs FK resolution for rich text)
-    # Locations bypass the write_queue and go directly via location_queue
+    # Locations and roles bypass the write_queue and go directly via their own queues
     write_queue: queue.Queue = queue.Queue(maxsize=4)
     location_queue: queue.Queue = queue.Queue(maxsize=4)
+    role_queue: queue.Queue = queue.Queue(maxsize=4)
     shutdown_event = threading.Event()
     thread_errors: list[Exception] = []
 
     people_count = 0
     orgs_count = 0
     locations_count = 0
+    roles_count = 0
     last_entity_index = start_index
     last_entity_id = ""
 
@@ -601,6 +619,19 @@ def db_import_wikidata_dump(
             except queue.Empty:
                 break
 
+    def drain_role_queue() -> None:
+        """Drain all pending role batches from the queue."""
+        nonlocal roles_count
+        while True:
+            try:
+                role_batch = role_queue.get_nowait()
+                if role_batch is None:
+                    break
+                inserted = roles_database.insert_batch(role_batch)
+                roles_count += inserted
+            except queue.Empty:
+                break
+
     click.echo("Starting pipeline (reader → writer, embeddings deferred to post-import)...", err=True)
     sys.stderr.flush()
 
@@ -621,6 +652,7 @@ def db_import_wikidata_dump(
             batch_size=batch_size,
             embed_queue=write_queue,
             location_queue=location_queue,
+            role_queue=role_queue,
             shutdown_event=shutdown_event,
             thread_errors=thread_errors,
         ),
@@ -636,8 +668,9 @@ def db_import_wikidata_dump(
             if thread_errors:
                 raise thread_errors[0]
 
-            # Drain location queue (non-blocking) while waiting for record batches
+            # Drain location and role queues (non-blocking) while waiting for record batches
             drain_location_queue()
+            drain_role_queue()
 
             try:
                 batch = write_queue.get(timeout=1.0)
@@ -663,13 +696,14 @@ def db_import_wikidata_dump(
 
             click.echo(
                 f"\r  Progress: {people_count:,} people, {orgs_count:,} orgs, "
-                f"{locations_count:,} locations...",
+                f"{locations_count:,} locations, {roles_count:,} roles...",
                 nl=False, err=True,
             )
             sys.stderr.flush()
 
-        # Drain any remaining location batches
+        # Drain any remaining location and role batches
         drain_location_queue()
+        drain_role_queue()
 
         click.echo("", err=True)  # Newline after counter
 
@@ -697,14 +731,15 @@ def db_import_wikidata_dump(
             except queue.Empty:
                 break
         drain_location_queue()
+        drain_role_queue()
         save_progress()
-        click.echo(f"  Saved: {people_count:,} people, {orgs_count:,} orgs, {locations_count:,} locations", err=True)
+        click.echo(f"  Saved: {people_count:,} people, {orgs_count:,} orgs, {locations_count:,} locations, {roles_count:,} roles", err=True)
         raise
     finally:
         save_progress()
         reader.join(timeout=5)
 
-    click.echo(f"Import complete: {people_count:,} people, {orgs_count:,} orgs, {locations_count:,} locations", err=True)
+    click.echo(f"Import complete: {people_count:,} people, {orgs_count:,} orgs, {locations_count:,} locations, {roles_count:,} roles", err=True)
 
     # === Pass 2: Resolve FK relations ===
     click.echo("\n=== Pass 2: Resolving FK relations ===", err=True)
@@ -752,15 +787,15 @@ def db_import_wikidata_dump(
         resolved = org_database.resolve_fks(org_fks)
         click.echo(f"  Resolved {resolved:,} org region_ids", err=True)
 
-    if people and person_fks:
-        resolved = person_database.resolve_fks(person_fks)
-        click.echo(f"  Resolved {resolved:,} person FKs (country_id, known_for_org)", err=True)
+    if people:
+        resolved = person_database.resolve_fks(person_fks if person_fks else None)
+        click.echo(f"  Resolved {resolved:,} person FKs (country_id, known_for_org, known_for_role)", err=True)
 
-    # Backfill known_for_org_id/known_for_org_location_id from reverse org→person mappings
+    # Backfill known_for_org_id from reverse org→person mappings
     # (rebuilt during pass 2: P169 CEO, P488 chairperson, P112 founder, P1037 director, P3320 board member)
     reverse_map = importer.get_reverse_person_orgs()
     if reverse_map and people:
-        # Pass org QIDs directly — backfill_known_for_org resolves to org/location FKs
+        # Pass org QIDs directly — backfill_known_for_org resolves to org FKs
         backfilled = person_database.backfill_known_for_org(reverse_map)
         click.echo(
             f"Backfilled known_for_org from org executive properties: "
@@ -777,6 +812,7 @@ def db_import_wikidata_dump(
         org_database.close()
     if locations_database:
         locations_database.close()
+    roles_database.close()
 
     # Run canonicalization to link equivalent records across sources
     click.echo("\n=== Canonicalization ===", err=True)

@@ -170,7 +170,6 @@ CREATE TABLE IF NOT EXISTS people (
     person_type_id INTEGER NOT NULL DEFAULT 15,
     known_for_role_id INTEGER,
     known_for_org_id INTEGER,
-    known_for_org_location_id INTEGER,
     from_date TEXT DEFAULT NULL,
     to_date TEXT DEFAULT NULL,
     birth_date TEXT DEFAULT NULL,
@@ -184,8 +183,7 @@ CREATE TABLE IF NOT EXISTS people (
     FOREIGN KEY (person_type_id) REFERENCES people_types(id),
     FOREIGN KEY (known_for_role_id) REFERENCES roles(id),
     FOREIGN KEY (known_for_org_id) REFERENCES organizations(id),
-    FOREIGN KEY (known_for_org_location_id) REFERENCES locations(id),
-    UNIQUE(source_identifier, source_id, known_for_role_id, known_for_org_id)
+    UNIQUE(source_identifier, source_id, known_for_role_id, known_for_org_id, from_date)
 );
 """
 
@@ -199,7 +197,6 @@ CREATE INDEX IF NOT EXISTS idx_people_country_id ON people(country_id);
 CREATE INDEX IF NOT EXISTS idx_people_person_type_id ON people(person_type_id);
 CREATE INDEX IF NOT EXISTS idx_people_known_for_role_id ON people(known_for_role_id);
 CREATE INDEX IF NOT EXISTS idx_people_known_for_org_id ON people(known_for_org_id);
-CREATE INDEX IF NOT EXISTS idx_people_known_for_org_location_id ON people(known_for_org_location_id);
 CREATE INDEX IF NOT EXISTS idx_people_canon_id ON people(canon_id);
 """
 
@@ -254,9 +251,8 @@ SELECT
     l.name as country,
     pt.name as person_type,
     r.name as known_for_role,
-    COALESCE(kfo.name, kfl.name) as known_for_org,
+    kfo.name as known_for_org,
     p.known_for_org_id,
-    p.known_for_org_location_id,
     p.from_date,
     p.to_date,
     p.birth_date,
@@ -268,8 +264,7 @@ JOIN source_types s ON p.source_id = s.id
 LEFT JOIN locations l ON p.country_id = l.id
 JOIN people_types pt ON p.person_type_id = pt.id
 LEFT JOIN roles r ON p.known_for_role_id = r.id
-LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
-LEFT JOIN locations kfl ON p.known_for_org_location_id = kfl.id;
+LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id;
 """
 
 CREATE_ROLES_VIEW = """

@@ -586,18 +586,6 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
                         org_id = org_database.get_id_by_source_id("wikipedia", org_qid)
                         if org_id is not None:
                             person.known_for_org_id = org_id
-                        else:
-                            # Fall back to location (wikidata→wikidata)
-                            from corp_entity_db.store import get_locations_database
-                            loc_db = get_locations_database(db_path=org_database._db_path, readonly=True)
-                            qid_int = int(org_qid.lstrip("Q")) if org_qid.startswith("Q") else None
-                            if qid_int is not None:
-                                conn = loc_db._connect()
-                                loc_row = conn.execute(
-                                    "SELECT id FROM locations WHERE qid = ? AND source_id = 4", (qid_int,)
-                                ).fetchone()
-                                if loc_row:
-                                    person.known_for_org_location_id = loc_row[0]
 
                     # Update the record with new role/org/dates and re-embed
                     new_embedding_text = person.get_embedding_text()
@@ -605,7 +593,7 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
                     if database.update_role_org(
                         person.source, person.source_id,
                         person.known_for_role,
-                        person.known_for_org_id, person.known_for_org_location_id,
+                        person.known_for_org_id,
                         new_embedding,
                         person.from_date, person.to_date,
                     ):
@@ -1198,7 +1186,7 @@ def db_import_wikidata_dump(
 
     click.echo(f"Import complete: {people_count:,} people, {orgs_count:,} orgs", err=True)
 
-    # Backfill known_for_org_id/known_for_org_location_id from reverse org→person mappings
+    # Backfill known_for_org_id from reverse org→person mappings
     # (P169 CEO, P488 chairperson, P112 founder, P1037 director, P3320 board member)
     reverse_map = importer.get_reverse_person_orgs()
     if reverse_map and people:

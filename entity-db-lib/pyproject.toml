@@ -41,6 +41,9 @@ corp-entity-db = "corp_entity_db.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/corp_entity_db"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",

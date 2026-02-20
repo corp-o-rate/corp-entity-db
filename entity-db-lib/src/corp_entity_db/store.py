@@ -40,7 +40,6 @@ from .seed_data import (
     SOURCE_ID_TO_NAME,
     SOURCE_NAME_TO_ID,
     seed_all_enums,
-    seed_pycountry_locations,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,8 +113,6 @@ def _get_shared_connection(
         # Ensure all v3 schema tables exist (CREATE IF NOT EXISTS is idempotent)
         create_all_tables(conn, embedding_dim)
         seed_all_enums(conn)
-        seed_pycountry_locations(conn)
-
         _shared_connections[path_key] = conn
         logger.debug(f"Created shared database connection for {path_key}")
 
@@ -1972,7 +1969,97 @@ class PersonDatabase:
                     self._schema_version = int(row[0])
                     logger.debug(f"Detected schema version {self._schema_version} from db_info")
 
+            # Migrate unique constraint to include from_date (allows same role at same org in different periods)
+            if self._is_v2 and not self._readonly:
+                self._migrate_people_unique_constraint()
+
         return self._conn
+
+    def _migrate_people_unique_constraint(self) -> None:
+        """Migrate people table: add from_date to unique constraint, drop known_for_org_location_id.
+
+        The old constraint UNIQUE(source_identifier, source_id, known_for_role_id, known_for_org_id)
+        doesn't allow the same person to hold the same role at the same org in different time periods
+        (e.g. Grover Cleveland as US President twice). Adding from_date fixes this.
+        Also drops the known_for_org_location_id column (no longer used).
+        """
+        conn = self._conn
+        assert conn is not None
+
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='people'"
+        ).fetchone()
+        if not row:
+            return
+
+        create_sql = row[0]
+        needs_unique_fix = "from_date)" not in create_sql
+        needs_column_drop = "known_for_org_location_id" in create_sql
+
+        if not needs_unique_fix and not needs_column_drop:
+            return  # Already migrated
+
+        logger.info("Migrating people table: updating unique constraint and dropping known_for_org_location_id...")
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Drop views that reference the people table before renaming
+            conn.execute("DROP VIEW IF EXISTS people_view")
+
+            conn.execute("ALTER TABLE people RENAME TO people_old")
+            conn.execute("""
+                CREATE TABLE people (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    qid INTEGER,
+                    name TEXT NOT NULL,
+                    name_normalized TEXT NOT NULL,
+                    source_id INTEGER NOT NULL,
+                    source_identifier TEXT NOT NULL,
+                    country_id INTEGER,
+                    person_type_id INTEGER NOT NULL DEFAULT 15,
+                    known_for_role_id INTEGER,
+                    known_for_org_id INTEGER,
+                    from_date TEXT DEFAULT NULL,
+                    to_date TEXT DEFAULT NULL,
+                    birth_date TEXT DEFAULT NULL,
+                    death_date TEXT DEFAULT NULL,
+                    record TEXT NOT NULL DEFAULT '{}',
+                    embedding BLOB DEFAULT NULL,
+                    canon_id INTEGER DEFAULT NULL,
+                    canon_size INTEGER DEFAULT 1,
+                    FOREIGN KEY (source_id) REFERENCES source_types(id),
+                    FOREIGN KEY (country_id) REFERENCES locations(id),
+                    FOREIGN KEY (person_type_id) REFERENCES people_types(id),
+                    FOREIGN KEY (known_for_role_id) REFERENCES roles(id),
+                    FOREIGN KEY (known_for_org_id) REFERENCES organizations(id),
+                    UNIQUE(source_identifier, source_id, known_for_role_id, known_for_org_id, from_date)
+                )
+            """)
+            conn.execute("""
+                INSERT INTO people
+                (id, qid, name, name_normalized, source_id, source_identifier, country_id,
+                 person_type_id, known_for_role_id, known_for_org_id, from_date, to_date,
+                 birth_date, death_date, record, embedding, canon_id, canon_size)
+                SELECT id, qid, name, name_normalized, source_id, source_identifier, country_id,
+                       person_type_id, known_for_role_id, known_for_org_id, from_date, to_date,
+                       birth_date, death_date, record, embedding, canon_id, canon_size
+                FROM people_old
+            """)
+            conn.execute("DROP TABLE people_old")
+
+            # Recreate indexes and view
+            from .schema_v2 import CREATE_PEOPLE_V2_INDEXES, CREATE_PEOPLE_VIEW
+            for stmt in CREATE_PEOPLE_V2_INDEXES.strip().split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    conn.execute(stmt)
+            conn.execute(CREATE_PEOPLE_VIEW)
+
+            conn.execute("COMMIT")
+            logger.info("Migration complete: people unique constraint now includes from_date")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         """Clear connection reference (shared connection remains open)."""
@@ -2026,9 +2113,9 @@ class PersonDatabase:
         cursor = conn.execute("""
             INSERT OR REPLACE INTO people
             (name, name_normalized, source_id, source_identifier, qid, country_id, person_type_id,
-             known_for_role_id, known_for_org_id, known_for_org_location_id, from_date, to_date,
+             known_for_role_id, known_for_org_id, from_date, to_date,
              birth_date, death_date, record, embedding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             record.name,
             name_normalized,
@@ -2039,7 +2126,6 @@ class PersonDatabase:
             person_type_id,
             role_id,
             record.known_for_org_id,
-            record.known_for_org_location_id,
             record.from_date or "",
             record.to_date or "",
             record.birth_date or "",
@@ -2102,9 +2188,9 @@ class PersonDatabase:
             cursor = conn.execute("""
                 INSERT OR REPLACE INTO people
                 (name, name_normalized, source_id, source_identifier, qid, country_id, person_type_id,
-                 known_for_role_id, known_for_org_id, known_for_org_location_id, from_date, to_date,
+                 known_for_role_id, known_for_org_id, from_date, to_date,
                  birth_date, death_date, record, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.name,
                 name_normalized,
@@ -2115,7 +2201,6 @@ class PersonDatabase:
                 person_type_id,
                 role_id,
                 record.known_for_org_id,
-                record.known_for_org_location_id,
                 record.from_date or "",
                 record.to_date or "",
                 record.birth_date or "",
@@ -2133,86 +2218,114 @@ class PersonDatabase:
         conn.commit()
         return count
 
-    def resolve_fks(self, qid_fk_data: dict[int, dict]) -> int:
+    def resolve_fks(self, qid_fk_data: Optional[dict[int, dict]] = None) -> int:
         """
         Pass 2: Resolve cross-table FKs for people inserted during pass 1.
 
-        Updates country_id, known_for_org_id, and known_for_org_location_id
-        by resolving QIDs to database IDs.
+        Iterates over each person row individually, reads the org_qid from
+        its record JSON, and resolves it to the correct org/location FK.
+        This ensures each role-record gets its own org rather than all rows
+        for the same person getting the same org.
+
+        Country QIDs come from qid_fk_data if provided, otherwise from the
+        record JSON column.
 
         Args:
-            qid_fk_data: Mapping of QID int → {"country_qid": "Q30", "org_qid": "Q312"}
+            qid_fk_data: Optional mapping of QID int → {"country_qid": "Q30"}.
+                          If None, country_qid is read from the record column.
 
         Returns:
             Number of records updated
         """
-        if not qid_fk_data:
-            return 0
-
         conn = self._connect()
 
         # Preload QID → location_id lookup
         cursor = conn.execute("SELECT qid, id FROM locations WHERE qid IS NOT NULL")
         qid_to_location_id: dict[int, int] = {row[0]: row[1] for row in cursor}
 
-        # Preload QID → org_id lookup (wikidata orgs use source_id=4 "wikipedia")
+        # Preload QID → org_id lookup
         cursor = conn.execute("SELECT qid, id, region_id FROM organizations WHERE qid IS NOT NULL")
         qid_to_org: dict[int, tuple[int, Optional[int]]] = {
             row[0]: (row[1], row[2]) for row in cursor
         }
 
+        # Preload QID → role_id lookup
+        cursor = conn.execute("SELECT qid, id FROM roles WHERE qid IS NOT NULL")
+        qid_to_role_id: dict[int, int] = {row[0]: row[1] for row in cursor}
+        logger.info(f"Loaded {len(qid_to_role_id):,} role QID→id mappings")
+
+        # Iterate over individual rows, each with its own org_qid in record JSON
+        cursor = conn.execute(
+            "SELECT id, qid, record FROM people WHERE source_id = 4 AND qid IS NOT NULL"
+        )
+        rows = cursor.fetchall()
+        logger.info(f"Resolving FKs for {len(rows):,} wikidata person rows...")
+
         updated = 0
-        batch_count = 0
-        for person_qid, fk_data in qid_fk_data.items():
-            country_qid_str = fk_data.get("country_qid", "")
-            org_qid_str = fk_data.get("org_qid", "")
+        skipped = 0
+        for row in rows:
+            row_id, person_qid, record_json = row[0], row[1], row[2]
+            rec = json.loads(record_json) if record_json else {}
+
+            # Country QID: prefer qid_fk_data if provided, else from record
+            if qid_fk_data and person_qid in qid_fk_data:
+                country_qid_str = qid_fk_data[person_qid].get("country_qid", "")
+            else:
+                country_qid_str = rec.get("country_qid", "")
+
+            # Org QID: always from this row's record (each row has its own org)
+            org_qid_str = rec.get("org_qid", "")
+
+            # Role QID: from this row's record
+            role_qid_str = rec.get("role_qid", "")
 
             # Resolve country
             country_id = None
             if country_qid_str and country_qid_str.startswith("Q") and country_qid_str[1:].isdigit():
                 country_id = qid_to_location_id.get(int(country_qid_str[1:]))
 
-            # Resolve org → (org_id, org_location_id)
+            # Resolve org → org_id
             org_id = None
-            org_location_id = None
             if org_qid_str and org_qid_str.startswith("Q") and org_qid_str[1:].isdigit():
                 org_info = qid_to_org.get(int(org_qid_str[1:]))
                 if org_info:
-                    org_id, org_location_id = org_info
-                else:
-                    # Fall back to location (org QID might be a location)
-                    org_location_id = qid_to_location_id.get(int(org_qid_str[1:]))
+                    org_id = org_info[0]
 
-            if country_id is None and org_id is None and org_location_id is None:
+            # Resolve role → role_id
+            role_id = None
+            if role_qid_str and role_qid_str.startswith("Q") and role_qid_str[1:].isdigit():
+                role_id = qid_to_role_id.get(int(role_qid_str[1:]))
+
+            if country_id is None and org_id is None and role_id is None:
                 continue
 
-            # Update country_id unconditionally, org FKs only when NULL
-            if org_id is not None or org_location_id is not None:
+            # Update this specific row by id
+            try:
                 result = conn.execute(
                     """UPDATE people SET
                         country_id = COALESCE(?, country_id),
                         known_for_org_id = COALESCE(known_for_org_id, ?),
-                        known_for_org_location_id = COALESCE(known_for_org_location_id, ?)
-                    WHERE qid = ?""",
-                    (country_id, org_id, org_location_id, person_qid),
+                        known_for_role_id = COALESCE(known_for_role_id, ?)
+                    WHERE id = ?""",
+                    (country_id, org_id, role_id, row_id),
                 )
-            elif country_id is not None:
-                result = conn.execute(
-                    "UPDATE people SET country_id = ? WHERE qid = ? AND country_id IS NULL",
-                    (country_id, person_qid),
-                )
-            else:
+            except sqlite3.IntegrityError:
+                skipped += 1
+                logger.error(f"UNIQUE constraint conflict resolving FKs for person Q{person_qid} "
+                             f"row {row_id} (org_id={org_id}), skipping")
                 continue
 
             updated += result.rowcount
-            batch_count += 1
 
-            if batch_count % 10000 == 0:
+            if updated % 10000 == 0 and updated > 0:
                 conn.commit()
                 logger.info(f"Resolved {updated:,} person FKs...")
 
         conn.commit()
-        logger.info(f"Resolved {updated:,} person FKs total")
+        if skipped:
+            logger.warning(f"Resolved {updated:,} person FKs total ({skipped:,} skipped due to UNIQUE conflicts)")
+        else:
+            logger.info(f"Resolved {updated:,} person FKs total")
         return updated
 
     def update_dates(self, source: str, source_id: str, from_date: Optional[str], to_date: Optional[str]) -> bool:
@@ -2245,7 +2358,6 @@ class PersonDatabase:
         source_id: str,
         known_for_role: str,
         known_for_org_id: Optional[int],
-        known_for_org_location_id: Optional[int],
         new_embedding: np.ndarray,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
@@ -2258,7 +2370,6 @@ class PersonDatabase:
             source_id: Source identifier (e.g., QID)
             known_for_role: Role/position title
             known_for_org_id: Organization FK or None
-            known_for_org_location_id: Location FK (for jurisdictions) or None
             new_embedding: New embedding vector based on updated data
             from_date: Start date in ISO format or None
             to_date: End date in ISO format or None
@@ -2283,11 +2394,11 @@ class PersonDatabase:
         # Update the person record (including dates)
         conn.execute("""
             UPDATE people SET
-                known_for_org_id = ?, known_for_org_location_id = ?,
+                known_for_org_id = ?,
                 from_date = COALESCE(?, from_date, ''),
                 to_date = COALESCE(?, to_date, '')
             WHERE id = ?
-        """, (known_for_org_id, known_for_org_location_id, from_date, to_date, person_id))
+        """, (known_for_org_id, from_date, to_date, person_id))
 
         # Update the embedding
         embedding_bytes = new_embedding.astype(np.float32).tobytes()
@@ -2300,10 +2411,10 @@ class PersonDatabase:
         self, qid_to_orgs: dict[str, list[tuple[str, str, Optional[str], Optional[str]]]]
     ) -> int:
         """
-        Backfill known_for_org_id/known_for_org_location_id for people using QID→org mappings.
+        Backfill known_for_org_id for people using QID→org mappings.
 
-        Only updates records where both known_for_org_id and known_for_org_location_id are NULL.
-        Resolves org QIDs to organization or location FKs (same source: wikidata→wikidata).
+        Only updates records where known_for_org_id is NULL.
+        Resolves org QIDs to organization FKs (same source: wikidata→wikidata).
 
         Args:
             qid_to_orgs: Mapping of person Wikidata QID →
@@ -2324,14 +2435,13 @@ class PersonDatabase:
                 continue
             # Use the first entry with an org QID that resolves
             org_id: Optional[int] = None
-            location_id: Optional[int] = None
             role = ""
             start_date: Optional[str] = None
             end_date: Optional[str] = None
             for entry_org_qid, entry_role, entry_start, entry_end in entries:
                 if not entry_org_qid:
                     continue
-                # Try organization first (same source: wikidata)
+                # Try organization (same source: wikidata)
                 resolved_org_id = org_database.get_id_by_source_id("wikipedia", entry_org_qid)
                 if resolved_org_id is not None:
                     org_id = resolved_org_id
@@ -2339,20 +2449,8 @@ class PersonDatabase:
                     start_date = entry_start
                     end_date = entry_end
                     break
-                # Fall back to location (same source: wikidata)
-                qid_int_org = int(entry_org_qid.lstrip("Q")) if entry_org_qid.startswith("Q") else None
-                if qid_int_org is not None:
-                    loc_row = conn.execute(
-                        "SELECT id FROM locations WHERE qid = ? AND source_id = 4", (qid_int_org,)
-                    ).fetchone()
-                    if loc_row:
-                        location_id = loc_row[0]
-                        role = entry_role
-                        start_date = entry_start
-                        end_date = entry_end
-                        break
 
-            if org_id is None and location_id is None:
+            if org_id is None:
                 continue
 
             # Strip Q prefix if present for integer QID column
@@ -2366,14 +2464,14 @@ class PersonDatabase:
                 roles_db = get_roles_database(db_path=self._db_path, readonly=False)
                 role_id = roles_db.get_or_create(role, source_id=4)  # 4 = wikidata
 
-            # Update records missing org/location FKs, also backfill dates and role
+            # Update records missing org FK, also backfill dates and role
             result = conn.execute(
-                """UPDATE people SET known_for_org_id = ?, known_for_org_location_id = ?,
+                """UPDATE people SET known_for_org_id = ?,
                    known_for_role_id = COALESCE(known_for_role_id, ?),
                    from_date = CASE WHEN from_date IS NULL OR from_date = '' THEN ? ELSE from_date END,
                    to_date = CASE WHEN to_date IS NULL OR to_date = '' THEN ? ELSE to_date END
-                WHERE qid = ? AND known_for_org_id IS NULL AND known_for_org_location_id IS NULL""",
-                (org_id, location_id, role_id, start_date or "", end_date or "", qid_int),
+                WHERE qid = ? AND known_for_org_id IS NULL""",
+                (org_id, role_id, start_date or "", end_date or "", qid_int),
             )
             updated += result.rowcount
             if updated % 1000 == 0 and updated > 0:
@@ -2581,7 +2679,6 @@ class PersonDatabase:
             person_type=PersonType(row["person_type"]) if row["person_type"] else PersonType.UNKNOWN,
             known_for_role=row["known_for_role"] or "",
             known_for_org_id=row["known_for_org_id"],
-            known_for_org_location_id=row["known_for_org_location_id"] if "known_for_org_location_id" in row.keys() else None,
             known_for_org_name=known_for_org_name,
             birth_date=row["birth_date"] or "",
             death_date=row["death_date"] or "",
@@ -2596,7 +2693,6 @@ class PersonDatabase:
         cursor = conn.execute("""
             SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
                    v.known_for_role, v.known_for_org, v.known_for_org_id,
-                   v.known_for_org_location_id,
                    v.birth_date, v.death_date, p.record
             FROM people_view v
             JOIN people p ON v.id = p.id
@@ -2616,7 +2712,6 @@ class PersonDatabase:
         cursor = conn.execute("""
             SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
                    v.known_for_role, v.known_for_org, v.known_for_org_id,
-                   v.known_for_org_location_id,
                    v.birth_date, v.death_date, p.record
             FROM people_view v
             JOIN people p ON v.id = p.id
@@ -2713,11 +2808,10 @@ class PersonDatabase:
         while True:
             cursor = conn.execute("""
                 SELECT p.id, p.name, r.name as role_name,
-                       COALESCE(kfo.name, kfl.name) as org_name
+                       kfo.name as org_name
                 FROM people p
                 LEFT JOIN roles r ON p.known_for_role_id = r.id
                 LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
-                LEFT JOIN locations kfl ON p.known_for_org_location_id = kfl.id
                 WHERE p.embedding IS NULL AND p.id > ?
                 ORDER BY p.id
                 LIMIT ?
@@ -2794,7 +2888,6 @@ class PersonDatabase:
             cursor = conn.execute("""
                 SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
                        v.known_for_role, v.known_for_org, v.known_for_org_id,
-                       v.known_for_org_location_id,
                        v.birth_date, v.death_date, p.record
                 FROM people_view v
                 JOIN people p ON v.id = p.id
@@ -2804,7 +2897,6 @@ class PersonDatabase:
             cursor = conn.execute("""
                 SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
                        v.known_for_role, v.known_for_org, v.known_for_org_id,
-                       v.known_for_org_location_id,
                        v.birth_date, v.death_date, p.record
                 FROM people_view v
                 JOIN people p ON v.id = p.id
@@ -2845,7 +2937,7 @@ class PersonDatabase:
         # Load all people with their normalized names and org info
         cursor = conn.execute("""
             SELECT p.id, p.name, p.name_normalized, s.name as source, p.source_identifier as source_id,
-                   p.known_for_org_id, p.known_for_org_location_id, p.from_date, p.to_date
+                   p.known_for_org_id, p.from_date, p.to_date
             FROM people p
             JOIN source_types s ON p.source_id = s.id
         """)
@@ -2859,7 +2951,6 @@ class PersonDatabase:
                 "source": row["source"],
                 "source_id": row["source_id"],
                 "known_for_org_id": row["known_for_org_id"],
-                "known_for_org_location_id": row["known_for_org_location_id"],
                 "from_date": row["from_date"],
                 "to_date": row["to_date"],
             })
@@ -2888,12 +2979,11 @@ class PersonDatabase:
             if len(same_name) < 2:
                 continue
 
-            # Group by organization (using known_for_org_id, falling back to known_for_org_location_id)
+            # Group by organization (using known_for_org_id)
             org_groups: dict[str, list[dict]] = {}
             for p in same_name:
                 org_key = (
                     f"org:{p['known_for_org_id']}" if p["known_for_org_id"]
-                    else f"loc:{p['known_for_org_location_id']}" if p.get("known_for_org_location_id")
                     else ""
                 )
                 if org_key:  # Only group if they have an org/location
@@ -3198,6 +3288,54 @@ class RolesDatabase:
 
         self._role_cache[cache_key] = role_id
         return role_id
+
+    def insert_batch(self, records: list[RoleRecord], batch_size: int = 5000) -> int:
+        """
+        Batch insert role records from Wikidata dump import.
+
+        Uses INSERT OR IGNORE to skip duplicates (unique on name_normalized + source_id).
+
+        Args:
+            records: List of RoleRecord objects to insert
+            batch_size: Commit interval
+
+        Returns:
+            Number of records inserted
+        """
+        conn = self._connect()
+        count = 0
+
+        for record in records:
+            name_normalized = record.name.lower().strip()
+            source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
+            record_json = json.dumps(record.record) if record.record else "{}"
+
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO roles
+                (name, name_normalized, source_id, source_identifier, qid, record)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (record.name, name_normalized, source_type_id, record.source_id,
+                 record.qid, record_json),
+            )
+            if cursor.rowcount > 0:
+                count += 1
+
+            if count % batch_size == 0 and count > 0:
+                conn.commit()
+                logger.info(f"Inserted {count} role records...")
+
+        conn.commit()
+        return count
+
+    def get_all_source_ids(self, source: str = "wikidata") -> set[str]:
+        """Get all source_identifiers for a given source."""
+        conn = self._connect()
+        source_id = SOURCE_NAME_TO_ID.get(source, 4)
+        cursor = conn.execute(
+            "SELECT source_identifier FROM roles WHERE source_id = ? AND source_identifier IS NOT NULL",
+            (source_id,),
+        )
+        return {row[0] for row in cursor}
 
     def get_by_id(self, role_id: int) -> Optional[RoleRecord]:
         """Get a role record by ID."""
@@ -3580,7 +3718,9 @@ class LocationsDatabase:
         """
         Resolve a region/country text to a location ID.
 
-        Uses pycountry for country resolution, then falls back to search.
+        Uses pycountry to normalize country names/codes, then looks up existing
+        locations by normalized name. Does NOT create new entries — locations
+        must already exist (imported from wikidata dump or other sources).
 
         Args:
             text: Region text (country code, name, or QID)
@@ -3597,30 +3737,38 @@ class LocationsDatabase:
         if text_lower in self._location_cache:
             return self._location_cache[text_lower]
 
-        # Try pycountry resolution
+        # Try pycountry to normalize the input to a canonical country name
         alpha_2 = self._resolve_via_pycountry(text)
         if alpha_2:
             alpha_2_lower = alpha_2.lower()
             if alpha_2_lower in self._location_cache:
                 location_id = self._location_cache[alpha_2_lower]
-                self._location_cache[text_lower] = location_id  # Cache the input too
+                self._location_cache[text_lower] = location_id
                 return location_id
 
-            # Country not in database yet, import it
+            # Try the canonical pycountry name in case it matches a wikidata location
             try:
                 country = pycountry.countries.get(alpha_2=alpha_2)
                 if country:
-                    country_type_id = self._location_type_cache.get("country", 2)
-                    location_id = self.get_or_create(
-                        name=country.name,
-                        location_type_id=country_type_id,
-                        source_id=4,  # wikidata
-                        source_identifier=alpha_2,
-                    )
-                    self._location_cache[text_lower] = location_id
-                    return location_id
+                    name_lower = country.name.lower()
+                    if name_lower in self._location_cache:
+                        location_id = self._location_cache[name_lower]
+                        self._location_cache[text_lower] = location_id
+                        self._location_cache[alpha_2_lower] = location_id
+                        return location_id
             except Exception:
                 pass
+
+        # Try database lookup by normalized name directly
+        conn = self._connect()
+        cursor = conn.execute(
+            "SELECT id FROM locations WHERE name_normalized = ?", (text_lower,)
+        )
+        row = cursor.fetchone()
+        if row:
+            location_id = row["id"]
+            self._location_cache[text_lower] = location_id
+            return location_id
 
         return None
 

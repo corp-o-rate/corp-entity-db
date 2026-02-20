@@ -4,6 +4,7 @@ import json
 import queue
 import sys
 import threading
+from pathlib import Path
 from typing import Optional
 
 import click
@@ -124,10 +125,10 @@ def db_repair_resume(db_path: Optional[str], verbose: bool):
         person_database.close()
         return
 
-    # Step 2: Backfill known_for_org_id/known_for_org_location_id
+    # Step 2: Backfill known_for_org_id
     click.echo("\n=== Step 2: Backfill known_for_org FKs ===", err=True)
     if reverse_person_orgs:
-        # Pass org QIDs directly — backfill resolves to org/location FKs
+        # Pass org QIDs directly — backfill resolves to org FKs
         backfilled = person_database.backfill_known_for_org(reverse_person_orgs)
         click.echo(f"  Updated {backfilled:,} people records", err=True)
     else:
@@ -155,10 +156,286 @@ def db_repair_resume(db_path: Optional[str], verbose: bool):
     conn.commit()
     click.echo(f"  Inserted {missing_orgs:,} missing discovered orgs", err=True)
 
+    # Step 5: Resolve country_id and region_id FKs
+    click.echo("\n=== Step 5: Resolve country/region FKs ===", err=True)
+    _resolve_all_fks(db_path_obj)
+
     org_database.close()
     org_database_rw.close()
     person_database.close()
     click.echo("\nRepair complete!", err=True)
+
+
+def _resolve_all_fks(db_path: Path) -> None:
+    """Resolve country_id on people and region_id on orgs from record JSON."""
+    import json as _json
+    from corp_entity_db.store import get_person_database, get_database
+
+    person_database = get_person_database(db_path=db_path, readonly=False)
+    org_database = get_database(db_path=db_path, readonly=False)
+
+    # Org FKs: read country_qid from record column, resolve to region_id
+    conn = org_database._connect()
+    org_fks: dict[int, dict] = {}
+    cursor = conn.execute(
+        "SELECT qid, record FROM organizations WHERE qid IS NOT NULL AND region_id IS NULL"
+    )
+    for row in cursor:
+        rec = _json.loads(row[1]) if row[1] else {}
+        country_qid = rec.get("country_qid", "")
+        if country_qid:
+            org_fks[row[0]] = {"country_qid": country_qid}
+    if org_fks:
+        click.echo(f"  Resolving region_id for {len(org_fks):,} orgs...", err=True)
+        resolved = org_database.resolve_fks(org_fks)
+        click.echo(f"  Resolved {resolved:,} org region_ids", err=True)
+    else:
+        click.echo("  No org region FKs to resolve", err=True)
+
+    # People FKs: resolve country_id, known_for_org_id, and known_for_role_id from record column
+    click.echo("  Resolving people FKs (country_id, known_for_org, known_for_role)...", err=True)
+    resolved = person_database.resolve_fks()
+    click.echo(f"  Resolved {resolved:,} person FKs", err=True)
+
+    org_database.close()
+    person_database.close()
+
+
+@click.command("backfill-locations")
+@click.option("--dump", "dump_path", type=click.Path(exists=True), help="Path to Wikidata JSON dump file (.bz2 or .gz)")
+@click.option("--download", is_flag=True, help="Download latest dump first (~100GB)")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--limit", type=int, help="Max location records to import")
+@click.option("--batch-size", type=int, default=10000, help="Batch size for commits (default: 10000)")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_backfill_locations(
+    dump_path: Optional[str],
+    download: bool,
+    db_path: Optional[str],
+    limit: Optional[int],
+    batch_size: int,
+    verbose: bool,
+):
+    """
+    Import locations from Wikidata dump into an existing database.
+
+    For databases imported before locations were included in phase 1, this
+    command reads the full Wikidata dump and imports all location records
+    (countries, cities, regions, etc.) that are not already present.
+
+    After importing locations, resolves country_id and region_id FKs on
+    people and org records.
+
+    \b
+    Steps:
+    1. Stream Wikidata dump, importing all location entities (skipping existing)
+    2. Resolve location parent_ids from record JSON
+    3. Resolve country/region FKs on people and orgs
+
+    \b
+    Examples:
+        corp-entity-db backfill-locations --dump /path/to/dump.json.bz2
+        corp-entity-db backfill-locations --download
+        corp-entity-db backfill-locations --dump dump.json.bz2 --limit 50000
+    """
+    _configure_logging(verbose)
+
+    from corp_entity_db.store import get_locations_database
+    from corp_entity_db.importers.wikidata_dump import WikidataDumpImporter
+
+    if not dump_path and not download:
+        raise click.UsageError("Either --dump path or --download is required")
+
+    db_path_obj = _resolve_db_path(db_path)
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    click.echo(f"Database: {db_path_obj}", err=True)
+
+    importer = WikidataDumpImporter(dump_path=dump_path)
+
+    if download:
+        click.echo("Downloading Wikidata dump (~100GB)...", err=True)
+        dump_file = importer.download_dump(force=False, use_aria2=True)
+        click.echo(f"Using dump: {dump_file}", err=True)
+    elif dump_path:
+        click.echo(f"Using dump: {dump_path}", err=True)
+
+    # Load existing location source IDs to skip
+    locations_database = get_locations_database(db_path=db_path_obj, readonly=False)
+    existing_ids = locations_database.get_all_source_ids(source="wikidata")
+    click.echo(f"Existing locations: {len(existing_ids):,} (will skip)", err=True)
+
+    # Step 1: Import locations from dump
+    click.echo("\n=== Step 1: Import locations from dump ===", err=True)
+    if limit:
+        click.echo(f"  Limit: {limit:,} records", err=True)
+
+    location_batch: list = []
+    locations_inserted = 0
+
+    for record in importer.import_locations(
+        limit=limit,
+        require_enwiki=False,
+        skip_ids=existing_ids,
+    ):
+        location_batch.append(record)
+        if len(location_batch) >= batch_size:
+            inserted = locations_database.insert_batch(location_batch)
+            locations_inserted += inserted
+            location_batch = []
+            click.echo(
+                f"\r  Imported {locations_inserted:,} locations...",
+                nl=False, err=True,
+            )
+            sys.stderr.flush()
+
+    # Flush remaining
+    if location_batch:
+        inserted = locations_database.insert_batch(location_batch)
+        locations_inserted += inserted
+
+    click.echo(f"\n  Imported {locations_inserted:,} locations total", err=True)
+
+    # Step 2: Resolve location parent_ids
+    click.echo("\n=== Step 2: Resolve location parent_ids ===", err=True)
+    loc_conn = locations_database._connect()
+    location_fks: dict[int, dict] = {}
+    cursor = loc_conn.execute(
+        "SELECT qid, record FROM locations WHERE qid IS NOT NULL AND source_id = 4"
+    )
+    for row in cursor:
+        rec = json.loads(row[1]) if row[1] else {}
+        parent_qids = rec.get("parent_qids", [])
+        country_qids = rec.get("country_qids", [])
+        if parent_qids or country_qids:
+            location_fks[row[0]] = {"parent_qids": parent_qids, "country_qids": country_qids}
+
+    if location_fks:
+        click.echo(f"  Resolving parent_ids for {len(location_fks):,} locations...", err=True)
+        resolved = locations_database.resolve_parent_ids(location_fks)
+        click.echo(f"  Resolved {resolved:,} location parent_ids", err=True)
+    else:
+        click.echo("  No location parent_ids to resolve", err=True)
+
+    locations_database.close()
+
+    # Step 3: Resolve country/region FKs on people and orgs
+    click.echo("\n=== Step 3: Resolve country/region FKs ===", err=True)
+    _resolve_all_fks(db_path_obj)
+
+    click.echo("\nBackfill complete!", err=True)
+
+
+@click.command("backfill-roles")
+@click.option("--dump", "dump_path", type=click.Path(exists=True), help="Path to Wikidata JSON dump file (.bz2 or .gz)")
+@click.option("--download", is_flag=True, help="Download latest dump first (~100GB)")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--limit", type=int, help="Max role records to import")
+@click.option("--batch-size", type=int, default=10000, help="Batch size for commits (default: 10000)")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_backfill_roles(
+    dump_path: Optional[str],
+    download: bool,
+    db_path: Optional[str],
+    limit: Optional[int],
+    batch_size: int,
+    verbose: bool,
+):
+    """
+    Import role/position entities from Wikidata dump into an existing database.
+
+    For databases imported before roles were included in phase 1, this
+    command reads the full Wikidata dump and imports all role/position entities
+    (e.g., President, CEO, Minister) that are not already present.
+
+    After importing roles, resolves known_for_role_id FKs on people records.
+
+    \b
+    Steps:
+    1. Stream Wikidata dump, importing all role entities (skipping existing)
+    2. Resolve known_for_role_id FKs on people records
+
+    \b
+    Examples:
+        corp-entity-db backfill-roles --dump /path/to/dump.json.bz2
+        corp-entity-db backfill-roles --download
+        corp-entity-db backfill-roles --dump dump.json.bz2 --limit 50000
+    """
+    _configure_logging(verbose)
+
+    from corp_entity_db.store import get_roles_database
+    from corp_entity_db.importers.wikidata_dump import WikidataDumpImporter
+
+    if not dump_path and not download:
+        raise click.UsageError("Either --dump path or --download is required")
+
+    db_path_obj = _resolve_db_path(db_path)
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    click.echo(f"Database: {db_path_obj}", err=True)
+
+    importer = WikidataDumpImporter(dump_path=dump_path)
+
+    if download:
+        click.echo("Downloading Wikidata dump (~100GB)...", err=True)
+        dump_file = importer.download_dump(force=False, use_aria2=True)
+        click.echo(f"Using dump: {dump_file}", err=True)
+    elif dump_path:
+        click.echo(f"Using dump: {dump_path}", err=True)
+
+    # Load existing role source IDs to skip
+    roles_database = get_roles_database(db_path=db_path_obj, readonly=False)
+    existing_ids = roles_database.get_all_source_ids(source="wikidata")
+    click.echo(f"Existing roles: {len(existing_ids):,} (will skip)", err=True)
+
+    # Step 1: Import roles from dump
+    click.echo("\n=== Step 1: Import roles from dump ===", err=True)
+    if limit:
+        click.echo(f"  Limit: {limit:,} records", err=True)
+
+    role_batch: list = []
+    roles_inserted = 0
+    roles_scanned = 0
+
+    for record_type, record in importer.import_all(
+        import_people=False,
+        import_orgs=False,
+        import_locations=False,
+    ):
+        if record_type != "role":
+            continue
+        roles_scanned += 1
+        if limit and roles_scanned > limit:
+            break
+        # Skip existing
+        if record.source_id and record.source_id in existing_ids:
+            continue
+        role_batch.append(record)
+        if len(role_batch) >= batch_size:
+            inserted = roles_database.insert_batch(role_batch)
+            roles_inserted += inserted
+            role_batch = []
+            click.echo(
+                f"\r  Imported {roles_inserted:,} roles...",
+                nl=False, err=True,
+            )
+            sys.stderr.flush()
+
+    # Flush remaining
+    if role_batch:
+        inserted = roles_database.insert_batch(role_batch)
+        roles_inserted += inserted
+
+    click.echo(f"\n  Imported {roles_inserted:,} roles total", err=True)
+    roles_database.close()
+
+    # Step 2: Resolve known_for_role_id FKs on people records
+    click.echo("\n=== Step 2: Resolve known_for_role_id FKs ===", err=True)
+    _resolve_all_fks(db_path_obj)
+
+    click.echo("\nBackfill complete!", err=True)
 
 
 @click.command("fix-resume")
@@ -174,8 +451,7 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
 
     Creates additional people records from org→person executive mappings
     (e.g. Microsoft P169→Bill Gates creates a "Bill Gates, CEO, Microsoft" record),
-    and backfills position jurisdictions (e.g. "President of the United States"
-    gets known_for_org_location_id pointing to "United States").
+    and backfills organization references for people records.
 
     This scans the full dump (~100GB) — step 1 is JSON-only, steps 3b/3c need
     the embedder for new/updated records.
@@ -185,11 +461,10 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
 
     \b
     Steps:
-    1. Scan dump: extract executive properties from orgs, position jurisdictions, org refs from people
+    1. Scan dump: extract executive properties from orgs, org refs from people
     2. Optionally update org records with executives field (for future repair-resume)
     3. Resolve org QIDs to labels and backfill people missing known_for_org
     3b. Insert additional people records from reverse org→person mappings (with embeddings)
-    3c. Backfill position jurisdictions for people with empty known_for_org (re-embeds)
     4. Insert discovered orgs referenced by people but not in orgs table
 
     \b
@@ -230,8 +505,6 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
     reverse_person_orgs: dict[str, list[tuple[str, str, Optional[str], Optional[str]]]] = {}
     # org_qid → label (discovered from people, populated in step 1)
     discovered_orgs: dict[str, str] = {}
-    # position_qid → jurisdiction_qid (from position items with P1001/P17)
-    position_jurisdictions: dict[str, str] = {}
 
     # ==================== Step 1: Scan dump ====================
     if from_step <= 1 and importer is not None:
@@ -353,13 +626,11 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
             raise prefetch_error[0]
 
         click.echo("", err=True)  # Newline after counter
-        position_jurisdictions = importer._position_jurisdictions
         click.echo(
             f"  Scan complete: {entities_scanned:,} entities, "
             f"{orgs_with_execs:,} orgs with executives, "
             f"{len(reverse_person_orgs):,} unique people in reverse map, "
-            f"{len(discovered_orgs):,} discovered orgs, "
-            f"{len(position_jurisdictions):,} position jurisdictions cached",
+            f"{len(discovered_orgs):,} discovered orgs",
             err=True,
         )
     elif from_step <= 1:
@@ -451,13 +722,13 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                 continue
 
             existing = conn.execute(
-                "SELECT known_for_org_id, known_for_org_location_id FROM people WHERE qid = ?", (qid_int,)
+                "SELECT known_for_org_id FROM people WHERE qid = ?", (qid_int,)
             ).fetchall()
             if not existing:
                 continue  # Person not in DB at all, skip
 
-            # Track existing org/location FK pairs to avoid duplicates
-            existing_fks = {(row[0], row[1]) for row in existing}
+            # Track existing org FK values to avoid duplicates
+            existing_fks = {row[0] for row in existing}
             base_row = conn.execute(
                 "SELECT name, country_id, person_type_id, birth_date, death_date, record FROM people WHERE qid = ? LIMIT 1",
                 (qid_int,),
@@ -473,24 +744,15 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
             base_record_json = base_row[5] or "{}"
 
             for rev_org_qid, rev_role, rev_start, rev_end in entries:
-                # Resolve org QID to org_id or location_id (wikidata→wikidata)
+                # Resolve org QID to org_id (wikidata→wikidata)
                 resolved_org_id = org_database.get_id_by_source_id("wikipedia", rev_org_qid)
-                resolved_loc_id = None
-                if resolved_org_id is None:
-                    org_qid_int = int(rev_org_qid.lstrip("Q")) if rev_org_qid.startswith("Q") else None
-                    if org_qid_int is not None:
-                        loc_row = conn.execute(
-                            "SELECT id FROM locations WHERE qid = ? AND source_id = 4", (org_qid_int,)
-                        ).fetchone()
-                        if loc_row:
-                            resolved_loc_id = loc_row[0]
 
-                if resolved_org_id is None and resolved_loc_id is None:
+                if resolved_org_id is None:
                     skipped += 1
                     continue
 
-                # Skip if this person already has a record with this org/location FK
-                if (resolved_org_id, resolved_loc_id) in existing_fks:
+                # Skip if this person already has a record with this org FK
+                if resolved_org_id in existing_fks:
                     continue
 
                 # Get org label for embedding text
@@ -519,7 +781,6 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                     "person_type_id": base_person_type_id,
                     "role_id": role_id,
                     "org_id": resolved_org_id,
-                    "location_id": resolved_loc_id,
                     "from_date": rev_start or "",
                     "to_date": rev_end or "",
                     "birth_date": base_birth_date,
@@ -527,7 +788,7 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                     "record_json": json.dumps(record_data),
                     "embed_text": embed_text,
                 })
-                existing_fks.add((resolved_org_id, resolved_loc_id))
+                existing_fks.add(resolved_org_id)
 
         click.echo(f"\n  Collected {len(pending):,} records to insert ({skipped:,} skipped, no org label)", err=True)
 
@@ -576,14 +837,14 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                     cursor = conn.execute(
                         """INSERT INTO people
                         (qid, name, name_normalized, source_id, source_identifier, country_id,
-                         person_type_id, known_for_role_id, known_for_org_id, known_for_org_location_id,
+                         person_type_id, known_for_role_id, known_for_org_id,
                          from_date, to_date, birth_date, death_date, record, embedding)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             rec["qid_int"], rec["name"], rec["name_normalized"],
                             4, rec["person_qid"], rec["country_id"],
                             rec["person_type_id"], rec["role_id"],
-                            rec.get("org_id"), rec.get("location_id"),
+                            rec.get("org_id"),
                             rec["from_date"], rec["to_date"],
                             rec["birth_date"], rec["death_date"],
                             rec["record_json"],
@@ -605,131 +866,6 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
             click.echo(f"\n  Inserted {new_records:,} new people records", err=True)
 
         org_database.close()
-        person_database.close()
-
-    # Also handle position jurisdictions: backfill P39 positions that lacked org qualifiers
-    if from_step <= 3 and position_jurisdictions and importer:
-        click.echo("\n=== Step 3c: Backfill people with position jurisdictions ===", err=True)
-        click.echo(f"  Using {len(position_jurisdictions):,} cached position→jurisdiction mappings", err=True)
-
-        from corp_entity_db.store import get_person_database, get_roles_database
-        from corp_entity_db.embeddings import CompanyEmbedder
-
-        person_database = get_person_database(db_path=db_path_obj, readonly=False)
-        embedder = CompanyEmbedder()
-        conn = person_database._connect()
-
-        rows = conn.execute(
-            "SELECT id, qid, name, record FROM people WHERE known_for_org_id IS NULL AND known_for_org_location_id IS NULL AND source_id = 4"
-        ).fetchall()
-        click.echo(f"  Found {len(rows):,} people with no known_for_org FK", err=True)
-
-        # Phase 1: Collect updates (no embedding yet — fast)
-        click.echo("  Phase 1: Resolving jurisdictions...", err=True)
-        pending_updates: list[dict] = []
-        roles_db = get_roles_database(db_path=db_path_obj, readonly=False)
-
-        for row in rows:
-            person_id, qid_int, name, record_json = row
-            try:
-                record_data = json.loads(record_json) if record_json else {}
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-            positions = record_data.get("positions", [])
-            for pos_qid in positions:
-                jur_qid = position_jurisdictions.get(pos_qid, "")
-                if jur_qid:
-                    # Resolve jurisdiction QID to location_id
-                    jur_qid_int = int(jur_qid.lstrip("Q")) if jur_qid.startswith("Q") else None
-                    if jur_qid_int is None:
-                        continue
-                    loc_row = conn.execute(
-                        "SELECT id, name FROM locations WHERE qid = ? AND source_id = 4", (jur_qid_int,)
-                    ).fetchone()
-                    if loc_row:
-                        jur_label = loc_row["name"]
-                        # Look up position label from roles table by QID
-                        pos_qid_int = int(pos_qid.lstrip("Q")) if pos_qid.startswith("Q") else None
-                        pos_label = ""
-                        if pos_qid_int:
-                            role_row = conn.execute("SELECT id, name FROM roles WHERE qid = ? LIMIT 1", (pos_qid_int,)).fetchone()
-                            if role_row:
-                                pos_label = role_row["name"]
-                        role_id = roles_db.get_or_create(pos_label, source_id=4) if pos_label else None
-                        embed_text = f"{name}, {pos_label}, {jur_label}" if pos_label else f"{name}, {jur_label}"
-                        pending_updates.append({
-                            "person_id": person_id,
-                            "location_id": loc_row["id"],
-                            "role_id": role_id,
-                            "embed_text": embed_text,
-                        })
-                        break  # Use first matching jurisdiction
-        click.echo(f"  Collected {len(pending_updates):,} records to update", err=True)
-
-        # Phase 2: Batch embed (background thread) and update (main thread) in parallel
-        if pending_updates:
-            click.echo("  Phase 2: Batch embedding and updating (2 threads)...", err=True)
-            EMBED_BATCH = 192
-            updated = 0
-
-            embed_q_3c: queue.Queue = queue.Queue(maxsize=2)
-            result_q_3c: queue.Queue = queue.Queue(maxsize=2)
-            embed_errors_3c: list[Exception] = []
-
-            def _embed_worker_3c():
-                try:
-                    while True:
-                        texts = embed_q_3c.get()
-                        if texts is None:
-                            return
-                        result_q_3c.put(embedder.embed_batch(texts))
-                except Exception as e:
-                    embed_errors_3c.append(e)
-                    result_q_3c.put(None)
-
-            embed_t_3c = threading.Thread(target=_embed_worker_3c, daemon=True, name="fix-embedder-3c")
-            embed_t_3c.start()
-
-            batches_3c = [pending_updates[i:i + EMBED_BATCH] for i in range(0, len(pending_updates), EMBED_BATCH)]
-
-            # Submit first batch
-            embed_q_3c.put([r["embed_text"] for r in batches_3c[0]])
-
-            for batch_idx, batch in enumerate(batches_3c):
-                fp32_embs = result_q_3c.get()
-                if fp32_embs is None:
-                    raise embed_errors_3c[0]
-
-                # Submit next batch immediately — embeds while we write to DB
-                if batch_idx + 1 < len(batches_3c):
-                    embed_q_3c.put([r["embed_text"] for r in batches_3c[batch_idx + 1]])
-
-                for i, rec in enumerate(batch):
-                    conn.execute(
-                        """UPDATE people SET known_for_org_location_id = ?,
-                           known_for_role_id = COALESCE(known_for_role_id, ?),
-                           embedding = ?
-                        WHERE id = ?""",
-                        (rec["location_id"], rec["role_id"], fp32_embs[i].tobytes(), rec["person_id"]),
-                    )
-                    updated += 1
-
-                conn.commit()
-                click.echo(
-                    f"\r  Embedded and updated {updated:,}/{len(pending_updates):,} records...",
-                    nl=False, err=True,
-                )
-                sys.stderr.flush()
-
-            embed_q_3c.put(None)  # shutdown embedder
-            embed_t_3c.join()
-
-            click.echo(f"\n  Updated {updated:,} people records with position jurisdictions", err=True)
-
-        roles_db.close()
-        # Checkpoint WAL after heavy writes to prevent corruption on re-open
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         person_database.close()
 
     # ==================== Step 4: Insert discovered orgs ====================

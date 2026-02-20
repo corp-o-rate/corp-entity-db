@@ -112,10 +112,12 @@ main.add_command(db_repair_embeddings)
 main.add_command(db_build_index)
 main.add_command(db_post_import)
 
-from .repair import db_repair_resume, db_fix_resume
+from .repair import db_repair_resume, db_fix_resume, db_backfill_locations, db_backfill_roles
 
 main.add_command(db_repair_resume)
 main.add_command(db_fix_resume)
+main.add_command(db_backfill_locations)
+main.add_command(db_backfill_roles)
 
 from .serve import serve_cmd
 
