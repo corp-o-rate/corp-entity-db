@@ -8,6 +8,7 @@ from typing import NamedTuple, Optional
 
 import click
 
+from ..models import RoleRecord
 from ._common import _configure_logging, _resolve_db_path
 
 
@@ -213,6 +214,59 @@ def _run_fk_only(db_path: Path, *, people: bool, orgs: bool, locations: bool) ->
         click.echo(f"  Loaded {len(org_fks):,} org FK records", err=True)
         resolved = org_database.resolve_fks(org_fks)
         click.echo(f"  Resolved {resolved:,} org region_ids", err=True)
+
+    # Backfill missing role records from people's P106 occupation QIDs
+    if people:
+        from corp_entity_db.store import get_roles_database
+        from corp_entity_db.importers.wikidata_dump import WikidataDumpImporter
+        roles_database = get_roles_database(db_path=db_path, readonly=False)
+        roles_conn = roles_database._connect()
+        existing_role_qids = {row[0] for row in roles_conn.execute("SELECT qid FROM roles WHERE qid IS NOT NULL")}
+
+        # Collect all unique occupation QIDs from people's record JSON
+        click.echo("  Scanning people records for occupation QIDs...", err=True)
+        needed_qids: set[int] = set()
+        cursor = conn.execute(
+            "SELECT record FROM people WHERE source_id = 4 AND record IS NOT NULL"
+        )
+        for row in cursor:
+            rec = _json.loads(row[0]) if row[0] else {}
+            for occ in rec.get("occupations", []):
+                if occ.startswith("Q") and occ[1:].isdigit():
+                    needed_qids.add(int(occ[1:]))
+            role_qid = rec.get("role_qid", "")
+            if role_qid and role_qid.startswith("Q") and role_qid[1:].isdigit():
+                needed_qids.add(int(role_qid[1:]))
+            for pos_qid in rec.get("positions", []):
+                if isinstance(pos_qid, str) and pos_qid.startswith("Q") and pos_qid[1:].isdigit():
+                    needed_qids.add(int(pos_qid[1:]))
+
+        missing_qids = needed_qids - existing_role_qids
+        if missing_qids:
+            with click.progressbar(
+                length=len(missing_qids),
+                label=f"  Fetching {len(missing_qids):,} role labels",
+                file=sys.stderr,
+            ) as bar:
+                api_labels = WikidataDumpImporter.fetch_qid_labels(
+                    missing_qids,
+                    progress_callback=lambda done, total: bar.update(done - bar.pos),
+                )
+            role_records = []
+            for qid_int, label in api_labels.items():
+                role_records.append(RoleRecord(
+                    name=label,
+                    source="wikidata",
+                    source_id=f"Q{qid_int}",
+                    qid=qid_int,
+                    record={"wikidata_id": f"Q{qid_int}", "label": label, "backfilled": True},
+                ))
+            if role_records:
+                inserted = roles_database.insert_batch(role_records)
+                click.echo(f"  Backfilled {inserted:,} missing role records", err=True)
+        else:
+            click.echo("  All occupation/position QIDs already have role records", err=True)
+        roles_database.close()
 
     # People FKs: resolve_fks reads each row's record JSON directly
     # Resolves country_id, known_for_org_id, and known_for_role_id
@@ -740,6 +794,54 @@ def db_import_wikidata_dump(
         reader.join(timeout=5)
 
     click.echo(f"Import complete: {people_count:,} people, {orgs_count:,} orgs, {locations_count:,} locations, {roles_count:,} roles", err=True)
+
+    # === Backfill missing role records ===
+    # Some occupation/position QIDs may have been missed by _is_role_entity during the dump scan.
+    # Fetch their labels from the Wikidata API and create role records before FK resolution.
+    click.echo("\n=== Backfilling missing role records ===", err=True)
+    sys.stderr.flush()
+    conn = roles_database._connect()
+    existing_role_qids = {row[0] for row in conn.execute("SELECT qid FROM roles WHERE qid IS NOT NULL")}
+    missing_qids = importer.get_missing_role_qids(existing_role_qids)
+    if missing_qids:
+        # First check _role_labels cache (populated during dump scan for detected roles)
+        cached_labels = {
+            int(qid_str[1:]): label
+            for qid_str, label in importer._role_labels.items()
+            if qid_str.startswith("Q") and qid_str[1:].isdigit() and int(qid_str[1:]) in missing_qids
+        }
+        still_missing = missing_qids - set(cached_labels.keys())
+
+        if still_missing:
+            with click.progressbar(
+                length=len(still_missing),
+                label=f"  Fetching {len(still_missing):,} role labels",
+                file=sys.stderr,
+            ) as bar:
+                api_labels = WikidataDumpImporter.fetch_qid_labels(
+                    still_missing,
+                    progress_callback=lambda done, total: bar.update(done - bar.pos),
+                )
+            cached_labels.update(api_labels)
+
+        # Create role records for all resolved labels
+        role_records = []
+        for qid_int, label in cached_labels.items():
+            role_records.append(RoleRecord(
+                name=label,
+                source="wikidata",
+                source_id=f"Q{qid_int}",
+                qid=qid_int,
+                record={"wikidata_id": f"Q{qid_int}", "label": label, "backfilled": True},
+            ))
+        if role_records:
+            inserted = roles_database.insert_batch(role_records)
+            roles_count += inserted
+            click.echo(f"  Backfilled {inserted:,} missing role records", err=True)
+        else:
+            click.echo("  No role records to backfill", err=True)
+    else:
+        click.echo("  All occupation/position QIDs already have role records", err=True)
 
     # === Pass 2: Resolve FK relations ===
     click.echo("\n=== Pass 2: Resolving FK relations ===", err=True)

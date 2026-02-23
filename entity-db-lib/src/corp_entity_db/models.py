@@ -280,14 +280,76 @@ class PersonRecord(BaseModel):
             "record": self.record,
         }
 
+    # Person types whose identity is defined by their role at an organization
+    _ORG_DEFINED_TYPES = {
+        PersonType.EXECUTIVE, PersonType.POLITICIAN, PersonType.GOVERNMENT,
+        PersonType.MILITARY, PersonType.LEGAL, PersonType.JOURNALIST,
+        PersonType.PROFESSIONAL, PersonType.ACADEMIC, PersonType.SCIENTIST,
+        PersonType.ENTREPRENEUR,
+    }
+
+    # Preposition used to connect the role to the org for each org-defined type
+    _TYPE_PREPOSITIONS: dict[PersonType, str] = {
+        PersonType.EXECUTIVE: "of",
+        PersonType.POLITICIAN: "of",
+        PersonType.GOVERNMENT: "at",
+        PersonType.MILITARY: "of",
+        PersonType.LEGAL: "at",
+        PersonType.JOURNALIST: "at",
+        PersonType.PROFESSIONAL: "at",
+        PersonType.ACADEMIC: "at",
+        PersonType.SCIENTIST: "at",
+        PersonType.ENTREPRENEUR: "of",
+    }
+
+    # Display labels for identity-defined types
+    _IDENTITY_LABELS: dict[PersonType, str] = {
+        PersonType.ARTIST: "artist",
+        PersonType.MEDIA: "media personality",
+        PersonType.ATHLETE: "athlete",
+        PersonType.ACTIVIST: "activist",
+    }
+
+    @staticmethod
+    def _a_or_an(word: str) -> str:
+        """Return 'an' if word starts with a vowel, else 'a'."""
+        return "an" if word and word[0].lower() in "aeiou" else "a"
+
     def get_embedding_text(self) -> str:
-        """Build text for embedding that includes role/org context."""
-        parts = [self.name]
-        if self.known_for_role:
-            parts.append(self.known_for_role)
-        if self.known_for_org_name:
-            parts.append(self.known_for_org_name)
-        return " | ".join(parts)
+        """Build natural language text for embedding.
+
+        Org-defined types: "{name}, a {role} {prep} {org}"
+        Identity-defined types: "{name}, a {type_label}"
+        Degraded forms when fields are missing.
+        """
+        if self.person_type in self._ORG_DEFINED_TYPES:
+            prep = self._TYPE_PREPOSITIONS[self.person_type]
+            if self.known_for_role and self.known_for_org_name:
+                article = self._a_or_an(self.known_for_role)
+                return f"{self.name}, {article} {self.known_for_role} {prep} {self.known_for_org_name}"
+            elif self.known_for_role:
+                article = self._a_or_an(self.known_for_role)
+                return f"{self.name}, {article} {self.known_for_role}"
+            elif self.known_for_org_name:
+                return f"{self.name} {prep} {self.known_for_org_name}"
+            else:
+                return self.name
+
+        if self.person_type in self._IDENTITY_LABELS:
+            label = self._IDENTITY_LABELS[self.person_type]
+            article = self._a_or_an(label)
+            return f"{self.name}, {article} {label}"
+
+        # Unknown type — use role+org if available
+        if self.known_for_role and self.known_for_org_name:
+            article = self._a_or_an(self.known_for_role)
+            return f"{self.name}, {article} {self.known_for_role} at {self.known_for_org_name}"
+        elif self.known_for_role:
+            article = self._a_or_an(self.known_for_role)
+            return f"{self.name}, {article} {self.known_for_role}"
+        elif self.known_for_org_name:
+            return f"{self.name} at {self.known_for_org_name}"
+        return self.name
 
 
 class PersonMatch(BaseModel):

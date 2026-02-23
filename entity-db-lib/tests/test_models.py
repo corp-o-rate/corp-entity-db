@@ -74,23 +74,93 @@ class TestPersonRecord:
         rec = PersonRecord(name="A", source="wikidata", source_id="Q1", death_date="")
         assert rec.is_historic is False
 
-    def test_get_embedding_text_full_context(self):
+    def test_get_embedding_text_org_defined_full(self):
+        """Org-defined types use natural language: 'Name, a role of org'."""
         rec = PersonRecord(
             name="Tim Cook",
             source="wikidata",
             source_id="Q1",
+            person_type=PersonType.EXECUTIVE,
             known_for_role="CEO",
             known_for_org_name="Apple Inc.",
         )
-        assert rec.get_embedding_text() == "Tim Cook | CEO | Apple Inc."
+        assert rec.get_embedding_text() == "Tim Cook, a CEO of Apple Inc."
 
-    def test_get_embedding_text_name_only(self):
+    def test_get_embedding_text_org_defined_role_only(self):
+        """Org-defined type with role but no org."""
+        rec = PersonRecord(
+            name="Tim Cook", source="wikidata", source_id="Q1",
+            person_type=PersonType.EXECUTIVE, known_for_role="CEO",
+        )
+        assert rec.get_embedding_text() == "Tim Cook, a CEO"
+
+    def test_get_embedding_text_org_defined_org_only(self):
+        """Org-defined type with org but no role."""
+        rec = PersonRecord(
+            name="Tim Cook", source="wikidata", source_id="Q1",
+            person_type=PersonType.EXECUTIVE, known_for_org_name="Apple Inc.",
+        )
+        assert rec.get_embedding_text() == "Tim Cook of Apple Inc."
+
+    def test_get_embedding_text_org_defined_at_preposition(self):
+        """Government type uses 'at' preposition."""
+        rec = PersonRecord(
+            name="Jerome Powell", source="wikidata", source_id="Q3",
+            person_type=PersonType.GOVERNMENT,
+            known_for_role="Chair",
+            known_for_org_name="Federal Reserve",
+        )
+        assert rec.get_embedding_text() == "Jerome Powell, a Chair at Federal Reserve"
+
+    def test_get_embedding_text_entrepreneur(self):
+        """Entrepreneur is org-defined with 'of' preposition."""
+        rec = PersonRecord(
+            name="Jensen Huang", source="wikidata", source_id="Q4",
+            person_type=PersonType.ENTREPRENEUR,
+            known_for_role="founder",
+            known_for_org_name="Nvidia",
+        )
+        assert rec.get_embedding_text() == "Jensen Huang, a founder of Nvidia"
+
+    def test_get_embedding_text_an_article(self):
+        """Roles starting with a vowel get 'an' article."""
+        rec = PersonRecord(
+            name="Anderson Cooper", source="wikidata", source_id="Q5",
+            person_type=PersonType.JOURNALIST,
+            known_for_role="anchor",
+            known_for_org_name="CNN",
+        )
+        assert rec.get_embedding_text() == "Anderson Cooper, an anchor at CNN"
+
+    def test_get_embedding_text_identity_defined(self):
+        """Identity-defined types use: 'Name, a type_label'."""
+        rec = PersonRecord(
+            name="Taylor Swift", source="wikidata", source_id="Q2",
+            person_type=PersonType.ARTIST, known_for_role="singer",
+            known_for_org_name="Taylor Swift Productions",
+        )
+        assert rec.get_embedding_text() == "Taylor Swift, an artist"
+
+    def test_get_embedding_text_identity_athlete(self):
+        """Athlete identity type."""
+        rec = PersonRecord(
+            name="LeBron James", source="wikidata", source_id="Q6",
+            person_type=PersonType.ATHLETE,
+        )
+        assert rec.get_embedding_text() == "LeBron James, an athlete"
+
+    def test_get_embedding_text_unknown_type(self):
+        """Unknown type uses just the name."""
         rec = PersonRecord(name="Tim Cook", source="wikidata", source_id="Q1")
         assert rec.get_embedding_text() == "Tim Cook"
 
-    def test_get_embedding_text_role_only(self):
-        rec = PersonRecord(name="Tim Cook", source="wikidata", source_id="Q1", known_for_role="CEO")
-        assert rec.get_embedding_text() == "Tim Cook | CEO"
+    def test_get_embedding_text_unknown_with_role_and_org(self):
+        """Unknown type with role+org falls back to natural language."""
+        rec = PersonRecord(
+            name="Jane Doe", source="wikidata", source_id="Q7",
+            known_for_role="engineer", known_for_org_name="Google",
+        )
+        assert rec.get_embedding_text() == "Jane Doe, an engineer at Google"
 
     def test_model_dump_for_db_person_type_value(self):
         rec = PersonRecord(

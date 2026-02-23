@@ -14,6 +14,7 @@ from corp_entity_db.store import (
     LocationsDatabase,
     get_database,
     get_person_database,
+    format_person_query,
 )
 
 # Backwards compatibility alias
@@ -78,4 +79,6 @@ __all__ = [
     # Resolver
     "OrganizationResolver",
     "get_organization_resolver",
+    # Query formatting
+    "format_person_query",
 ]

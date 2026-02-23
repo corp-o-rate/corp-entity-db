@@ -46,6 +46,61 @@ logger = logging.getLogger(__name__)
 
 from .hub import DB_VERSION, DEFAULT_DB_FULL_FILENAME
 
+# Person types whose identity is defined by their role at an organization
+_ORG_DEFINED_TYPE_STRS = {
+    "executive", "politician", "government", "military", "legal", "journalist",
+    "professional", "academic", "scientist", "entrepreneur",
+}
+
+_TYPE_PREPOSITIONS: dict[str, str] = {
+    "executive": "of", "politician": "of", "government": "at",
+    "military": "of", "legal": "at", "journalist": "at",
+    "professional": "at", "academic": "at", "scientist": "at",
+    "entrepreneur": "of",
+}
+
+_IDENTITY_LABELS: dict[str, str] = {
+    "artist": "artist", "media": "media personality",
+    "athlete": "athlete", "activist": "activist",
+}
+
+
+def _a_or_an(word: str) -> str:
+    """Return 'an' if word starts with a vowel, else 'a'."""
+    return "an" if word and word[0].lower() in "aeiou" else "a"
+
+
+def format_person_query(name: str, person_type: Optional[str] = None,
+                        role: Optional[str] = None, org: Optional[str] = None) -> str:
+    """Format a person query for embedding, matching stored natural language format.
+
+    Org-defined types: "{name}, a {role} {prep} {org}"
+    Identity-defined types: "{name}, a {type_label}"
+    Unknown/missing type falls back to role+org with 'at' preposition.
+    """
+    if person_type and person_type in _ORG_DEFINED_TYPE_STRS:
+        prep = _TYPE_PREPOSITIONS[person_type]
+        if role and org:
+            return f"{name}, {_a_or_an(role)} {role} {prep} {org}"
+        elif role:
+            return f"{name}, {_a_or_an(role)} {role}"
+        elif org:
+            return f"{name} {prep} {org}"
+        return name
+
+    if person_type and person_type in _IDENTITY_LABELS:
+        label = _IDENTITY_LABELS[person_type]
+        return f"{name}, {_a_or_an(label)} {label}"
+
+    # Unknown type or no type — use role+org if available
+    if role and org:
+        return f"{name}, {_a_or_an(role)} {role} at {org}"
+    elif role:
+        return f"{name}, {_a_or_an(role)} {role}"
+    elif org:
+        return f"{name} at {org}"
+    return name
+
 # Default database location
 DEFAULT_DB_PATH = Path.home() / ".cache" / "corp-extractor" / DEFAULT_DB_FULL_FILENAME
 
@@ -884,11 +939,20 @@ class OrganizationDatabase:
             return 0
 
         conn = self._connect()
-        locations_db = get_locations_database(db_path=self._db_path, readonly=True)
 
         # Preload QID → location_id lookup
         cursor = conn.execute("SELECT qid, id FROM locations WHERE qid IS NOT NULL")
         qid_to_location_id: dict[int, int] = {row[0]: row[1] for row in cursor}
+
+        org_null_region = conn.execute("SELECT COUNT(*) FROM organizations WHERE region_id IS NULL").fetchone()[0]
+        logger.info(
+            f"Org resolve_fks: {len(qid_fk_data):,} FK entries, "
+            f"{len(qid_to_location_id):,} location QIDs available, "
+            f"{org_null_region:,} orgs needing region_id"
+        )
+        if org_null_region == 0:
+            logger.info("All org region_ids already resolved, nothing to update")
+            return 0
 
         updated = 0
         batch_count = 0
@@ -919,7 +983,7 @@ class OrganizationDatabase:
                 logger.info(f"Resolved {updated:,} org region FKs...")
 
         conn.commit()
-        logger.info(f"Resolved {updated:,} org region FKs total")
+        logger.info(f"Resolved {updated:,} org region FKs total ({batch_count:,} candidates matched locations)")
         return updated
 
     def search(
@@ -2291,10 +2355,20 @@ class PersonDatabase:
                 if org_info:
                     org_id = org_info[0]
 
-            # Resolve role → role_id
+            # Resolve role → role_id from P39 position QID.
+            # Only fall back to P106 occupations when there is NO role_qid
+            # (single-record path with no P39 positions). If a specific position
+            # QID doesn't resolve, leave role_id NULL — using the generic
+            # occupation would collapse distinct positions into the same role.
             role_id = None
             if role_qid_str and role_qid_str.startswith("Q") and role_qid_str[1:].isdigit():
                 role_id = qid_to_role_id.get(int(role_qid_str[1:]))
+            elif not role_qid_str:
+                for occ_qid in rec.get("occupations", []):
+                    if occ_qid.startswith("Q") and occ_qid[1:].isdigit():
+                        role_id = qid_to_role_id.get(int(occ_qid[1:]))
+                        if role_id is not None:
+                            break
 
             if country_id is None and org_id is None and role_id is None:
                 continue
@@ -2430,27 +2504,9 @@ class PersonDatabase:
         org_database = OrganizationDatabase(db_path=self._db_path, readonly=True)
         locations_db = get_locations_database(db_path=self._db_path, readonly=True)
         updated = 0
+        batch_count = 0
         for person_qid, entries in qid_to_orgs.items():
             if not entries:
-                continue
-            # Use the first entry with an org QID that resolves
-            org_id: Optional[int] = None
-            role = ""
-            start_date: Optional[str] = None
-            end_date: Optional[str] = None
-            for entry_org_qid, entry_role, entry_start, entry_end in entries:
-                if not entry_org_qid:
-                    continue
-                # Try organization (same source: wikidata)
-                resolved_org_id = org_database.get_id_by_source_id("wikipedia", entry_org_qid)
-                if resolved_org_id is not None:
-                    org_id = resolved_org_id
-                    role = entry_role
-                    start_date = entry_start
-                    end_date = entry_end
-                    break
-
-            if org_id is None:
                 continue
 
             # Strip Q prefix if present for integer QID column
@@ -2458,25 +2514,53 @@ class PersonDatabase:
             if qid_int is None:
                 continue
 
-            # Resolve role to role_id
-            role_id = None
-            if role:
-                roles_db = get_roles_database(db_path=self._db_path, readonly=False)
-                role_id = roles_db.get_or_create(role, source_id=4)  # 4 = wikidata
+            # Apply each resolved entry to a separate row for this person
+            for entry_org_qid, entry_role, entry_start, entry_end in entries:
+                if not entry_org_qid:
+                    continue
 
-            # Update records missing org FK, also backfill dates and role
-            result = conn.execute(
-                """UPDATE people SET known_for_org_id = ?,
-                   known_for_role_id = COALESCE(known_for_role_id, ?),
-                   from_date = CASE WHEN from_date IS NULL OR from_date = '' THEN ? ELSE from_date END,
-                   to_date = CASE WHEN to_date IS NULL OR to_date = '' THEN ? ELSE to_date END
-                WHERE qid = ? AND known_for_org_id IS NULL""",
-                (org_id, role_id, start_date or "", end_date or "", qid_int),
-            )
-            updated += result.rowcount
-            if updated % 1000 == 0 and updated > 0:
+                # Resolve org QID to org_id
+                org_id = org_database.get_id_by_source_id("wikipedia", entry_org_qid)
+                if org_id is None:
+                    continue
+
+                # Resolve role to role_id
+                role_id = None
+                if entry_role:
+                    roles_db = get_roles_database(db_path=self._db_path, readonly=False)
+                    role_id = roles_db.get_or_create(entry_role, source_id=4)  # 4 = wikidata
+
+                # Find one row for this person that still needs an org
+                target_id = conn.execute(
+                    "SELECT id FROM people WHERE qid = ? AND known_for_org_id IS NULL LIMIT 1",
+                    (qid_int,),
+                ).fetchone()
+                if target_id is None:
+                    break  # No more rows without org for this person
+
+                try:
+                    result = conn.execute(
+                        """UPDATE people SET known_for_org_id = ?,
+                           known_for_role_id = COALESCE(known_for_role_id, ?),
+                           from_date = CASE WHEN from_date IS NULL OR from_date = '' THEN ? ELSE from_date END,
+                           to_date = CASE WHEN to_date IS NULL OR to_date = '' THEN ? ELSE to_date END
+                        WHERE id = ?""",
+                        (org_id, role_id, entry_start or "", entry_end or "", target_id[0]),
+                    )
+                    updated += result.rowcount
+                except sqlite3.IntegrityError:
+                    logger.warning(
+                        f"UNIQUE conflict backfilling org for person Q{qid_int} "
+                        f"(org_id={org_id}, role_id={role_id}), skipping"
+                    )
+
+            batch_count += 1
+            if batch_count % 10000 == 0:
                 conn.commit()
+                logger.info(f"Backfilled {updated:,} known_for_org records...")
+
         conn.commit()
+        logger.info(f"Backfilled {updated:,} known_for_org records total")
         return updated
 
     def search(
@@ -2793,8 +2877,10 @@ class PersonDatabase:
         """
         Yield batches of (person_id, embedding_text) tuples for records missing embeddings.
 
-        Embedding text is built as "Name | Role | Org/Location" by JOINing
-        against roles, organizations, and locations tables.
+        Embedding text format depends on person type:
+        - Org-defined types (executive, politician, etc.): Name | role | org
+        - Identity-defined types (artist, athlete, etc.): Name | person_type
+        - Unknown type: Name | role | org (fallback)
 
         Args:
             batch_size: Number of IDs per batch
@@ -2808,10 +2894,11 @@ class PersonDatabase:
         while True:
             cursor = conn.execute("""
                 SELECT p.id, p.name, r.name as role_name,
-                       kfo.name as org_name
+                       kfo.name as org_name, pt.name as person_type_name
                 FROM people p
                 LEFT JOIN roles r ON p.known_for_role_id = r.id
                 LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
+                LEFT JOIN people_types pt ON p.person_type_id = pt.id
                 WHERE p.embedding IS NULL AND p.id > ?
                 ORDER BY p.id
                 LIMIT ?
@@ -2822,7 +2909,12 @@ class PersonDatabase:
                 break
 
             results = [
-                (row["id"], " | ".join(filter(None, [row["name"], row["role_name"], row["org_name"]])))
+                (row["id"], format_person_query(
+                    row["name"],
+                    person_type=row["person_type_name"],
+                    role=row["role_name"],
+                    org=row["org_name"],
+                ))
                 for row in rows
             ]
             yield results

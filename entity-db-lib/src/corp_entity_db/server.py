@@ -32,6 +32,7 @@ class SearchRequest(BaseModel):
 class SearchPeopleRequest(BaseModel):
     query: str
     limit: int = 10
+    person_type: Optional[str] = None
 
 
 class SearchRolesRequest(BaseModel):
@@ -47,6 +48,7 @@ class SearchLocationsRequest(BaseModel):
 class ResolveRequest(BaseModel):
     name: str
     type: Literal["org", "person"] = "org"
+    person_type: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -187,12 +189,15 @@ def search_organizations(req: SearchRequest):
 def search_people(req: SearchPeopleRequest):
     """Search people by name."""
     t0 = time.time()
-    logger.info(f"Search people: '{req.query}' (limit={req.limit})")
+    logger.info(f"Search people: '{req.query}' (limit={req.limit}, person_type={req.person_type})")
+
+    from .store import format_person_query
 
     embedder = _get_embedder()
     person_db = _get_person_db()
 
-    query_embedding = embedder.embed(req.query)
+    embed_query = format_person_query(req.query, person_type=req.person_type)
+    query_embedding = embedder.embed(embed_query)
 
     results = person_db.search(
         query_embedding,
@@ -267,9 +272,11 @@ def resolve_entity(req: ResolveRequest):
         return result.model_dump() if result else None
     else:
         # Person resolution: find best match via embedding search
+        from .store import format_person_query
         embedder = _get_embedder()
         person_db = _get_person_db()
-        query_embedding = embedder.embed(req.name)
+        embed_query = format_person_query(req.name, person_type=req.person_type)
+        query_embedding = embedder.embed(embed_query)
         results = person_db.search(query_embedding, top_k=1, query_text=req.name)
         elapsed = time.time() - t0
         if results:

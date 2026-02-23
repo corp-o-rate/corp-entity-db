@@ -27,6 +27,8 @@ import json
 import logging
 import shutil
 import subprocess
+import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -309,6 +311,16 @@ OCCUPATION_TO_TYPE: dict[str, PersonType] = {
     # Entrepreneurs/Executives via occupation
     "Q131524": PersonType.ENTREPRENEUR,  # entrepreneur
     "Q43845": PersonType.ENTREPRENEUR,   # businessperson
+
+    # Additional common occupations (for role coverage)
+    "Q10798782": PersonType.ARTIST,      # television actor
+    "Q201788": PersonType.ACADEMIC,      # historian
+    "Q250867": PersonType.PROFESSIONAL,  # Catholic priest
+    "Q628099": PersonType.ATHLETE,       # association football coach
+    "Q333634": PersonType.ARTIST,        # translator
+    "Q611644": PersonType.PROFESSIONAL,  # Catholic bishop
+    "Q12299841": PersonType.ATHLETE,     # cricketer
+    "Q188094": PersonType.PROFESSIONAL,  # economist
 }
 
 # =============================================================================
@@ -317,10 +329,71 @@ OCCUPATION_TO_TYPE: dict[str, PersonType] = {
 # =============================================================================
 
 ROLE_TYPE_QIDS: frozenset[str] = frozenset({
-    # Core position types
+    # Core position/occupation types
     "Q4164871",    # position
     "Q294414",     # public office
     "Q12737077",   # occupation
+    "Q28640",      # profession
+
+    # Occupation sub-types (by domain)
+    "Q66715801",   # musical profession
+    "Q88789639",   # artistic profession
+    "Q4220920",    # filmmaking occupation
+    "Q15839299",   # theatrical occupation
+    "Q58635633",   # media profession
+    "Q66666607",   # academic profession
+    "Q137841866",  # foreign language profession
+    "Q63188683",   # Christian religious occupation
+    "Q63188808",   # Catholic vocation
+    "Q138348066",  # female occupation
+    "Q63187345",   # religious occupation
+    "Q66811410",   # medical profession
+    "Q15987302",   # legal profession
+    "Q3139516",    # ecclesiastical occupation
+    "Q91188763",   # Eastern Orthodox religious occupation
+    "Q6857706",    # military profession
+    "Q103810966",  # circus profession
+    "Q110749524",  # show business profession
+    "Q83856136",   # legal position
+    "Q56604560",   # wood working profession
+    "Q17279032",   # elective office
+    "Q108377574",  # Islamic religious occupation
+    "Q135106813",  # musical occupation (alternate)
+    "Q137847894",  # clerical occupation
+    "Q138024519",  # Roman Catholic episcopal title
+    "Q138061574",  # Orthodox episcopal title
+    "Q138348131",  # male occupation
+    "Q16335296",   # historical profession
+    "Q16631188",   # military position
+    "Q3922583",    # health profession
+    "Q349843",     # allied health profession
+    "Q57260825",   # skilled trade
+    "Q828803",     # job title
+    "Q214339",     # role
+    "Q355567",     # noble title
+    "Q3320743",    # title of honor
+    "Q486983",     # academic rank
+    "Q4226220",    # naval officer rank
+    "Q1474521",    # function
+    "Q621504",     # police rank (Germany)
+    "Q1221033",    # rank group
+    "Q108392111",  # university head
+    "Q98038492",   # membership type
+
+    # Occupation classification systems
+    "Q108300140",  # occupation group (ISCO-08)
+    "Q119982961",  # profession and socioprofessional category (France)
+
+    # Professional/title types
+    "Q11488158",   # corporate title
+    "Q20827480",   # certified professional
+    "Q3529618",    # academic title
+    "Q480319",     # title of authority
+    "Q136649946",  # type of position
+
+    # Social status (used by P106 for aristocrat, pensioner, etc.)
+    "Q187588",     # social class
+    "Q189970",     # social status
 
     # Political positions
     "Q2285706",    # type of political position
@@ -742,6 +815,9 @@ class WikidataDumpImporter:
         # Cache role QID → English label. Built as role entities are encountered in the dump.
         # Used to populate known_for_role on person records during pass 1.
         self._role_labels: dict[str, str] = {}
+        # Track ALL occupation QIDs referenced by people (from P106 claims).
+        # Used after import to backfill any missing role records.
+        self._needed_role_qids: set[str] = set()
 
     def download_dump(
         self,
@@ -1522,7 +1598,18 @@ class WikidataDumpImporter:
         return None
 
     def _is_role_entity(self, entity: dict) -> bool:
-        """Check if entity has P31 matching a role/position type."""
+        """Check if entity is a role/position/occupation.
+
+        Matches entities whose P31 is in ROLE_TYPE_QIDS (position, occupation, etc.)
+        or whose QID is directly listed in OCCUPATION_TO_TYPE (known occupations like
+        politician, entrepreneur, actor that may have different P31 types).
+        """
+        # Direct match: entity QID is a known occupation
+        entity_qid = entity.get("id", "")
+        if entity_qid in OCCUPATION_TO_TYPE:
+            return True
+
+        # P31-based match: entity is an instance of a role/position type
         claims = entity.get("claims", {})
         for claim in claims.get("P31", []):
             mainsnak = claim.get("mainsnak", {})
@@ -1862,8 +1949,13 @@ class WikidataDumpImporter:
 
         # Get positions (P39) with qualifiers for org
         positions = self._get_positions_with_org(claims)
-        # Get occupations (P106)
+        # Get occupations (P106) and track for role backfill
         occupations = self._get_claim_values(entity, "P106")
+        self._needed_role_qids.update(occupations)
+        # Also track P39 position QIDs as needed roles
+        for pos in positions:
+            if pos.get("position_qid"):
+                self._needed_role_qids.add(pos["position_qid"])
 
         # Classify person type from positions + occupations
         person_type = self._classify_person_type(positions, occupations)
@@ -2541,4 +2633,102 @@ class WikidataDumpImporter:
                 if jur_qid:
                     self._position_jurisdictions[qid] = jur_qid
                     return
+
+    def get_missing_role_qids(self, existing_role_qids: set[int]) -> set[int]:
+        """Return occupation/position QIDs referenced by people but not in the roles table.
+
+        Args:
+            existing_role_qids: Set of integer QIDs already in the roles table.
+
+        Returns:
+            Set of integer QIDs that need role records created.
+        """
+        missing = set()
+        for qid_str in self._needed_role_qids:
+            if qid_str.startswith("Q") and qid_str[1:].isdigit():
+                qid_int = int(qid_str[1:])
+                if qid_int not in existing_role_qids:
+                    missing.add(qid_int)
+        return missing
+
+    @staticmethod
+    def fetch_qid_labels(
+        qids: set[int],
+        batch_size: int = 50,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> dict[int, str]:
+        """Fetch labels for QIDs from the Wikidata API.
+
+        Prefers English labels, falls back to any available language.
+        For QIDs with no label at all, uses the QID string as the name.
+
+        Args:
+            qids: Set of integer QIDs to look up.
+            batch_size: Number of QIDs per API request (max 50).
+            progress_callback: Optional callback(fetched_count, total_count) called after each batch.
+
+        Returns:
+            Mapping of QID int → label string (guaranteed to cover all input QIDs).
+        """
+        labels: dict[int, str] = {}
+        qid_list = sorted(qids)
+        total_batches = (len(qid_list) + batch_size - 1) // batch_size
+        total_count = len(qid_list)
+        for batch_idx, i in enumerate(range(0, len(qid_list), batch_size)):
+            batch = qid_list[i:i + batch_size]
+            ids_param = "|".join(f"Q{q}" for q in batch)
+            url = (
+                f"https://www.wikidata.org/w/api.php?action=wbgetentities"
+                f"&ids={ids_param}&props=labels&format=json"
+            )
+
+            # Retry with exponential backoff on 429s
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    req = urllib.request.Request(url, headers={
+                        "User-Agent": "corp-entity-db/1.0 (Wikidata role backfill)"
+                    })
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        data = json.loads(resp.read())
+                    for qid_str, ent in data.get("entities", {}).items():
+                        if not (qid_str.startswith("Q") and qid_str[1:].isdigit()):
+                            continue
+                        all_labels = ent.get("labels", {})
+                        # Prefer English, fall back to any language
+                        label = all_labels.get("en", {}).get("value", "")
+                        if not label:
+                            for lang_data in all_labels.values():
+                                if isinstance(lang_data, dict) and lang_data.get("value"):
+                                    label = lang_data["value"]
+                                    break
+                        if label:
+                            labels[int(qid_str[1:])] = label
+                    break  # Success
+                except urllib.error.HTTPError as e:
+                    if e.code == 429 and attempt < max_retries - 1:
+                        wait = 2 ** (attempt + 1)  # 2, 4, 8, 16, 32 seconds
+                        logger.info(f"Rate limited (429), waiting {wait}s before retry (attempt {attempt + 1}/{max_retries})...")
+                        time.sleep(wait)
+                    else:
+                        logger.warning(f"Failed to fetch labels for batch starting at Q{batch[0]}: {e}")
+                        break
+                except Exception as e:
+                    logger.warning(f"Failed to fetch labels for batch starting at Q{batch[0]}: {e}")
+                    break
+
+            # Rate limit: pause between batches to stay under Wikidata's limits
+            if batch_idx < total_batches - 1:
+                time.sleep(0.5)
+
+            if progress_callback:
+                progress_callback(min((batch_idx + 1) * batch_size, total_count), total_count)
+            elif (batch_idx + 1) % 100 == 0:
+                logger.info(f"  Fetched labels: {batch_idx + 1}/{total_batches} batches, {len(labels):,} labels so far")
+
+        # Use QID as name for anything still missing
+        for qid_int in qids - set(labels.keys()):
+            labels[qid_int] = f"Q{qid_int}"
+
+        return labels
 
