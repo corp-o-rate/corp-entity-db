@@ -692,12 +692,9 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
         click.echo("  Creates new records for people who have org mappings they lack records for.", err=True)
 
         from corp_entity_db.store import get_person_database, get_database, get_roles_database
-        from corp_entity_db.embeddings import CompanyEmbedder
-        import numpy as np
 
         person_database = get_person_database(db_path=db_path_obj, readonly=False)
         org_database = get_database(db_path=db_path_obj, readonly=True)
-        embedder = CompanyEmbedder()
 
         conn = person_database._connect()
         roles_db = get_roles_database(db_path=db_path_obj, readonly=False)
@@ -755,14 +752,6 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                 if resolved_org_id in existing_fks:
                     continue
 
-                # Get org label for embedding text
-                org_rec = org_database.get_by_source_id("wikipedia", rev_org_qid)
-                org_label = org_rec.name if org_rec else ""
-                if not org_label:
-                    skipped += 1
-                    continue
-
-                embed_text = f"{base_name}, {rev_role}, {org_label}" if rev_role else f"{base_name}, {org_label}"
                 role_id = roles_db.get_or_create(rev_role, source_id=4) if rev_role else None
 
                 try:
@@ -786,60 +775,26 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                     "birth_date": base_birth_date,
                     "death_date": base_death_date,
                     "record_json": json.dumps(record_data),
-                    "embed_text": embed_text,
                 })
                 existing_fks.add(resolved_org_id)
 
         click.echo(f"\n  Collected {len(pending):,} records to insert ({skipped:,} skipped, no org label)", err=True)
 
-        # Phase 2: Batch embed (background thread) and insert (main thread) in parallel.
-        # PyTorch releases the GIL during forward pass, so embedding overlaps with DB writes.
+        # Phase 2: Insert records (embeddings generated during post-import)
         if pending:
-            click.echo("  Phase 2: Batch embedding and inserting (2 threads)...", err=True)
-            EMBED_BATCH = 192
+            click.echo("  Phase 2: Inserting records...", err=True)
+            INSERT_BATCH = 1000
             new_records = 0
 
-            embed_q: queue.Queue = queue.Queue(maxsize=2)
-            result_q: queue.Queue = queue.Queue(maxsize=2)
-            embed_errors: list[Exception] = []
-
-            def _embed_worker_3b():
-                try:
-                    while True:
-                        texts = embed_q.get()
-                        if texts is None:
-                            return
-                        result_q.put(embedder.embed_batch(texts))
-                except Exception as e:
-                    embed_errors.append(e)
-                    result_q.put(None)
-
-            embed_t = threading.Thread(target=_embed_worker_3b, daemon=True, name="fix-embedder-3b")
-            embed_t.start()
-
-            batches = [pending[i:i + EMBED_BATCH] for i in range(0, len(pending), EMBED_BATCH)]
-
-            # Submit first batch to start the pipeline
-            embed_q.put([r["embed_text"] for r in batches[0]])
-
-            for batch_idx, batch in enumerate(batches):
-                # Get current batch embeddings (blocks until embedder finishes)
-                fp32_embs = result_q.get()
-                if fp32_embs is None:
-                    raise embed_errors[0]
-
-                # Submit NEXT batch immediately — embeds while we write to DB below
-                if batch_idx + 1 < len(batches):
-                    embed_q.put([r["embed_text"] for r in batches[batch_idx + 1]])
-
-                # Write current batch to DB (overlaps with next batch embedding)
-                for i, rec in enumerate(batch):
-                    cursor = conn.execute(
+            for i in range(0, len(pending), INSERT_BATCH):
+                batch = pending[i:i + INSERT_BATCH]
+                for rec in batch:
+                    conn.execute(
                         """INSERT INTO people
                         (qid, name, name_normalized, source_id, source_identifier, country_id,
                          person_type_id, known_for_role_id, known_for_org_id,
-                         from_date, to_date, birth_date, death_date, record, embedding)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         from_date, to_date, birth_date, death_date, record)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             rec["qid_int"], rec["name"], rec["name_normalized"],
                             4, rec["person_qid"], rec["country_id"],
@@ -848,22 +803,14 @@ def db_fix_resume(dump_path: Optional[str], db_path: Optional[str], skip_record_
                             rec["from_date"], rec["to_date"],
                             rec["birth_date"], rec["death_date"],
                             rec["record_json"],
-                            fp32_embs[i].astype(np.float32).tobytes(),
                         ),
                     )
                     new_records += 1
 
                 conn.commit()
-                click.echo(
-                    f"\r  Embedded and inserted {new_records:,}/{len(pending):,} records...",
-                    nl=False, err=True,
-                )
-                sys.stderr.flush()
+                click.echo(f"  Inserted {new_records:,}/{len(pending):,} records...", err=True)
 
-            embed_q.put(None)  # shutdown embedder
-            embed_t.join()
-
-            click.echo(f"\n  Inserted {new_records:,} new people records", err=True)
+            click.echo(f"  Inserted {new_records:,} new people records", err=True)
 
         org_database.close()
         person_database.close()

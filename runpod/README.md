@@ -41,5 +41,10 @@ The handler accepts a JSON payload:
 | `type` | string | `"org"` | `"org"`, `"person"`, `"role"`, or `"location"` |
 | `limit` | int | `10` | Max results |
 | `hybrid` | bool | `false` | Text + embedding hybrid search (org/person only) |
+| `role` | string | `null` | Role/job title for composite person search (person type only) |
+| `org` | string | `null` | Organization for composite person search (person type only) |
+| `person_type` | string | `null` | Person type hint for identity fallback (e.g. `"artist"`, `"athlete"`) |
+
+Person search uses a dual-index strategy: a primary composite index (name + role + org as 768-dim vector for AND-style matching) and a secondary identity index (256-dim Matryoshka embeddings of natural language descriptions). The identity index is consulted as fallback when composite scores are below threshold, improving accuracy for people known by name and type alone (artists, athletes, etc.).
 
 Results are cached in-memory (up to 1GB LRU cache) for repeated queries.

@@ -101,6 +101,48 @@ def format_person_query(name: str, person_type: Optional[str] = None,
         return f"{name} at {org}"
     return name
 
+
+def format_person_query_variants(name: str, person_type: Optional[str] = None,
+                                 role: Optional[str] = None, org: Optional[str] = None) -> list[str]:
+    """Generate up to 4 query embedding variants for multi-variant person search.
+
+    Variants (deduplicated):
+      [0] name_only:  "Tim Cook"
+      [1] name_type:  "Tim Cook, a CEO" (org-defined) / "Taylor Swift, an artist" (identity)
+      [2] name_org:   "Tim Cook of Apple" (with type-appropriate preposition)
+      [3] name_full:  "Tim Cook, a CEO of Apple" (full context, same as format_person_query)
+
+    When fields are missing, variants degrade to simpler forms. Duplicate texts
+    are kept in the list (the caller can deduplicate embeddings).
+    """
+    # Variant 0: name only
+    v_name = name
+
+    # Variant 1: name + type/role
+    v_name_type = name
+    if person_type and person_type in _ORG_DEFINED_TYPE_STRS:
+        if role:
+            v_name_type = f"{name}, {_a_or_an(role)} {role}"
+    elif person_type and person_type in _IDENTITY_LABELS:
+        label = _IDENTITY_LABELS[person_type]
+        v_name_type = f"{name}, {_a_or_an(label)} {label}"
+    elif role:
+        v_name_type = f"{name}, {_a_or_an(role)} {role}"
+
+    # Variant 2: name + org
+    v_name_org = name
+    if org:
+        if person_type and person_type in _ORG_DEFINED_TYPE_STRS:
+            prep = _TYPE_PREPOSITIONS[person_type]
+        else:
+            prep = "at"
+        v_name_org = f"{name} {prep} {org}"
+
+    # Variant 3: full context (same as format_person_query)
+    v_full = format_person_query(name, person_type=person_type, role=role, org=org)
+
+    return [v_name, v_name_type, v_name_org, v_full]
+
 # Default database location
 DEFAULT_DB_PATH = Path.home() / ".cache" / "corp-extractor" / DEFAULT_DB_FULL_FILENAME
 
@@ -602,11 +644,14 @@ def build_hnsw_index(
     ef_search: int = 200,
     progress_callback: Optional[Any] = None,
 ) -> int:
-    """Build HNSW index for fast approximate nearest neighbor search.
+    """Build HNSW index for organizations from stored embeddings.
+
+    For people, use build_people_composite_index() instead — people embeddings
+    are not stored in the database, they are generated on-the-fly.
 
     Args:
         conn: Read-only database connection
-        entity_type: 'people' or 'organizations'
+        entity_type: 'organizations' (people no longer supported here)
         embedding_dim: Dimension of embeddings (default 768)
         M: Number of connections per node (default 32)
         ef_construction: Size of dynamic candidate list during construction (default 200)
@@ -622,16 +667,12 @@ def build_hnsw_index(
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
     cache_dir = db_path.parent
 
-    if entity_type == "people":
-        source_table = "people"
-        id_column = "id"
-        index_path = cache_dir / "people_usearch.bin"
-    elif entity_type == "organizations":
+    if entity_type == "organizations":
         source_table = "organizations"
         id_column = "id"
         index_path = cache_dir / "organizations_usearch.bin"
     else:
-        raise ValueError(f"Unknown entity_type: {entity_type}")
+        raise ValueError(f"Unknown entity_type: {entity_type}. For people, use build_people_composite_index().")
 
     # Count total vectors
     total_count = conn.execute(f"SELECT COUNT(*) FROM {source_table} WHERE embedding IS NOT NULL").fetchone()[0]
@@ -699,6 +740,233 @@ def build_hnsw_index(
     index_size_mb = index_path.stat().st_size / 1024**2
     logger.info(f"USearch index built successfully: {total_added:,} vectors")
     logger.info(f"  Index file: {index_path.name} ({index_size_mb:.1f} MB)")
+
+    return total_added
+
+
+def build_people_composite_index(
+    conn: sqlite3.Connection,
+    embedder: "CompanyEmbedder",
+    embedding_dim: int = 768,
+    M: int = 32,
+    ef_construction: int = 200,
+    ef_search: int = 200,
+    embed_batch_size: int = 64,
+    progress_callback: Optional[Any] = None,
+) -> int:
+    """Build USearch HNSW index for people using composite embeddings.
+
+    Generates composite embeddings (name + role + org) on-the-fly and feeds
+    them directly into the USearch index. No embeddings are stored in the
+    people table — this is the only place people embeddings live.
+
+    Args:
+        conn: Database connection
+        embedder: CompanyEmbedder instance for generating embeddings
+        embedding_dim: Dimension of composite embeddings (default 768 = 3 × 256)
+        M: HNSW connections per node
+        ef_construction: Construction quality parameter
+        ef_search: Search quality parameter
+        embed_batch_size: Batch size for embedding generation
+        progress_callback: Optional callable(processed, total) for progress
+
+    Returns:
+        Number of vectors indexed
+    """
+    from usearch.index import Index
+
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    cache_dir = db_path.parent
+    index_path = cache_dir / "people_usearch.bin"
+
+    total_count = conn.execute("SELECT COUNT(*) FROM people").fetchone()[0]
+    if total_count == 0:
+        logger.warning("No people records found")
+        return 0
+
+    logger.info(f"Building composite USearch index for {total_count:,} people")
+    logger.info(f"Parameters: M={M}, ef_construction={ef_construction}, ef_search={ef_search}")
+
+    index = Index(
+        ndim=embedding_dim,
+        metric='cos',
+        dtype='i8',
+        connectivity=M,
+        expansion_add=ef_construction,
+        expansion_search=ef_search,
+    )
+
+    # Stream people in batches, generate composite embeddings, add to index
+    DB_BATCH_SIZE = 10_000
+    total_added = 0
+    last_id = 0
+
+    while True:
+        cursor = conn.execute("""
+            SELECT p.id, p.name, r.name as role_name, kfo.name as org_name
+            FROM people p
+            LEFT JOIN roles r ON p.known_for_role_id = r.id
+            LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
+            WHERE p.id > ?
+            ORDER BY p.id
+            LIMIT ?
+        """, (last_id, DB_BATCH_SIZE))
+
+        rows = cursor.fetchall()
+        if not rows:
+            break
+
+        ids = [row["id"] for row in rows]
+        names = [row["name"] for row in rows]
+        roles = [row["role_name"] for row in rows]
+        orgs = [row["org_name"] for row in rows]
+
+        # Generate composite embeddings in sub-batches
+        for i in range(0, len(ids), embed_batch_size):
+            sub_ids = ids[i:i + embed_batch_size]
+            sub_names = names[i:i + embed_batch_size]
+            sub_roles = roles[i:i + embed_batch_size]
+            sub_orgs = orgs[i:i + embed_batch_size]
+
+            fp32_batch = embedder.embed_composite_person_batch(
+                names=sub_names, roles=sub_roles, orgs=sub_orgs,
+                batch_size=embed_batch_size,
+            )
+
+            # Quantize to int8 and add to index
+            int8_batch = np.clip(np.round(fp32_batch * 127), -127, 127).astype(np.int8)
+            ids_array = np.array(sub_ids, dtype=np.int64)
+            index.add(ids_array, int8_batch, threads=4)
+            total_added += len(sub_ids)
+
+        last_id = ids[-1]
+
+        if progress_callback:
+            progress_callback(total_added, total_count)
+        logger.info(f"Indexed {total_added:,}/{total_count:,} people vectors...")
+
+    logger.info(f"Saving people index to {index_path.name}...")
+    index.save(str(index_path))
+
+    index_size_mb = index_path.stat().st_size / 1024**2
+    logger.info(f"People USearch index built: {total_added:,} vectors ({index_size_mb:.1f} MB)")
+
+    return total_added
+
+
+def build_people_identity_index(
+    conn: sqlite3.Connection,
+    embedder: "CompanyEmbedder",
+    identity_dim: int = 256,
+    M: int = 32,
+    ef_construction: int = 200,
+    ef_search: int = 200,
+    embed_batch_size: int = 192,
+    progress_callback: Optional[Any] = None,
+) -> int:
+    """Build USearch HNSW index for people using identity embeddings (Matryoshka 256-dim).
+
+    For each person, builds embedding text using the same logic as
+    PersonRecord.get_embedding_text() — identity types get "{name}, a {type_label}",
+    org-defined types get their full natural language form.
+
+    The embedding is truncated to `identity_dim` dimensions and L2-normalized
+    (Matryoshka truncation), then quantized to int8 for the USearch index.
+
+    Args:
+        conn: Database connection
+        embedder: CompanyEmbedder instance for generating embeddings
+        identity_dim: Dimension of identity embeddings (default 256)
+        M: HNSW connections per node
+        ef_construction: Construction quality parameter
+        ef_search: Search quality parameter
+        embed_batch_size: Batch size for embedding generation
+        progress_callback: Optional callable(processed, total) for progress
+
+    Returns:
+        Number of vectors indexed
+    """
+    from usearch.index import Index
+
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    cache_dir = db_path.parent
+    index_path = cache_dir / "people_identity_usearch.bin"
+
+    total_count = conn.execute("SELECT COUNT(*) FROM people").fetchone()[0]
+    if total_count == 0:
+        logger.warning("No people records found")
+        return 0
+
+    logger.info(f"Building identity USearch index for {total_count:,} people ({identity_dim}-dim)")
+    logger.info(f"Parameters: M={M}, ef_construction={ef_construction}, ef_search={ef_search}")
+
+    index = Index(
+        ndim=identity_dim,
+        metric='cos',
+        dtype='i8',
+        connectivity=M,
+        expansion_add=ef_construction,
+        expansion_search=ef_search,
+    )
+
+    DB_BATCH_SIZE = 10_000
+    total_added = 0
+    last_id = 0
+
+    while True:
+        cursor = conn.execute("""
+            SELECT p.id, p.name, pt.name as person_type,
+                   r.name as role_name, kfo.name as org_name
+            FROM people p
+            JOIN people_types pt ON p.person_type_id = pt.id
+            LEFT JOIN roles r ON p.known_for_role_id = r.id
+            LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
+            WHERE p.id > ?
+            ORDER BY p.id
+            LIMIT ?
+        """, (last_id, DB_BATCH_SIZE))
+
+        rows = cursor.fetchall()
+        if not rows:
+            break
+
+        # Build embedding texts using format_person_query (mirrors PersonRecord.get_embedding_text)
+        ids = [row["id"] for row in rows]
+        texts: list[str] = []
+        for row in rows:
+            texts.append(format_person_query(
+                row["name"],
+                person_type=row["person_type"],
+                role=row["role_name"],
+                org=row["org_name"],
+            ))
+
+        # Embed in sub-batches, truncate to identity_dim, L2-normalize
+        for i in range(0, len(ids), embed_batch_size):
+            sub_ids = ids[i:i + embed_batch_size]
+            sub_texts = texts[i:i + embed_batch_size]
+
+            fp32_batch = embedder.embed_for_identity_index_batch(
+                sub_texts, dim=identity_dim, batch_size=embed_batch_size,
+            )
+
+            # Quantize to int8 and add to index
+            int8_batch = np.clip(np.round(fp32_batch * 127), -127, 127).astype(np.int8)
+            ids_array = np.array(sub_ids, dtype=np.int64)
+            index.add(ids_array, int8_batch, threads=4)
+            total_added += len(sub_ids)
+
+        last_id = ids[-1]
+
+        if progress_callback:
+            progress_callback(total_added, total_count)
+        logger.info(f"Indexed {total_added:,}/{total_count:,} identity vectors...")
+
+    logger.info(f"Saving identity index to {index_path.name}...")
+    index.save(str(index_path))
+
+    index_size_mb = index_path.stat().st_size / 1024**2
+    logger.info(f"People identity index built: {total_added:,} vectors ({index_size_mb:.1f} MB)")
 
     return total_added
 
@@ -1997,8 +2265,9 @@ class PersonDatabase:
         self._conn: Optional[sqlite3.Connection] = None
         self._is_v2: Optional[bool] = None  # Detected on first connect
         self._schema_version: int = 1  # Updated on connect (1=legacy, 2=normalized FKs, 3=no embeddings in lite)
-        # USearch index for fast approximate nearest neighbor search
-        self._hnsw_index: Optional[Any] = None  # usearch.index.Index
+        # USearch indexes for fast approximate nearest neighbor search
+        self._hnsw_index: Optional[Any] = None  # primary composite 768-dim
+        self._identity_index: Optional[Any] = None  # secondary identity 256-dim (fallback)
 
     def _ensure_dir(self) -> None:
         """Ensure database directory exists."""
@@ -2088,7 +2357,6 @@ class PersonDatabase:
                     birth_date TEXT DEFAULT NULL,
                     death_date TEXT DEFAULT NULL,
                     record TEXT NOT NULL DEFAULT '{}',
-                    embedding BLOB DEFAULT NULL,
                     canon_id INTEGER DEFAULT NULL,
                     canon_size INTEGER DEFAULT 1,
                     FOREIGN KEY (source_id) REFERENCES source_types(id),
@@ -2103,10 +2371,10 @@ class PersonDatabase:
                 INSERT INTO people
                 (id, qid, name, name_normalized, source_id, source_identifier, country_id,
                  person_type_id, known_for_role_id, known_for_org_id, from_date, to_date,
-                 birth_date, death_date, record, embedding, canon_id, canon_size)
+                 birth_date, death_date, record, canon_id, canon_size)
                 SELECT id, qid, name, name_normalized, source_id, source_identifier, country_id,
                        person_type_id, known_for_role_id, known_for_org_id, from_date, to_date,
-                       birth_date, death_date, record, embedding, canon_id, canon_size
+                       birth_date, death_date, record, canon_id, canon_size
                 FROM people_old
             """)
             conn.execute("DROP TABLE people_old")
@@ -2132,14 +2400,15 @@ class PersonDatabase:
     def insert(
         self,
         record: PersonRecord,
-        embedding: np.ndarray,
     ) -> int:
         """
-        Insert a person record with its embedding.
+        Insert a person record.
+
+        Embeddings are generated separately during post-import and stored
+        only in the USearch index, not in the people table.
 
         Args:
             record: Person record to insert
-            embedding: Embedding vector for the person name (float32)
 
         Returns:
             Row ID of inserted record
@@ -2149,7 +2418,6 @@ class PersonDatabase:
         # Serialize record
         record_json = json.dumps(record.record)
         name_normalized = _normalize_person_name(record.name)
-        embedding_blob = embedding.astype(np.float32).tobytes()
 
         # v2+ schema: use FK IDs instead of TEXT columns
         source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
@@ -2178,8 +2446,8 @@ class PersonDatabase:
             INSERT OR REPLACE INTO people
             (name, name_normalized, source_id, source_identifier, qid, country_id, person_type_id,
              known_for_role_id, known_for_org_id, from_date, to_date,
-             birth_date, death_date, record, embedding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             birth_date, death_date, record)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             record.name,
             name_normalized,
@@ -2195,7 +2463,6 @@ class PersonDatabase:
             record.birth_date or "",
             record.death_date or "",
             record_json,
-            embedding_blob,
         ))
 
         row_id = cursor.lastrowid
@@ -2207,15 +2474,16 @@ class PersonDatabase:
     def insert_batch(
         self,
         records: list[PersonRecord],
-        embeddings: Optional[np.ndarray] = None,
         batch_size: int = 1000,
     ) -> int:
         """
-        Insert multiple person records, optionally with embeddings.
+        Insert multiple person records.
+
+        Embeddings are generated separately during post-import and stored
+        only in the USearch index, not in the people table.
 
         Args:
             records: List of person records
-            embeddings: Matrix of embeddings (N x dim) - float32, or None to insert NULL
             batch_size: Commit batch size
 
         Returns:
@@ -2227,7 +2495,6 @@ class PersonDatabase:
         for i, record in enumerate(records):
             record_json = json.dumps(record.record)
             name_normalized = _normalize_person_name(record.name)
-            embedding_blob = embeddings[i].astype(np.float32).tobytes() if embeddings is not None else None
 
             # v2+ schema: use FK IDs instead of TEXT columns
             source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
@@ -2253,8 +2520,8 @@ class PersonDatabase:
                 INSERT OR REPLACE INTO people
                 (name, name_normalized, source_id, source_identifier, qid, country_id, person_type_id,
                  known_for_role_id, known_for_org_id, from_date, to_date,
-                 birth_date, death_date, record, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 birth_date, death_date, record)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.name,
                 name_normalized,
@@ -2270,7 +2537,6 @@ class PersonDatabase:
                 record.birth_date or "",
                 record.death_date or "",
                 record_json,
-                embedding_blob,
             ))
 
             count += 1
@@ -2432,19 +2698,20 @@ class PersonDatabase:
         source_id: str,
         known_for_role: str,
         known_for_org_id: Optional[int],
-        new_embedding: np.ndarray,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
     ) -> bool:
         """
-        Update the role/org/dates data for a person record and re-embed.
+        Update the role/org/dates data for a person record.
+
+        Embeddings are regenerated separately during post-import and stored
+        only in the USearch index.
 
         Args:
             source: Data source (e.g., 'wikidata')
             source_id: Source identifier (e.g., QID)
             known_for_role: Role/position title
             known_for_org_id: Organization FK or None
-            new_embedding: New embedding vector based on updated data
             from_date: Start date in ISO format or None
             to_date: End date in ISO format or None
 
@@ -2473,10 +2740,6 @@ class PersonDatabase:
                 to_date = COALESCE(?, to_date, '')
             WHERE id = ?
         """, (known_for_org_id, from_date, to_date, person_id))
-
-        # Update the embedding
-        embedding_bytes = new_embedding.astype(np.float32).tobytes()
-        conn.execute("UPDATE people SET embedding = ? WHERE id = ?", (embedding_bytes, person_id))
 
         conn.commit()
         return True
@@ -2569,19 +2832,29 @@ class PersonDatabase:
         top_k: int = 20,
         query_text: Optional[str] = None,
         max_text_candidates: int = 5000,
+        identity_query_embedding: Optional[np.ndarray] = None,
+        fallback_threshold: float = 0.75,
     ) -> list[tuple[PersonRecord, float]]:
         """
-        Search for similar people using hybrid text + vector search.
+        Search for similar people using composite embedding + optional identity fallback.
 
-        Two-stage approach:
+        Three-stage approach:
         1. If query_text provided, use SQL LIKE to find candidates containing search terms
-        2. USearch HNSW index for fast approximate nearest neighbor search
+        2. Primary USearch HNSW index (768-dim composite) for fast ANN search
+        3. If identity_query_embedding provided and primary scores are low, also
+           search the secondary identity index (256-dim) and merge results
+
+        The identity fallback is used when:
+        - identity_query_embedding is provided, AND
+        - the best primary score < fallback_threshold
 
         Args:
-            query_embedding: Query embedding vector
+            query_embedding: Composite query embedding (768-dim = name|role|org segments)
             top_k: Number of results to return
             query_text: Optional query text for text-based pre-filtering
             max_text_candidates: Max candidates to keep after text filtering
+            identity_query_embedding: Optional 256-dim identity embedding for fallback search
+            fallback_threshold: Primary score threshold below which identity fallback is used
 
         Returns:
             List of (PersonRecord, similarity_score) tuples
@@ -2594,12 +2867,6 @@ class PersonDatabase:
             logger.info(f"Person search: hybrid mode (text + embeddings) for '{query_text}'")
         else:
             logger.debug("Person search: embeddings-only mode (fast KNN)")
-
-        # Normalize query embedding
-        query_norm = np.linalg.norm(query_embedding)
-        if query_norm == 0:
-            return []
-        query_normalized = query_embedding / query_norm
 
         # Stage 1: Text filtering (if query_text provided)
         candidate_ids: Optional[set[int]] = None
@@ -2614,16 +2881,82 @@ class PersonDatabase:
                 if len(candidate_ids) == 0:
                     return []
 
-        # Stage 2: Vector ranking via USearch
-        query_int8 = np.clip(np.round(query_normalized * 127), -127, 127).astype(np.int8)
-
         if not self._load_hnsw_index():
-            raise RuntimeError("USearch index not found. Run: corp-extractor db build-index")
+            raise RuntimeError("USearch index not found. Run: corp-entity-db build-index")
+
+        query_norm = np.linalg.norm(query_embedding)
+        if query_norm == 0:
+            return []
+        query_normalized = query_embedding / query_norm
+        query_int8 = np.clip(np.round(query_normalized * 127), -127, 127).astype(np.int8)
 
         results = self._hnsw_search(query_int8, top_k, candidate_ids)
 
+        # Stage 3: Identity fallback — if identity embedding provided and primary scores are weak
+        if (
+            identity_query_embedding is not None
+            and self._identity_index is not None
+            and (not results or results[0][1] < fallback_threshold)
+        ):
+            best_score = results[0][1] if results else 0.0
+            logger.info(
+                f"Identity fallback: primary best={best_score:.3f}, threshold={fallback_threshold}"
+            )
+            identity_results = self._identity_search(
+                identity_query_embedding, top_k, candidate_ids,
+            )
+
+            # Merge: deduplicate by person name+source, keep higher score
+            seen: dict[int, tuple[PersonRecord, float]] = {}
+            for record, score in results:
+                # Use the person's DB row id (source_id is unique per person)
+                key = hash((record.name, record.source, record.source_id))
+                seen[key] = (record, score)
+            for record, score in identity_results:
+                key = hash((record.name, record.source, record.source_id))
+                if key not in seen or score > seen[key][1]:
+                    seen[key] = (record, score)
+
+            results = sorted(seen.values(), key=lambda x: x[1], reverse=True)[:top_k]
+
         elapsed = time.time() - start
         logger.debug(f"Person search took {elapsed:.3f}s (results={len(results)})")
+        return results
+
+    def _identity_search(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int,
+        candidate_ids: Optional[set[int]] = None,
+    ) -> list[tuple[PersonRecord, float]]:
+        """Search using the secondary identity USearch index (256-dim)."""
+        if self._identity_index is None:
+            return []
+
+        # Normalize and quantize
+        query_norm = np.linalg.norm(query_embedding)
+        if query_norm == 0:
+            return []
+        query_normalized = query_embedding / query_norm
+        query_int8 = np.clip(np.round(query_normalized * 127), -127, 127).astype(np.int8)
+
+        fetch_k = top_k * 10 if candidate_ids else top_k
+        fetch_k = min(fetch_k, len(self._identity_index))
+
+        matches = self._identity_index.search(query_int8, fetch_k)
+
+        results: list[tuple[PersonRecord, float]] = []
+        for person_id, dist in zip(matches.keys, matches.distances):
+            person_id = int(person_id)
+            if candidate_ids and person_id not in candidate_ids:
+                continue
+            similarity = 1.0 - float(dist)
+            record = self._get_record_by_id(person_id)
+            if record is not None:
+                results.append((record, similarity))
+            if len(results) >= top_k:
+                break
+
         return results
 
     def _text_filter_candidates(
@@ -2672,12 +3005,20 @@ class PersonDatabase:
         """Get path to USearch index file."""
         return self._db_path.parent / "people_usearch.bin"
 
+    def _get_identity_index_path(self) -> Path:
+        """Get path to identity USearch index file."""
+        return self._db_path.parent / "people_identity_usearch.bin"
+
     def _load_hnsw_index(self) -> bool:
         """
-        Load pre-built USearch index from disk.
+        Load pre-built USearch indexes from disk.
+
+        Loads both the primary composite index (768-dim) and the secondary
+        identity index (256-dim). The identity index is optional — if missing,
+        fallback search is simply not available.
 
         Returns:
-            True if successfully loaded, False otherwise.
+            True if primary index successfully loaded, False otherwise.
         """
         if self._hnsw_index is not None:
             return True  # Already loaded
@@ -2690,13 +3031,24 @@ class PersonDatabase:
         try:
             from usearch.index import Index
 
-            # Load index (IDs are stored in the index itself)
+            # Load primary composite index
             logger.info(f"Loading USearch index from {index_path.name}...")
             index = Index.restore(str(index_path))
             # USearch doesn't persist expansion_search — restore it for good recall on large indexes
             index.expansion_search = 200
             self._hnsw_index = index
             logger.info(f"Loaded USearch index: {len(index):,} vectors, connectivity={index.connectivity}, ef_search={index.expansion_search}")
+
+            # Load secondary identity index (non-fatal if missing)
+            identity_path = self._get_identity_index_path()
+            if identity_path.exists():
+                identity_index = Index.restore(str(identity_path))
+                identity_index.expansion_search = 200
+                self._identity_index = identity_index
+                logger.info(f"Loaded identity index: {len(identity_index):,} vectors ({identity_index.ndim}-dim)")
+            else:
+                logger.debug(f"Identity index not found: {identity_path} (fallback disabled)")
+
             return True
 
         except Exception as e:
@@ -2839,54 +3191,18 @@ class PersonDatabase:
             "by_source": by_source,
         }
 
-    def get_embeddings_by_ids(self, person_ids: list[int]) -> dict[int, np.ndarray]:
+    def iter_all_for_embedding(self, batch_size: int = 10000) -> Iterator[list[tuple[int, str, str | None, str | None]]]:
         """
-        Fetch float32 embeddings for given person IDs.
+        Yield batches of (person_id, name, role_name, org_name) for all people.
+
+        Used by the index builder to generate composite embeddings on-the-fly.
+        People embeddings are stored only in the USearch index, not in SQLite.
 
         Args:
-            person_ids: List of person IDs
-
-        Returns:
-            Dict mapping person_id to float32 embedding array
-        """
-        conn = self._connect()
-
-        if not person_ids:
-            return {}
-
-        placeholders = ",".join("?" * len(person_ids))
-        cursor = conn.execute(f"""
-            SELECT id, embedding FROM people
-            WHERE id IN ({placeholders}) AND embedding IS NOT NULL
-        """, person_ids)
-
-        result = {}
-        for row in cursor:
-            embedding_blob = row["embedding"]
-            embedding = np.frombuffer(embedding_blob, dtype=np.float32)
-            result[row["id"]] = embedding
-        return result
-
-    def get_embedding_count(self) -> int:
-        """Get count of people with embeddings."""
-        conn = self._connect()
-        cursor = conn.execute("SELECT COUNT(*) FROM people WHERE embedding IS NOT NULL")
-        return cursor.fetchone()[0]
-
-    def get_missing_embedding_ids(self, batch_size: int = 1000) -> Iterator[list[tuple[int, str]]]:
-        """
-        Yield batches of (person_id, embedding_text) tuples for records missing embeddings.
-
-        Embedding text format depends on person type:
-        - Org-defined types (executive, politician, etc.): Name | role | org
-        - Identity-defined types (artist, athlete, etc.): Name | person_type
-        - Unknown type: Name | role | org (fallback)
-
-        Args:
-            batch_size: Number of IDs per batch
+            batch_size: Number of rows per batch
 
         Yields:
-            Lists of (person_id, embedding_text) tuples needing embeddings
+            Lists of (person_id, name, role_name, org_name) tuples
         """
         conn = self._connect()
 
@@ -2894,12 +3210,11 @@ class PersonDatabase:
         while True:
             cursor = conn.execute("""
                 SELECT p.id, p.name, r.name as role_name,
-                       kfo.name as org_name, pt.name as person_type_name
+                       kfo.name as org_name
                 FROM people p
                 LEFT JOIN roles r ON p.known_for_role_id = r.id
                 LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
-                LEFT JOIN people_types pt ON p.person_type_id = pt.id
-                WHERE p.embedding IS NULL AND p.id > ?
+                WHERE p.id > ?
                 ORDER BY p.id
                 LIMIT ?
             """, (last_id, batch_size))
@@ -2909,42 +3224,17 @@ class PersonDatabase:
                 break
 
             results = [
-                (row["id"], format_person_query(
-                    row["name"],
-                    person_type=row["person_type_name"],
-                    role=row["role_name"],
-                    org=row["org_name"],
-                ))
+                (row["id"], row["name"], row["role_name"], row["org_name"])
                 for row in rows
             ]
             yield results
             last_id = results[-1][0]
 
-    def update_embeddings_batch(
-        self,
-        person_ids: list[int],
-        embeddings: np.ndarray,
-    ) -> int:
-        """
-        Update embeddings for existing people.
-
-        Args:
-            person_ids: List of person IDs
-            embeddings: Matrix of float32 embeddings (N x dim)
-
-        Returns:
-            Number of embeddings updated
-        """
+    def get_people_count(self) -> int:
+        """Get total count of people records."""
         conn = self._connect()
-        count = 0
-
-        for person_id, embedding in zip(person_ids, embeddings):
-            fp32_blob = embedding.astype(np.float32).tobytes()
-            conn.execute("UPDATE people SET embedding = ? WHERE id = ?", (fp32_blob, person_id))
-            count += 1
-
-        conn.commit()
-        return count
+        cursor = conn.execute("SELECT COUNT(*) FROM people")
+        return cursor.fetchone()[0]
 
     def get_all_source_ids(self, source: Optional[str] = None) -> set[str]:
         """

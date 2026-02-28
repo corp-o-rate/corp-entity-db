@@ -375,9 +375,9 @@ def db_create_lite(db_path: str, output: Optional[str], verbose: bool):
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def db_repair_embeddings(db_path: Optional[str], batch_size: int, verbose: bool):
     """
-    Generate missing embeddings for organizations in the database.
+    Generate missing embeddings for organizations and people in the database.
 
-    This repairs databases where organizations were imported without embeddings.
+    This repairs databases where records were imported without embeddings.
 
     \b
     Examples:
@@ -387,35 +387,43 @@ def db_repair_embeddings(db_path: Optional[str], batch_size: int, verbose: bool)
     _configure_logging(verbose)
 
     from corp_entity_db import OrganizationDatabase, CompanyEmbedder
+    from corp_entity_db.store import (
+        _get_shared_connection,
+        build_people_composite_index,
+        build_people_identity_index,
+    )
 
-    # readonly=False for write operations (embedding repair)
     db_path_obj = _resolve_db_path(db_path)
-    database = OrganizationDatabase(db_path=db_path_obj, readonly=False)
     embedder = CompanyEmbedder()
 
-    # Check how many need repair
-    missing_count = database.get_missing_embedding_count()
-    if missing_count == 0:
-        click.echo("All organizations have embeddings. Nothing to repair.")
-        database.close()
-        return
+    # --- Organizations (embeddings stored in DB) ---
+    org_db = OrganizationDatabase(db_path=db_path_obj, readonly=False)
+    org_missing = org_db.get_missing_embedding_count()
+    if org_missing == 0:
+        click.echo("All organizations have embeddings.", err=True)
+    else:
+        click.echo(f"Found {org_missing:,} organizations without embeddings.", err=True)
+        count = 0
+        for batch in org_db.get_missing_embedding_ids(batch_size=batch_size):
+            ids = [item[0] for item in batch]
+            names = [item[1] for item in batch]
+            embeddings = embedder.embed_batch(names)
+            org_db.update_embeddings_batch(ids, embeddings)
+            count += len(ids)
+            click.echo(f"  Repaired {count:,} / {org_missing:,} org embeddings...", err=True)
+        click.echo(f"Repaired {count:,} org embeddings.", err=True)
+    org_db.close()
 
-    click.echo(f"Found {missing_count:,} organizations without embeddings.", err=True)
-    click.echo("Generating embeddings...", err=True)
+    # --- People (composite embeddings → USearch index only) ---
+    click.echo("Rebuilding people composite USearch index...", err=True)
+    conn = _get_shared_connection(db_path_obj, readonly=True)
+    count = build_people_composite_index(conn, embedder)
+    click.echo(f"People USearch index rebuilt: {count:,} composite vectors.", err=True)
 
-    # Process in batches
-    count = 0
-    for batch in database.get_missing_embedding_ids(batch_size=batch_size):
-        ids = [item[0] for item in batch]
-        names = [item[1] for item in batch]
-
-        embeddings = embedder.embed_batch(names)
-        database.update_embeddings_batch(ids, embeddings)
-        count += len(ids)
-        click.echo(f"Repaired {count:,} / {missing_count:,} embeddings...", err=True)
-
-    click.echo(f"\nRepaired {count:,} embeddings successfully.", err=True)
-    database.close()
+    # --- People identity index ---
+    click.echo("Rebuilding people identity USearch index...", err=True)
+    count = build_people_identity_index(conn, embedder)
+    click.echo(f"People identity index rebuilt: {count:,} vectors.", err=True)
 
 
 @click.command("build-index")
@@ -425,8 +433,9 @@ def db_repair_embeddings(db_path: Optional[str], batch_size: int, verbose: bool)
 @click.option("--ef-search", type=int, default=200, help="Search quality parameter (default 200)")
 @click.option("--people/--no-people", default=True, help="Build USearch index for people")
 @click.option("--orgs/--no-orgs", default=True, help="Build USearch index for organizations")
+@click.option("--identity-only", is_flag=True, help="Build only the people identity index (skip composite)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_search: int, people: bool, orgs: bool, verbose: bool):
+def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_search: int, people: bool, orgs: bool, identity_only: bool, verbose: bool):
     """
     Build USearch index for fast approximate nearest neighbor search.
 
@@ -445,13 +454,17 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
         corp-entity-db build-index --M 16              # Faster build, less memory
         corp-entity-db build-index --M 64 --ef-construction 400   # Highest quality
         corp-entity-db build-index --no-orgs           # People only
+        corp-entity-db build-index --identity-only     # Identity index only (skip composite)
     """
     _configure_logging(verbose)
 
     from corp_entity_db.store import (
         _get_shared_connection,
         build_hnsw_index,
+        build_people_composite_index,
+        build_people_identity_index,
     )
+    from corp_entity_db.embeddings import CompanyEmbedder
 
     db_path_obj = _resolve_db_path(db_path)
 
@@ -461,26 +474,67 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
     click.echo(f"Database: {db_path_obj}", err=True)
     click.echo(f"Parameters: M={m}, ef_construction={ef_construction}, ef_search={ef_search}", err=True)
 
-    # Open read-only connection (we only read embeddings)
     conn = _get_shared_connection(db_path_obj, readonly=True)
 
-    if people:
-        click.echo("\n--- Building USearch index for people ---", err=True)
+    if identity_only:
+        # Only build the identity index, skip everything else
+        click.echo("\n--- Building identity USearch index for people ---", err=True)
+        embedder = CompanyEmbedder()
 
-        def people_progress(done: int, total: int) -> None:
-            click.echo(f"  Loaded {done:,}/{total:,} vectors...", err=True)
+        def identity_only_progress(done: int, total: int) -> None:
+            click.echo(f"  Generated + indexed {done:,}/{total:,} identity vectors...", err=True)
 
         try:
-            count = build_hnsw_index(
-                conn, "people",
+            count = build_people_identity_index(
+                conn, embedder,
+                M=m,
+                ef_construction=ef_construction,
+                ef_search=ef_search,
+                progress_callback=identity_only_progress,
+            )
+            click.echo(f"People identity index: {count:,} vectors indexed", err=True)
+        except Exception as e:
+            raise click.ClickException(f"People identity index build failed: {e}")
+
+        click.echo("\nUSearch index build complete!", err=True)
+        return
+
+    if people:
+        click.echo("\n--- Building composite USearch index for people ---", err=True)
+
+        embedder = CompanyEmbedder()
+
+        def people_progress(done: int, total: int) -> None:
+            click.echo(f"  Generated + indexed {done:,}/{total:,} vectors...", err=True)
+
+        try:
+            count = build_people_composite_index(
+                conn, embedder,
                 M=m,
                 ef_construction=ef_construction,
                 ef_search=ef_search,
                 progress_callback=people_progress,
             )
-            click.echo(f"People USearch index: {count:,} vectors indexed", err=True)
+            click.echo(f"People USearch index: {count:,} composite vectors indexed", err=True)
         except Exception as e:
             raise click.ClickException(f"People USearch index build failed: {e}")
+
+        click.echo("\n--- Building identity USearch index for people ---", err=True)
+
+        def identity_progress(done: int, total: int) -> None:
+            click.echo(f"  Generated + indexed {done:,}/{total:,} identity vectors...", err=True)
+
+        try:
+            count = build_people_identity_index(
+                conn, embedder,
+                M=m,
+                ef_construction=ef_construction,
+                ef_search=ef_search,
+                progress_callback=identity_progress,
+            )
+            click.echo(f"People identity index: {count:,} vectors indexed", err=True)
+        except Exception as e:
+            raise click.ClickException(f"People identity index build failed: {e}")
 
     if orgs:
         click.echo("\n--- Building USearch index for organizations ---", err=True)
@@ -507,23 +561,26 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
     """
     Standard post-import steps: generate embeddings, build USearch indexes, VACUUM.
 
+    Organizations: generate missing embeddings → store in DB → build index from DB.
+    People: generate composite embeddings on-the-fly → build index directly (no DB storage).
+
     Called automatically after imports or manually via `db post-import`.
     """
     import sqlite3
 
     from corp_entity_db import OrganizationDatabase, CompanyEmbedder
     from corp_entity_db.store import (
-        get_person_database,
         _get_shared_connection,
         build_hnsw_index,
+        build_people_composite_index,
+        build_people_identity_index,
     )
 
     embedder = None  # Lazy load
 
-    # --- Step 1: Generate embeddings for new records ---
-    click.echo("\n=== Step 1: Generate embeddings for new records ===", err=True)
-
+    # --- Step 1: Generate org embeddings for new records ---
     if orgs:
+        click.echo("\n=== Step 1: Generate org embeddings ===", err=True)
         org_db = OrganizationDatabase(db_path=db_path_obj, readonly=False)
 
         org_generated = 0
@@ -549,40 +606,33 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
 
         org_db.close()
 
-    if people:
-        person_db = get_person_database(db_path=db_path_obj, readonly=False)
-
-        person_generated = 0
-        for batch in person_db.get_missing_embedding_ids(batch_size=batch_size):
-            if not batch:
-                continue
-            if embedder is None:
-                click.echo("  Loading embedding model...", err=True)
-                embedder = CompanyEmbedder()
-            for i in range(0, len(batch), embed_batch_size):
-                sub_batch = batch[i:i + embed_batch_size]
-                ids = [item[0] for item in sub_batch]
-                texts = [item[1] for item in sub_batch]
-                fp32_batch = embedder.embed_batch(texts, batch_size=embed_batch_size)
-                person_db.update_embeddings_batch(ids, fp32_batch)
-                person_generated += len(ids)
-                if person_generated % 10000 == 0:
-                    click.echo(f"  Generated {person_generated:,} person embeddings...", err=True)
-        if person_generated:
-            click.echo(f"  Generated {person_generated:,} person embeddings", err=True)
-        else:
-            click.echo("  People: all embeddings up to date", err=True)
-
-        person_db.close()
-
     # --- Step 2: Build USearch indexes ---
     click.echo("\n=== Step 2: Build USearch indexes ===", err=True)
 
     conn = _get_shared_connection(db_path_obj, readonly=True)
 
     if people:
-        count = build_hnsw_index(conn, "people")
-        click.echo(f"  People USearch index: {count:,} vectors", err=True)
+        if embedder is None:
+            click.echo("  Loading embedding model...", err=True)
+            embedder = CompanyEmbedder()
+
+        def people_progress(done: int, total: int) -> None:
+            click.echo(f"  People: {done:,}/{total:,} vectors...", err=True)
+
+        count = build_people_composite_index(
+            conn, embedder, embed_batch_size=embed_batch_size,
+            progress_callback=people_progress,
+        )
+        click.echo(f"  People USearch index: {count:,} composite vectors", err=True)
+
+        def identity_progress(done: int, total: int) -> None:
+            click.echo(f"  Identity: {done:,}/{total:,} vectors...", err=True)
+
+        count = build_people_identity_index(
+            conn, embedder,
+            progress_callback=identity_progress,
+        )
+        click.echo(f"  People identity index: {count:,} vectors", err=True)
 
     if orgs:
         count = build_hnsw_index(conn, "organizations")

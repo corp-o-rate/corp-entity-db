@@ -33,6 +33,8 @@ class SearchPeopleRequest(BaseModel):
     query: str
     limit: int = 10
     person_type: Optional[str] = None
+    role: Optional[str] = None
+    org: Optional[str] = None
 
 
 class SearchRolesRequest(BaseModel):
@@ -187,22 +189,25 @@ def search_organizations(req: SearchRequest):
 
 @app.post("/search-people")
 def search_people(req: SearchPeopleRequest):
-    """Search people by name."""
+    """Search people by name with composite embeddings (name + role + org)."""
     t0 = time.time()
-    logger.info(f"Search people: '{req.query}' (limit={req.limit}, person_type={req.person_type})")
-
-    from .store import format_person_query
+    logger.info(f"Search people: '{req.query}' (limit={req.limit}, role={req.role}, org={req.org})")
 
     embedder = _get_embedder()
     person_db = _get_person_db()
 
-    embed_query = format_person_query(req.query, person_type=req.person_type)
-    query_embedding = embedder.embed(embed_query)
+    query_embedding = embedder.embed_composite_person(req.query, role=req.role, org=req.org)
+
+    # Identity embedding for fallback (name + type if provided)
+    from .store import format_person_query
+    identity_text = format_person_query(req.query, person_type=req.person_type)
+    identity_embedding = embedder.embed_for_identity_index(identity_text)
 
     results = person_db.search(
         query_embedding,
         top_k=req.limit,
         query_text=req.query,
+        identity_query_embedding=identity_embedding,
     )
 
     elapsed = time.time() - t0
@@ -271,13 +276,15 @@ def resolve_entity(req: ResolveRequest):
         logger.info(f"Resolve completed in {elapsed:.3f}s: {'found' if result else 'not found'}")
         return result.model_dump() if result else None
     else:
-        # Person resolution: find best match via embedding search
-        from .store import format_person_query
+        # Person resolution: find best match via composite + identity embedding search
         embedder = _get_embedder()
         person_db = _get_person_db()
-        embed_query = format_person_query(req.name, person_type=req.person_type)
-        query_embedding = embedder.embed(embed_query)
-        results = person_db.search(query_embedding, top_k=1, query_text=req.name)
+        query_embedding = embedder.embed_composite_person(req.name, role=None, org=None)
+        identity_embedding = embedder.embed_for_identity_index(req.name)
+        results = person_db.search(
+            query_embedding, top_k=1, query_text=req.name,
+            identity_query_embedding=identity_embedding,
+        )
         elapsed = time.time() - t0
         if results:
             record, score = results[0]

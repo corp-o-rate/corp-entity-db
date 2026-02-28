@@ -54,7 +54,8 @@ uv publish                     # Publish to PyPI (requires credentials)
 ```bash
 corp-entity-db search "Microsoft"              # Search organizations (USearch HNSW)
 corp-entity-db search "Microsoft" --hybrid     # Hybrid text + embeddings search
-corp-entity-db search-people "Tim Cook"        # Search people
+corp-entity-db search-people "Tim Cook"        # Search people (composite embeddings)
+corp-entity-db search-people "Tim Cook" --role CEO --org Apple  # Constrained composite search
 corp-entity-db search-roles "CEO"              # Search roles
 corp-entity-db search-locations "California"   # Search locations
 corp-entity-db status                          # Show database statistics
@@ -76,7 +77,8 @@ corp-entity-db import-wikidata-dump --download --limit 50000
 # Database management
 corp-entity-db canonicalize                    # Link equivalent records across sources
 corp-entity-db post-import                     # Run after any import: embeddings + USearch index + VACUUM
-corp-entity-db build-index                     # Build USearch HNSW index for fast ANN search
+corp-entity-db build-index                     # Build all USearch HNSW indexes
+corp-entity-db build-index --identity-only     # Build only the people identity index
 corp-entity-db repair-embeddings               # Generate missing embeddings
 corp-entity-db migrate-embeddings              # Migrate from legacy vec0 tables to embedding column
 corp-entity-db download                        # Download lite version + USearch indexes (default)
@@ -109,18 +111,21 @@ The frontend can connect to the entity database via two backends (configured by 
 
 ### Database Classes
 - `OrganizationDatabase` - Search and manage organizations
-- `PersonDatabase` - Search and manage people
+- `PersonDatabase` - Search and manage people (composite embedding search)
 - `RolesDatabase` - Search roles/positions
 - `LocationsDatabase` - Search locations
-- `CompanyEmbedder` - Generate embeddings using google/embeddinggemma-300m (300M params)
+- `CompanyEmbedder` - Generate embeddings using google/embeddinggemma-300m (300M params), including composite person embeddings and identity index embeddings
 - `OrganizationResolver` - Resolve organization names to canonical records
 - `Canonicalizer` - Link equivalent records across data sources
 
 ### Database Schema
 - Schema version: v3 with normalized FK references (INTEGER FKs replace TEXT enums)
-- Variants: full (`entities-v3.db`), lite (`entities-v3-lite.db` - drops embedding column, uses USearch only)
+- Variants: full (`entities-v3.db`), lite (`entities-v3-lite.db` - drops org embedding column, uses USearch only)
 - Default DB path: `~/.cache/corp-extractor/entities-v2.db` (symlinked to v3)
-- USearch indexes: `people_usearch.bin`, `organizations_usearch.bin` (same dir as DB)
+- USearch indexes: `people_usearch.bin`, `people_identity_usearch.bin`, `organizations_usearch.bin` (same dir as DB)
+- People embeddings exist **only** in USearch indexes, never in the SQLite `people` table — they are generated on-the-fly during index building
+- Two people indexes: primary composite (768-dim, name|role|org segments) and secondary identity (256-dim Matryoshka, `"{name}, a {type_label}"`)
+- Organization embeddings are stored as float32 BLOBs in the `organizations` table (full DB) and also in USearch index
 - Tables: `organizations`, `people`, `roles`, `locations`, `location_types`, `db_info`
 
 ### Organization EntityType Classification
@@ -141,7 +146,9 @@ The frontend can connect to the entity database via two backends (configured by 
 | `media` | Studios, record labels | Warner Bros |
 | `sports` | Sports clubs/teams | Manchester United |
 | `political_party` | Political parties | Democratic Party |
+| `religious` | Religious organizations | Vatican, churches |
 | `trade_union` | Labor unions | AFL-CIO |
+| `unknown` | Unclassified organizations | — |
 
 ### Person Types
 
@@ -161,6 +168,7 @@ The frontend can connect to the entity database via two backends (configured by 
 | `journalist` | Reporters, news presenters | Anderson Cooper |
 | `entrepreneur` | Founders, business owners | Mark Zuckerberg |
 | `activist` | Advocates, campaigners | Greta Thunberg |
+| `unknown` | Unclassified people | — |
 
 ### Data Sources
 
@@ -185,8 +193,11 @@ The default install (`pip install corp-entity-db`) includes only search dependen
 ### Key Technical Notes
 - USearch `expansion_search=200` must be set after `Index.restore()` (default resets to 64)
 - SQLite pragmas: 256MB mmap, 500MB page cache, WAL journal mode
-- Embeddings stored as float32 BLOB directly in organizations/people tables (NOT NULL in full DB)
-- Lite database ships without embedding column — uses USearch HNSW indexes for ANN search
+- **Organization embeddings**: stored as float32 BLOB in `organizations` table (NOT NULL in full DB); also indexed in USearch
+- **People embeddings**: stored **only** in USearch HNSW indexes, NOT in SQLite — generated on-the-fly during index building
+- **Primary people index** (`people_usearch.bin`): 768-dim composite embeddings (name|role|org as 3×256-dim segments). Name, role, and org are embedded separately, independently L2-normalized (Matryoshka truncation), weighted (name=8, role=1, org=4), and concatenated. This gives AND-style matching where a bad match on org cannot be compensated by a good match on role. Built by `build_people_composite_index()`.
+- **Secondary identity index** (`people_identity_usearch.bin`): 256-dim Matryoshka-truncated embeddings of `format_person_query()` text (e.g. `"Taylor Swift, an artist"`, `"Tim Cook, a CEO of Apple"`). Used as fallback when primary composite scores are below threshold (0.75). Built by `build_people_identity_index()`.
+- Lite database ships without org embedding column — uses USearch HNSW indexes for ANN search
 - Int8 quantization for USearch is computed on-the-fly during index build (not stored)
 - Hybrid search: text filtering + USearch embeddings
 - Embedding model: `google/embeddinggemma-300m` (300M params)
@@ -195,6 +206,8 @@ The default install (`pip install corp-entity-db`) includes only search dependen
 - Server default port: 8222
 - Person records include `birth_date` and `death_date` fields, with `is_historic` property for deceased individuals
 - Canonicalization priority: wikidata > sec_edgar > companies_house
+- People search uses dual-index strategy: primary composite index searched first, identity index as fallback when scores < 0.75 threshold
+- People search performance: 82.5% acc@1, 91.4% acc@20 on 280 queries across 14 person types, 60-80ms per query after model warmup (identity fallback improves accuracy for identity-defined types like artists, athletes, activists)
 
 ### Python Library API
 
@@ -207,10 +220,21 @@ matches = db.search("Microsoft", limit=10)
 for match in matches:
     print(f"{match.record.name} ({match.record.entity_type}) - score: {match.score:.3f}")
 
-# Search people
+# Search people (composite embeddings + identity fallback)
 from corp_entity_db import PersonDatabase, get_person_database
+from corp_entity_db.store import format_person_query
 person_db = get_person_database()
-matches = person_db.search("Tim Cook", limit=5)
+embedder = CompanyEmbedder()
+
+# Org-defined person: composite embedding is authoritative
+query_emb = embedder.embed_composite_person("Tim Cook", role="CEO", org="Apple")
+identity_emb = embedder.embed_for_identity_index(format_person_query("Tim Cook", person_type="executive"))
+matches = person_db.search(query_emb, top_k=5, identity_query_embedding=identity_emb)
+
+# Identity-defined person: composite scores low, identity fallback kicks in
+query_emb = embedder.embed_composite_person("Taylor Swift")
+identity_emb = embedder.embed_for_identity_index(format_person_query("Taylor Swift", person_type="artist"))
+matches = person_db.search(query_emb, top_k=5, identity_query_embedding=identity_emb)
 
 # Resolve organization names
 from corp_entity_db import OrganizationResolver, get_organization_resolver

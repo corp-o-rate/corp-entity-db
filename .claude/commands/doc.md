@@ -27,6 +27,12 @@ The embedding database documentation names approximate sizes and other info. Ple
 
 To get the current sizes and other database information.
 
+### Accuracy
+
+State on the website and in the README.md the current accuracy of the performance tests. Make sure any reference to the performance of the API (i.e. speed in milliseconds) is tied to the results of running (Don't use the warmup, first two or three values!!!):
+
+`uv run corp-entity-db search-people-perf-test --top-k=20 --for-llm`
+
 ## Process
 
 $ARGUMENTS$

@@ -33,8 +33,9 @@ corp-entity-db download
 corp-entity-db search "Microsoft"
 corp-entity-db search "Microsoft" --hybrid
 
-# Search people
+# Search people (composite embeddings: name + role + org)
 corp-entity-db search-people "Tim Cook"
+corp-entity-db search-people "Tim Cook" --role CEO --org Apple
 
 # Show database statistics
 corp-entity-db status
@@ -43,12 +44,22 @@ corp-entity-db status
 ## Python API
 
 ```python
-from corp_entity_db import OrganizationDatabase, get_database_path
+from corp_entity_db import OrganizationDatabase, CompanyEmbedder, get_database_path
 
+# Search organizations
 db = OrganizationDatabase(get_database_path())
-matches = db.search("Microsoft", limit=10)
-for match in matches:
-    print(f"{match.record.name} ({match.record.entity_type}) - score: {match.score:.3f}")
+embedder = CompanyEmbedder()
+matches = db.search(embedder.embed("Microsoft"), top_k=10)
+for record, score in matches:
+    print(f"{record.name} ({record.entity_type}) - score: {score:.3f}")
+
+# Search people with composite embeddings + identity fallback
+from corp_entity_db import PersonDatabase, get_person_database
+from corp_entity_db.store import format_person_query
+person_db = get_person_database()
+query_emb = embedder.embed_composite_person("Tim Cook", role="CEO", org="Apple")
+identity_emb = embedder.embed_for_identity_index(format_person_query("Tim Cook", person_type="executive"))
+matches = person_db.search(query_emb, top_k=5, identity_query_embedding=identity_emb)
 ```
 
 ## Server Mode
@@ -64,27 +75,36 @@ corp-entity-db serve --port 9000      # Custom port
 
 | Source | Description | Scale |
 |--------|-------------|-------|
-| Companies House | UK registered companies + officers | ~5.5M orgs, ~27.5M people |
-| Wikidata | Organizations & notable people | ~1.7M orgs, ~39.4M people |
+| Wikidata | Organizations & notable people | ~1.5M orgs, ~13.2M people |
 | GLEIF | Legal Entity Identifier records | ~2.6M orgs |
 | SEC Edgar | US public company filers & officers | ~73K orgs |
-| **Total** | | **~9.9M orgs, ~66.9M people** |
+| Companies House | UK registered companies | ~5.5M orgs |
 
 ## Embedding Architecture
 
-Embeddings are stored as float32 BLOBs directly in the `organizations` and `people` tables. The full database enforces NOT NULL on the embedding column. Int8 scalar quantization is computed on-the-fly during USearch HNSW index building and is not stored separately.
+**Organizations**: Embeddings are stored as 768-dim float32 BLOBs in the `organizations` table. The full database enforces NOT NULL on the embedding column. Int8 scalar quantization is computed on-the-fly during USearch HNSW index building and is not stored separately.
+
+**People (Dual-Index Search)**: People use two USearch HNSW indexes, both generated on-the-fly during index building (no embeddings stored in SQLite):
+
+- **Primary composite index** (`people_usearch.bin`, 768-dim): Name, role, and organization are embedded as separate 256-dim vectors using Matryoshka truncation, independently L2-normalized, weighted (name=8, role=1, org=4), and concatenated. This gives AND-style matching: a poor match on organization cannot be compensated by a good match on name, enabling precise queries like "find the CEO named Tim Cook at Apple." Built by `build_people_composite_index()`.
+- **Secondary identity index** (`people_identity_usearch.bin`, 256-dim): Natural language descriptions (e.g. "Taylor Swift, an artist", "Tim Cook, a CEO of Apple") embedded with Matryoshka truncation to 256 dims. Consulted as fallback when composite scores are below threshold (0.75). This improves accuracy for identity-defined people (artists, athletes, media, activists) who lack role/org context and would otherwise waste 512 of 768 composite dims as zeros. Built by `build_people_identity_index()`.
+
+Search accuracy: 82.5% acc@1, 91.4% acc@20 on 280 queries across 14 person types (60-80ms per query after model warmup), with identity fallback improving accuracy for identity-defined types.
 
 ## Database Variants
 
-- **Lite** (default download): Embedding column dropped, uses pre-built USearch HNSW indexes for search
-- **Full**: Includes float32 embedding BLOBs in main tables
+- **Lite** (default download): Organization embedding column dropped, uses pre-built USearch HNSW indexes for search
+- **Full**: Includes float32 embedding BLOBs in the organizations table
+
+In both variants, people embeddings exist only in USearch index files (`people_usearch.bin` and `people_identity_usearch.bin`), never in SQLite.
 
 ## Database Management
 
 ```bash
 corp-entity-db post-import             # Generate embeddings + build USearch indexes + VACUUM
-corp-entity-db build-index             # Rebuild USearch HNSW indexes only
-corp-entity-db repair-embeddings       # Generate missing embeddings
+corp-entity-db build-index             # Rebuild all USearch HNSW indexes
+corp-entity-db build-index --identity-only  # Rebuild only the people identity index
+corp-entity-db repair-embeddings       # Generate missing embeddings + rebuild indexes
 corp-entity-db migrate-embeddings      # Migrate from legacy vec0 tables to embedding column
 ```
 

@@ -121,6 +121,151 @@ class CompanyEmbedder:
         )
         return embeddings.astype(np.float32)
 
+    def embed_composite_person(
+        self,
+        name: str,
+        role: str | None,
+        org: str | None,
+        weights: tuple[float, float, float] = (8.0, 1.0, 4.0),
+        segment_dim: int = 256,
+    ) -> np.ndarray:
+        """
+        Embed a person as a composite 768-dim vector from three 256-dim segments.
+
+        Each segment is the first `segment_dim` dims of the full embedding,
+        scaled by the corresponding weight, then the full vector is L2-normalized.
+
+        Args:
+            name: Person name
+            role: Role/job title (None → zero vector segment)
+            org: Organization name (None → zero vector segment)
+            weights: (name_weight, role_weight, org_weight)
+            segment_dim: Dimensions per segment (default 256, 3×256=768)
+
+        Returns:
+            L2-normalized float32 vector of shape (segment_dim * 3,)
+        """
+        self._load_model()
+
+        # Collect texts to embed (deduplicate)
+        texts_to_embed: list[str] = [name]
+        if role:
+            texts_to_embed.append(role)
+        if org:
+            texts_to_embed.append(org)
+
+        raw = self._model.encode(
+            texts_to_embed,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=False,
+        ).astype(np.float32)
+
+        # Extract + L2-normalize each segment independently (Matryoshka requirement),
+        # then scale by weight so weights control relative importance in cosine sim.
+        def _normed_segment(vec: np.ndarray) -> np.ndarray:
+            seg = vec[:segment_dim].copy()
+            n = np.linalg.norm(seg)
+            if n > 0:
+                seg /= n
+            return seg
+
+        name_seg = _normed_segment(raw[0]) * weights[0]
+        idx = 1
+        if role:
+            role_seg = _normed_segment(raw[idx]) * weights[1]
+            idx += 1
+        else:
+            role_seg = np.zeros(segment_dim, dtype=np.float32)
+        if org:
+            org_seg = _normed_segment(raw[idx]) * weights[2]
+        else:
+            org_seg = np.zeros(segment_dim, dtype=np.float32)
+
+        composite = np.concatenate([name_seg, role_seg, org_seg])
+        norm = np.linalg.norm(composite)
+        if norm > 0:
+            composite /= norm
+        return composite.astype(np.float32)
+
+    def embed_composite_person_batch(
+        self,
+        names: list[str],
+        roles: list[str | None],
+        orgs: list[str | None],
+        weights: tuple[float, float, float] = (8.0, 1.0, 4.0),
+        segment_dim: int = 256,
+        batch_size: int = 192,
+    ) -> np.ndarray:
+        """
+        Batch-embed people as composite 768-dim vectors.
+
+        Deduplicates all unique texts across names/roles/orgs, embeds once,
+        then assembles composite vectors.
+
+        Args:
+            names: List of person names
+            roles: List of role strings (None for missing)
+            orgs: List of org strings (None for missing)
+            weights: (name_weight, role_weight, org_weight)
+            segment_dim: Dimensions per segment
+            batch_size: Embedding batch size
+
+        Returns:
+            (N, segment_dim*3) float32 array, L2-normalized
+        """
+        self._load_model()
+        n = len(names)
+
+        # Collect all unique texts
+        unique_texts: dict[str, int] = {}
+        text_list: list[str] = []
+        for text in names:
+            if text not in unique_texts:
+                unique_texts[text] = len(text_list)
+                text_list.append(text)
+        for text in roles:
+            if text is not None and text not in unique_texts:
+                unique_texts[text] = len(text_list)
+                text_list.append(text)
+        for text in orgs:
+            if text is not None and text not in unique_texts:
+                unique_texts[text] = len(text_list)
+                text_list.append(text)
+
+        logger.info(f"Composite person batch: {n} people, {len(text_list)} unique texts to embed")
+
+        # Embed all unique texts at once
+        raw = self._model.encode(
+            text_list,
+            convert_to_numpy=True,
+            show_progress_bar=len(text_list) > 100,
+            batch_size=batch_size,
+            normalize_embeddings=False,
+        ).astype(np.float32)
+
+        # Truncate to segment_dim and L2-normalize each segment independently
+        # (Matryoshka requirement: truncated dims must be renormalized)
+        raw_truncated = raw[:, :segment_dim].copy()
+        norms = np.linalg.norm(raw_truncated, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        raw_truncated /= norms
+
+        zero_seg = np.zeros(segment_dim, dtype=np.float32)
+        out = np.empty((n, segment_dim * 3), dtype=np.float32)
+
+        for i in range(n):
+            name_seg = raw_truncated[unique_texts[names[i]]] * weights[0]
+            role_seg = raw_truncated[unique_texts[roles[i]]] * weights[1] if roles[i] is not None else zero_seg
+            org_seg = raw_truncated[unique_texts[orgs[i]]] * weights[2] if orgs[i] is not None else zero_seg
+            out[i] = np.concatenate([name_seg, role_seg, org_seg])
+
+        # L2-normalize each row
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        out /= norms
+        return out
+
     def quantize_to_int8(self, embedding: np.ndarray) -> np.ndarray:
         """
         Quantize L2-normalized float32 embedding to int8.
@@ -165,6 +310,48 @@ class CompanyEmbedder:
         fp32 = self.embed_batch(texts, batch_size=batch_size)
         int8 = np.array([self.quantize_to_int8(e) for e in fp32])
         return fp32, int8
+
+    def embed_for_identity_index(self, text: str, dim: int = 256) -> np.ndarray:
+        """
+        Embed text for the identity index: full embed → truncate to `dim` → L2-normalize.
+
+        Uses Matryoshka truncation: the first `dim` dimensions of the full embedding
+        are extracted and re-normalized to produce a valid unit vector.
+
+        Args:
+            text: Text to embed (e.g. "Taylor Swift, an artist")
+            dim: Target dimension (default 256)
+
+        Returns:
+            L2-normalized float32 vector of shape (dim,)
+        """
+        full = self.embed(text)  # already L2-normalized at full dim
+        seg = full[:dim].copy()
+        n = np.linalg.norm(seg)
+        if n > 0:
+            seg /= n
+        return seg.astype(np.float32)
+
+    def embed_for_identity_index_batch(
+        self, texts: list[str], dim: int = 256, batch_size: int = 192
+    ) -> np.ndarray:
+        """
+        Batch-embed texts for the identity index: full embed → truncate → L2-normalize.
+
+        Args:
+            texts: List of texts to embed
+            dim: Target dimension (default 256)
+            batch_size: Embedding batch size
+
+        Returns:
+            (N, dim) float32 array, L2-normalized
+        """
+        full = self.embed_batch(texts, batch_size=batch_size)  # (N, full_dim)
+        truncated = full[:, :dim].copy()
+        norms = np.linalg.norm(truncated, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        truncated /= norms
+        return truncated.astype(np.float32)
 
     def similarity(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
         """

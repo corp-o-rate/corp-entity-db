@@ -219,7 +219,6 @@ def db_import_sec_officers(db_path: Optional[str], start_year: int, end_year: Op
     _configure_logging(verbose)
 
     from corp_entity_db.store import get_person_database, get_database
-    from corp_entity_db.embeddings import CompanyEmbedder
     from corp_entity_db.importers.sec_form4 import SecForm4Importer
 
     # Default database path
@@ -231,9 +230,9 @@ def db_import_sec_officers(db_path: Optional[str], start_year: int, end_year: Op
         click.echo("Resuming from saved progress...", err=True)
 
     # Initialize components (readonly=False for import operations)
+    # Embeddings are generated during post-import (composite USearch index)
     database = get_person_database(db_path=db_path_obj, readonly=False)
     org_database = get_database(db_path=db_path_obj, readonly=False)
-    embedder = CompanyEmbedder()
     importer = SecForm4Importer()
 
     # Import records in batches
@@ -269,18 +268,14 @@ def db_import_sec_officers(db_path: Optional[str], start_year: int, end_year: Op
         records.append(record)
 
         if len(records) >= batch_size:
-            embedding_texts = [r.get_embedding_text() for r in records]
-            embeddings = embedder.embed_batch(embedding_texts)
-            database.insert_batch(records, embeddings)
+            database.insert_batch(records)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
 
     # Final batch
     if records:
-        embedding_texts = [r.get_embedding_text() for r in records]
-        embeddings = embedder.embed_batch(embedding_texts)
-        database.insert_batch(records, embeddings)
+        database.insert_batch(records)
         count += len(records)
 
     if skip_existing and skipped_existing > 0:
@@ -318,7 +313,6 @@ def db_import_ch_officers(file_path: str, db_path: Optional[str], limit: Optiona
     _configure_logging(verbose)
 
     from corp_entity_db.store import get_person_database, get_database
-    from corp_entity_db.embeddings import CompanyEmbedder
     from corp_entity_db.importers.companies_house_officers import CompaniesHouseOfficersImporter
 
     # Default database path
@@ -329,9 +323,9 @@ def db_import_ch_officers(file_path: str, db_path: Optional[str], limit: Optiona
         click.echo("Resuming from saved progress...", err=True)
 
     # Initialize components (readonly=False for import operations)
+    # Embeddings are generated during post-import (composite USearch index)
     database = get_person_database(db_path=db_path_obj, readonly=False)
     org_database = get_database(db_path=db_path_obj, readonly=False)
-    embedder = CompanyEmbedder()
     importer = CompaniesHouseOfficersImporter()
 
     # Import records in batches
@@ -367,18 +361,14 @@ def db_import_ch_officers(file_path: str, db_path: Optional[str], limit: Optiona
         records.append(record)
 
         if len(records) >= batch_size:
-            embedding_texts = [r.get_embedding_text() for r in records]
-            embeddings = embedder.embed_batch(embedding_texts)
-            database.insert_batch(records, embeddings)
+            database.insert_batch(records)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
 
     # Final batch
     if records:
-        embedding_texts = [r.get_embedding_text() for r in records]
-        embeddings = embedder.embed_batch(embedding_texts)
-        database.insert_batch(records, embeddings)
+        database.insert_batch(records)
         count += len(records)
 
     if skip_existing and skipped_existing > 0:
@@ -498,7 +488,6 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
     _configure_logging(verbose)
 
     from corp_entity_db.store import get_person_database, get_database
-    from corp_entity_db.embeddings import CompanyEmbedder
     from corp_entity_db.importers.wikidata_people import WikidataPeopleImporter
 
     # Default database path
@@ -507,9 +496,9 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
     click.echo(f"Importing Wikidata people to {db_path_obj}...", err=True)
 
     # Initialize components (readonly=False for import operations)
+    # Embeddings are generated during post-import (composite USearch index)
     database = get_person_database(db_path=db_path_obj, readonly=False)
     org_database = get_database(db_path=db_path_obj, readonly=False)
-    embedder = CompanyEmbedder()
     importer = WikidataPeopleImporter(batch_size=batch_size)
 
     count = 0
@@ -532,9 +521,7 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
             records.append(record)
 
             if len(records) >= batch_size:
-                embedding_texts = [r.get_embedding_text() for r in records]
-                embeddings = embedder.embed_batch(embedding_texts)
-                database.insert_batch(records, embeddings)
+                database.insert_batch(records)
                 count += len(records)
 
                 click.echo(f"  Imported {count} people...", err=True)
@@ -542,9 +529,7 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
 
         # Final batch
         if records:
-            embedding_texts = [r.get_embedding_text() for r in records]
-            embeddings = embedder.embed_batch(embedding_texts)
-            database.insert_batch(records, embeddings)
+            database.insert_batch(records)
             count += len(records)
 
         if skip_existing and skipped_existing > 0:
@@ -587,14 +572,12 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
                         if org_id is not None:
                             person.known_for_org_id = org_id
 
-                    # Update the record with new role/org/dates and re-embed
-                    new_embedding_text = person.get_embedding_text()
-                    new_embedding = embedder.embed(new_embedding_text)
+                    # Update the record with new role/org/dates
+                    # Embeddings are regenerated during post-import (composite USearch index)
                     if database.update_role_org(
                         person.source, person.source_id,
                         person.known_for_role,
                         person.known_for_org_id,
-                        new_embedding,
                         person.from_date, person.to_date,
                     ):
                         updated += 1

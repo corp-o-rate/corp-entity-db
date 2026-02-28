@@ -28,7 +28,7 @@ DEFAULT_DB_FULL_FILENAME = f"entities-v{DB_VERSION}.db"
 DEFAULT_DB_LITE_FILENAME = f"entities-v{DB_VERSION}-lite.db"
 
 # USearch index filenames (co-located with database)
-USEARCH_INDEX_FILES = ["organizations_usearch.bin", "people_usearch.bin"]
+USEARCH_INDEX_FILES = ["organizations_usearch.bin", "people_usearch.bin", "people_identity_usearch.bin"]
 
 # Local cache directory
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "corp-extractor"

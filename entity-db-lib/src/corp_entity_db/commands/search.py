@@ -11,15 +11,22 @@ from ._common import _configure_logging, _resolve_db_path
 @click.argument("query")
 @click.option("--db", "db_path", type=click.Path(), help="Database path")
 @click.option("--top-k", type=int, default=10, help="Number of results")
+@click.option("--role", type=str, default=None, help="Role/job title for composite search (e.g. 'CEO')")
+@click.option("--org", type=str, default=None, help="Organization for composite search (e.g. 'Apple')")
 @click.option("--hybrid", is_flag=True, help="Use hybrid text + embeddings search (default is embeddings-only)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_search_people(query: str, db_path: Optional[str], top_k: int, hybrid: bool, verbose: bool):
+def db_search_people(query: str, db_path: Optional[str], top_k: int, role: Optional[str], org: Optional[str], hybrid: bool, verbose: bool):
     """
     Search for a person in the database.
+
+    Uses composite embeddings: name, role, and org are embedded as separate
+    256-dim segments and concatenated into a 768-dim vector. Use --role and
+    --org to constrain results (e.g. find a specific CEO at a specific company).
 
     \b
     Examples:
         corp-entity-db search-people "Tim Cook"
+        corp-entity-db search-people "Tim Cook" --role CEO --org Apple
         corp-entity-db search-people "Elon Musk" --top-k 5
         corp-entity-db search-people "Elon Musk" --hybrid
     """
@@ -38,10 +45,19 @@ def db_search_people(query: str, db_path: Optional[str], top_k: int, hybrid: boo
     database = get_person_database(db_path=db_path_obj)
     embedder = CompanyEmbedder()
 
-    # Embed query and search
-    query_embedding = embedder.embed(query)
+    # Composite embedding search (primary)
+    query_embedding = embedder.embed_composite_person(query, role=role, org=org)
+
+    # Identity embedding (fallback) — always build from name (+ type if known)
+    from corp_entity_db.store import format_person_query
+    identity_text = format_person_query(query)  # just the name when no type/role/org
+    identity_embedding = embedder.embed_for_identity_index(identity_text)
+
     query_text = query if hybrid else None
-    results = database.search(query_embedding, top_k=top_k, query_text=query_text)
+    results = database.search(
+        query_embedding, top_k=top_k, query_text=query_text,
+        identity_query_embedding=identity_embedding,
+    )
 
     if not results:
         click.echo("No results found.", err=True)
@@ -85,11 +101,11 @@ def db_search_people_perf_test(
 
     _configure_logging(verbose)
 
-    from corp_entity_db.store import get_person_database, format_person_query
+    from corp_entity_db.store import get_person_database
     from corp_entity_db.embeddings import CompanyEmbedder
 
     # Each entry: (name, expected_name_substring, query_kwargs)
-    # query_kwargs are passed to format_person_query (person_type, role, org).
+    # query_kwargs contain person_type, role, org — used for composite embedding.
     test_queries_by_type: dict[str, list[tuple[str, str, dict[str, str]]]] = {
         "executive": [
             ("Tim Cook", "Tim Cook", {"person_type": "executive", "role": "CEO", "org": "Apple"}),
@@ -446,14 +462,25 @@ def db_search_people_perf_test(
             query_idx += 1
             expected_lower = expected.lower()
 
-            query = format_person_query(name, **query_kwargs)
+            role = query_kwargs.get("role")
+            org = query_kwargs.get("org")
+            person_type = query_kwargs.get("person_type")
+            query = f"{name}" + (f", {role}" if role else "") + (f" at {org}" if org else "")
             t0 = _time.perf_counter()
-            query_embedding = embedder.embed(query)
+            query_embedding = embedder.embed_composite_person(name, role=role, org=org)
+
+            # Identity embedding for fallback
+            from corp_entity_db.store import format_person_query
+            identity_text = format_person_query(name, person_type=person_type)
+            identity_embedding = embedder.embed_for_identity_index(identity_text)
             embed_elapsed = _time.perf_counter() - t0
 
             t1 = _time.perf_counter()
             query_text = name if hybrid else None
-            results = database.search(query_embedding, top_k=top_k, query_text=query_text)
+            results = database.search(
+                query_embedding, top_k=top_k, query_text=query_text,
+                identity_query_embedding=identity_embedding,
+            )
             search_elapsed = _time.perf_counter() - t1
 
             total_elapsed = _time.perf_counter() - t0
