@@ -31,7 +31,6 @@ corp-entity-db download
 
 # Search organizations
 corp-entity-db search "Microsoft"
-corp-entity-db search "Microsoft" --hybrid
 
 # Search people (composite embeddings: name + role + org)
 corp-entity-db search-people "Tim Cook"
@@ -82,9 +81,9 @@ corp-entity-db serve --port 9000      # Custom port
 
 ## Embedding Architecture
 
-**Organizations**: Embeddings are stored as 768-dim float32 BLOBs in the `organizations` table. The full database enforces NOT NULL on the embedding column. Int8 scalar quantization is computed on-the-fly during USearch HNSW index building and is not stored separately.
+**All embeddings** (organizations and people) exist only in USearch HNSW indexes, never in SQLite. They are generated on-the-fly during index building using `google/embeddinggemma-300m`. Int8 scalar quantization is computed during index building and is not stored separately.
 
-**People (Dual-Index Search)**: People use two USearch HNSW indexes, both generated on-the-fly during index building (no embeddings stored in SQLite):
+**People (Dual-Index Search)**: People use two USearch HNSW indexes:
 
 - **Primary composite index** (`people_usearch.bin`, 768-dim): Name, role, and organization are embedded as separate 256-dim vectors using Matryoshka truncation, independently L2-normalized, weighted (name=8, role=1, org=4), and concatenated. This gives AND-style matching: a poor match on organization cannot be compensated by a good match on name, enabling precise queries like "find the CEO named Tim Cook at Apple." Built by `build_people_composite_index()`.
 - **Secondary identity index** (`people_identity_usearch.bin`, 256-dim): Natural language descriptions (e.g. "Taylor Swift, an artist", "Tim Cook, a CEO of Apple") embedded with Matryoshka truncation to 256 dims. Consulted as fallback when composite scores are below threshold (0.75). This improves accuracy for identity-defined people (artists, athletes, media, activists) who lack role/org context and would otherwise waste 512 of 768 composite dims as zeros. Built by `build_people_identity_index()`.
@@ -93,19 +92,18 @@ Search accuracy: 82.5% acc@1, 91.4% acc@20 on 280 queries across 14 person types
 
 ## Database Variants
 
-- **Lite** (default download): Organization embedding column dropped, uses pre-built USearch HNSW indexes for search
-- **Full**: Includes float32 embedding BLOBs in the organizations table
+- **Lite** (default download): `record` and `name_normalized` columns dropped for smaller download
+- **Full**: Includes all columns with source record metadata
 
-In both variants, people embeddings exist only in USearch index files (`people_usearch.bin` and `people_identity_usearch.bin`), never in SQLite.
+In both variants, all embeddings exist only in USearch index files (`organizations_usearch.bin`, `people_usearch.bin`, `people_identity_usearch.bin`), never in SQLite.
 
 ## Database Management
 
 ```bash
-corp-entity-db post-import             # Generate embeddings + build USearch indexes + VACUUM
+corp-entity-db migrate                 # Migrate schema to v4 (drops embedding columns)
+corp-entity-db post-import             # Build USearch indexes + VACUUM
 corp-entity-db build-index             # Rebuild all USearch HNSW indexes
 corp-entity-db build-index --identity-only  # Rebuild only the people identity index
-corp-entity-db repair-embeddings       # Generate missing embeddings + rebuild indexes
-corp-entity-db migrate-embeddings      # Migrate from legacy vec0 tables to embedding column
 ```
 
 HuggingFace dataset: [Corp-o-Rate-Community/entity-references](https://huggingface.co/datasets/Corp-o-Rate-Community/entity-references)

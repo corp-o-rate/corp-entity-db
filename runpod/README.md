@@ -29,8 +29,7 @@ The handler accepts a JSON payload:
   "input": {
     "query": "Microsoft",
     "type": "org",
-    "limit": 10,
-    "hybrid": false
+    "limit": 10
   }
 }
 ```
@@ -40,7 +39,6 @@ The handler accepts a JSON payload:
 | `query` | string | required | Search query |
 | `type` | string | `"org"` | `"org"`, `"person"`, `"role"`, or `"location"` |
 | `limit` | int | `10` | Max results |
-| `hybrid` | bool | `false` | Text + embedding hybrid search (org/person only) |
 | `role` | string | `null` | Role/job title for composite person search (person type only) |
 | `org` | string | `null` | Organization for composite person search (person type only) |
 | `person_type` | string | `null` | Person type hint for identity fallback (e.g. `"artist"`, `"athlete"`) |

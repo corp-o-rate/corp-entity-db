@@ -69,7 +69,7 @@ def db_import_gleif(file_path: Optional[str], download: bool, force: bool, db_pa
     """
     _configure_logging(verbose)
 
-    from corp_entity_db import OrganizationDatabase, CompanyEmbedder
+    from corp_entity_db import OrganizationDatabase
     from corp_entity_db.importers import GleifImporter
 
     importer = GleifImporter()
@@ -88,8 +88,7 @@ def db_import_gleif(file_path: Optional[str], download: bool, force: bool, db_pa
 
     # Initialize components (readonly=False for import operations)
     db_path_obj = _resolve_db_path(db_path)
-    embedder = CompanyEmbedder()
-    database = OrganizationDatabase(db_path=db_path_obj, embedding_dim=embedder.embedding_dim, readonly=False)
+    database = OrganizationDatabase(db_path=db_path_obj, readonly=False)
 
     # Import records in batches
     records = []
@@ -99,18 +98,14 @@ def db_import_gleif(file_path: Optional[str], download: bool, force: bool, db_pa
         records.append(record)
 
         if len(records) >= batch_size:
-            names = [r.name for r in records]
-            embeddings = embedder.embed_batch(names)
-            database.insert_batch(records, embeddings)
+            database.insert_batch(records)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
 
     # Final batch
     if records:
-        names = [r.name for r in records]
-        embeddings = embedder.embed_batch(names)
-        database.insert_batch(records, embeddings)
+        database.insert_batch(records)
         count += len(records)
 
     click.echo(f"\nImported {count} GLEIF records successfully.", err=True)
@@ -141,7 +136,7 @@ def db_import_sec(download: bool, file_path: Optional[str], db_path: Optional[st
     """
     _configure_logging(verbose)
 
-    from corp_entity_db import OrganizationDatabase, CompanyEmbedder
+    from corp_entity_db import OrganizationDatabase
     from corp_entity_db.importers import SecEdgarImporter
 
     if not download and not file_path:
@@ -149,8 +144,7 @@ def db_import_sec(download: bool, file_path: Optional[str], db_path: Optional[st
 
     # Initialize components (readonly=False for import operations)
     db_path_obj = _resolve_db_path(db_path)
-    embedder = CompanyEmbedder()
-    database = OrganizationDatabase(db_path=db_path_obj, embedding_dim=embedder.embedding_dim, readonly=False)
+    database = OrganizationDatabase(db_path=db_path_obj, readonly=False)
     importer = SecEdgarImporter()
 
     # Get records
@@ -169,18 +163,14 @@ def db_import_sec(download: bool, file_path: Optional[str], db_path: Optional[st
         records.append(record)
 
         if len(records) >= batch_size:
-            names = [r.name for r in records]
-            embeddings = embedder.embed_batch(names)
-            database.insert_batch(records, embeddings)
+            database.insert_batch(records)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
 
     # Final batch
     if records:
-        names = [r.name for r in records]
-        embeddings = embedder.embed_batch(names)
-        database.insert_batch(records, embeddings)
+        database.insert_batch(records)
         count += len(records)
 
     click.echo(f"\nImported {count} SEC Edgar records successfully.", err=True)
@@ -415,15 +405,14 @@ def db_import_wikidata(db_path: Optional[str], limit: Optional[int], batch_size:
     """
     _configure_logging(verbose)
 
-    from corp_entity_db import OrganizationDatabase, CompanyEmbedder
+    from corp_entity_db import OrganizationDatabase
     from corp_entity_db.importers import WikidataImporter
 
     click.echo(f"Importing Wikidata organization data via SPARQL (type={query_type}, all={import_all})...", err=True)
 
     # Initialize components (readonly=False for import operations)
     db_path_obj = _resolve_db_path(db_path)
-    embedder = CompanyEmbedder()
-    database = OrganizationDatabase(db_path=db_path_obj, embedding_dim=embedder.embedding_dim, readonly=False)
+    database = OrganizationDatabase(db_path=db_path_obj, readonly=False)
     importer = WikidataImporter(batch_size=500)  # Smaller SPARQL batch size for reliability
 
     # Import records in batches
@@ -434,18 +423,14 @@ def db_import_wikidata(db_path: Optional[str], limit: Optional[int], batch_size:
         records.append(record)
 
         if len(records) >= batch_size:
-            names = [r.name for r in records]
-            embeddings = embedder.embed_batch(names)
-            database.insert_batch(records, embeddings)
+            database.insert_batch(records)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
 
     # Final batch
     if records:
-        names = [r.name for r in records]
-        embeddings = embedder.embed_batch(names)
-        database.insert_batch(records, embeddings)
+        database.insert_batch(records)
         count += len(records)
 
     click.echo(f"\nImported {count} Wikidata records successfully.", err=True)
@@ -1251,7 +1236,7 @@ def db_import_companies_house(
     """
     _configure_logging(verbose)
 
-    from corp_entity_db import OrganizationDatabase, CompanyEmbedder
+    from corp_entity_db import OrganizationDatabase
     from corp_entity_db.importers import CompaniesHouseImporter
 
     if not file_path and not search_terms and not download:
@@ -1261,8 +1246,7 @@ def db_import_companies_house(
 
     # Initialize components (readonly=False for import operations)
     db_path_obj = _resolve_db_path(db_path)
-    embedder = CompanyEmbedder()
-    database = OrganizationDatabase(db_path=db_path_obj, embedding_dim=embedder.embedding_dim, readonly=False)
+    database = OrganizationDatabase(db_path=db_path_obj, readonly=False)
     importer = CompaniesHouseImporter()
 
     # Get records
@@ -1290,18 +1274,14 @@ def db_import_companies_house(
         records.append(record)
 
         if len(records) >= batch_size:
-            names = [r.name for r in records]
-            embeddings = embedder.embed_batch(names)
-            database.insert_batch(records, embeddings)
+            database.insert_batch(records)
             count += len(records)
             click.echo(f"Imported {count} records...", err=True)
             records = []
 
     # Final batch
     if records:
-        names = [r.name for r in records]
-        embeddings = embedder.embed_batch(names)
-        database.insert_batch(records, embeddings)
+        database.insert_batch(records)
         count += len(records)
 
     click.echo(f"\nImported {count} Companies House records successfully.", err=True)

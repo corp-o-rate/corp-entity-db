@@ -40,12 +40,11 @@ class EntityDBClient:
         self,
         query: str,
         limit: int = 10,
-        hybrid: bool = False,
     ) -> list[dict]:
         """Search organizations by name."""
         resp = self._httpx.post(
             f"{self.server_url}/search",
-            json={"query": query, "limit": limit, "hybrid": hybrid},
+            json={"query": query, "limit": limit},
             timeout=_TIMEOUT,
         )
         resp.raise_for_status()

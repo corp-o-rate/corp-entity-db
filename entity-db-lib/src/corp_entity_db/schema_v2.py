@@ -133,7 +133,6 @@ CREATE TABLE IF NOT EXISTS organizations (
     from_date TEXT DEFAULT NULL,
     to_date TEXT DEFAULT NULL,
     record TEXT NOT NULL DEFAULT '{}',
-    embedding BLOB DEFAULT NULL,
     canon_id INTEGER DEFAULT NULL,
     canon_size INTEGER DEFAULT 1,
     FOREIGN KEY (source_id) REFERENCES source_types(id),
@@ -175,7 +174,6 @@ CREATE TABLE IF NOT EXISTS people (
     birth_date TEXT DEFAULT NULL,
     death_date TEXT DEFAULT NULL,
     record TEXT NOT NULL DEFAULT '{}',
-    embedding BLOB DEFAULT NULL,
     canon_id INTEGER DEFAULT NULL,
     canon_size INTEGER DEFAULT 1,
     FOREIGN KEY (source_id) REFERENCES source_types(id),
@@ -341,11 +339,11 @@ def create_all_tables(conn, embedding_dim: int = 768) -> None:
     """
     Create all v2 schema tables.
 
-    Embeddings are stored as BLOB columns directly in the organizations and people tables.
+    Embeddings live only in USearch HNSW indexes, not in SQLite.
 
     Args:
         conn: SQLite connection
-        embedding_dim: Dimension for embedding vectors (unused, kept for API compat)
+        embedding_dim: Unused, kept for API compatibility
     """
     for ddl in ALL_DDL_STATEMENTS:
         for statement in ddl.strip().split(";"):
@@ -358,6 +356,6 @@ def create_all_tables(conn, embedding_dim: int = 768) -> None:
         conn.execute(ddl)
 
     # Set schema version
-    conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '3')")
+    conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '4')")
 
     conn.commit()

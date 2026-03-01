@@ -13,9 +13,8 @@ from ._common import _configure_logging, _resolve_db_path
 @click.option("--top-k", type=int, default=10, help="Number of results")
 @click.option("--role", type=str, default=None, help="Role/job title for composite search (e.g. 'CEO')")
 @click.option("--org", type=str, default=None, help="Organization for composite search (e.g. 'Apple')")
-@click.option("--hybrid", is_flag=True, help="Use hybrid text + embeddings search (default is embeddings-only)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_search_people(query: str, db_path: Optional[str], top_k: int, role: Optional[str], org: Optional[str], hybrid: bool, verbose: bool):
+def db_search_people(query: str, db_path: Optional[str], top_k: int, role: Optional[str], org: Optional[str], verbose: bool):
     """
     Search for a person in the database.
 
@@ -28,7 +27,6 @@ def db_search_people(query: str, db_path: Optional[str], top_k: int, role: Optio
         corp-entity-db search-people "Tim Cook"
         corp-entity-db search-people "Tim Cook" --role CEO --org Apple
         corp-entity-db search-people "Elon Musk" --top-k 5
-        corp-entity-db search-people "Elon Musk" --hybrid
     """
     _configure_logging(verbose)
 
@@ -38,8 +36,7 @@ def db_search_people(query: str, db_path: Optional[str], top_k: int, role: Optio
     # Default database path
     db_path_obj = _resolve_db_path(db_path)
 
-    mode = "hybrid (text + embeddings)" if hybrid else "embeddings-only"
-    click.echo(f"Searching for '{query}' in {db_path_obj} [{mode}]...", err=True)
+    click.echo(f"Searching for '{query}' in {db_path_obj}...", err=True)
 
     # Initialize components
     database = get_person_database(db_path=db_path_obj)
@@ -53,9 +50,8 @@ def db_search_people(query: str, db_path: Optional[str], top_k: int, role: Optio
     identity_text = format_person_query(query)  # just the name when no type/role/org
     identity_embedding = embedder.embed_for_identity_index(identity_text)
 
-    query_text = query if hybrid else None
     results = database.search(
-        query_embedding, top_k=top_k, query_text=query_text,
+        query_embedding, top_k=top_k,
         identity_query_embedding=identity_embedding,
     )
 
@@ -78,12 +74,11 @@ def db_search_people(query: str, db_path: Optional[str], top_k: int, role: Optio
 @click.command("search-people-perf-test")
 @click.option("--db", "db_path", type=click.Path(), help="Database path")
 @click.option("--top-k", type=int, default=5, help="Number of results per query")
-@click.option("--hybrid", is_flag=True, help="Use hybrid text + embeddings search")
 @click.option("--type", "person_type_filter", type=str, help="Only test a single person type (e.g. 'executive')")
 @click.option("--for-llm", is_flag=True, help="Output structured results for LLM review (failures + ambiguous matches)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def db_search_people_perf_test(
-    db_path: Optional[str], top_k: int, hybrid: bool, person_type_filter: Optional[str],
+    db_path: Optional[str], top_k: int, person_type_filter: Optional[str],
     for_llm: bool, verbose: bool,
 ):
     """
@@ -94,7 +89,6 @@ def db_search_people_perf_test(
     \b
     Examples:
         corp-entity-db search-people-perf-test
-        corp-entity-db search-people-perf-test --hybrid
         corp-entity-db search-people-perf-test --type politician
     """
     import time as _time
@@ -428,9 +422,8 @@ def db_search_people_perf_test(
     total_queries = sum(len(qs) for qs in test_queries_by_type.values())
     db_path_obj = _resolve_db_path(db_path)
 
-    mode = "hybrid" if hybrid else "embeddings-only"
     click.echo(
-        f"Person search perf+accuracy test [{mode}] — "
+        f"Person search perf+accuracy test — "
         f"{len(test_queries_by_type)} types, {total_queries} queries, top_k={top_k}",
         err=True,
     )
@@ -476,9 +469,8 @@ def db_search_people_perf_test(
             embed_elapsed = _time.perf_counter() - t0
 
             t1 = _time.perf_counter()
-            query_text = name if hybrid else None
             results = database.search(
-                query_embedding, top_k=top_k, query_text=query_text,
+                query_embedding, top_k=top_k,
                 identity_query_embedding=identity_embedding,
             )
             search_elapsed = _time.perf_counter() - t1
@@ -593,7 +585,7 @@ def db_search_people_perf_test(
                 "acc_at_1": round(global_acc1, 1),
                 "acc_at_k": round(global_acck, 1),
                 "top_k": top_k,
-                "mode": mode,
+                "mode": "embeddings-only",
                 "failures": n_missing,
                 "wrong_rank": n_wrong_rank,
             },
@@ -618,9 +610,8 @@ def db_search_people_perf_test(
 @click.option("--db", "db_path", type=click.Path(), help="Database path")
 @click.option("--top-k", type=int, default=10, help="Number of results")
 @click.option("--source", type=click.Choice(["gleif", "sec_edgar", "companies_house", "wikipedia"]), help="Filter by source")
-@click.option("--hybrid", is_flag=True, help="Use hybrid text + embeddings search (default is embeddings-only)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_search(query: str, db_path: Optional[str], top_k: int, source: Optional[str], hybrid: bool, verbose: bool):
+def db_search(query: str, db_path: Optional[str], top_k: int, source: Optional[str], verbose: bool):
     """
     Search for an organization in the database.
 
@@ -628,7 +619,6 @@ def db_search(query: str, db_path: Optional[str], top_k: int, source: Optional[s
     Examples:
         corp-entity-db search "Apple Inc"
         corp-entity-db search "Microsoft" --source sec_edgar
-        corp-entity-db search "Apple" --hybrid
     """
     _configure_logging(verbose)
 
@@ -638,15 +628,13 @@ def db_search(query: str, db_path: Optional[str], top_k: int, source: Optional[s
     embedder = CompanyEmbedder()
     database = OrganizationDatabase(db_path=db_path_obj)
 
-    mode = "hybrid (text + embeddings)" if hybrid else "embeddings-only"
-    click.echo(f"Searching for '{query}' [{mode}]...", err=True)
+    click.echo(f"Searching for '{query}'...", err=True)
 
     # Embed query
     query_embedding = embedder.embed(query)
 
     # Search
-    query_text = query if hybrid else None
-    results = database.search(query_embedding, top_k=top_k, source_filter=source, query_text=query_text)
+    results = database.search(query_embedding, top_k=top_k, source_filter=source)
 
     if not results:
         click.echo("No results found.")

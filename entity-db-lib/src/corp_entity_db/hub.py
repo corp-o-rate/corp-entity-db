@@ -19,7 +19,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # Database schema version — bump this when the schema changes
-DB_VERSION = 3
+DB_VERSION = 4
 
 # Default HuggingFace repo for entity database
 DEFAULT_REPO_ID = "Corp-o-Rate-Community/entity-references"
@@ -73,9 +73,11 @@ def get_database_path(
     # Check if database exists in cache
     cache_dir = DEFAULT_CACHE_DIR
 
-    # Check common locations (v3 first, then v2 fallback)
+    # Check common locations (v4 first, then v3/v2 fallback)
     possible_paths = [
         cache_dir / filename,
+        cache_dir / "entities-v4.db",
+        cache_dir / "entities-v4-lite.db",
         cache_dir / "entities-v3.db",
         cache_dir / "entities-v3-lite.db",
         cache_dir / "entities-v2.db",  # v2 fallback (or symlink target)
@@ -245,7 +247,7 @@ def create_lite_database(
 
     The lite version:
     - Strips the `record` column content (sets to empty {})
-    - Drops the `embedding` column from organizations and people tables
+    - Drops the `name_normalized` column (not needed for search)
     - Drops any legacy vec0 embedding tables
     - Uses USearch HNSW index files for search instead
     - Significantly reduces file size
@@ -283,21 +285,21 @@ def create_lite_database(
         updated = cursor.rowcount
         logger.info(f"Stripped {updated} organization record fields")
 
-        # Drop embedding column — lite databases use USearch indexes for search
+        # Drop name_normalized — not needed for search (USearch handles it)
         try:
-            conn.execute("ALTER TABLE organizations DROP COLUMN embedding")
-            logger.info("Dropped embedding column from organizations")
+            conn.execute("ALTER TABLE organizations DROP COLUMN name_normalized")
+            logger.info("Dropped name_normalized column from organizations")
         except sqlite3.OperationalError:
             pass  # Column doesn't exist
 
-        # Also strip people records and embeddings if table exists
+        # Also strip people records if table exists
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='people'")
         if cursor.fetchone():
             cursor = conn.execute("UPDATE people SET record = '{}'")
             logger.info(f"Stripped {cursor.rowcount} people record fields")
             try:
-                conn.execute("ALTER TABLE people DROP COLUMN embedding")
-                logger.info("Dropped embedding column from people")
+                conn.execute("ALTER TABLE people DROP COLUMN name_normalized")
+                logger.info("Dropped name_normalized column from people")
             except sqlite3.OperationalError:
                 pass  # Column doesn't exist
 

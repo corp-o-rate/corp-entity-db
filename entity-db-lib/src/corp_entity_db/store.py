@@ -1,9 +1,8 @@
 """
 Entity/Organization database with USearch for vector search.
 
-Uses a hybrid approach:
-1. Text-based filtering to narrow candidates (Levenshtein-like)
-2. USearch HNSW index for fast approximate nearest neighbor search
+Uses USearch HNSW indexes for fast approximate nearest neighbor search.
+Embeddings live only in USearch indexes, never in SQLite.
 """
 
 import json
@@ -638,24 +637,31 @@ def _normalize_person_name(name: str) -> str:
 def build_hnsw_index(
     conn: sqlite3.Connection,
     entity_type: str,
+    embedder: "CompanyEmbedder",
     embedding_dim: int = 768,
     M: int = 32,
     ef_construction: int = 200,
     ef_search: int = 200,
+    embed_batch_size: int = 64,
     progress_callback: Optional[Any] = None,
 ) -> int:
-    """Build HNSW index for organizations from stored embeddings.
+    """Build HNSW index for organizations by generating embeddings on-the-fly.
 
-    For people, use build_people_composite_index() instead — people embeddings
-    are not stored in the database, they are generated on-the-fly.
+    Embeddings are generated from organization names in batches, quantized to
+    int8, and fed directly into the USearch index. No embeddings are stored in
+    the database — this is the only place organization embeddings live.
+
+    For people, use build_people_composite_index() instead.
 
     Args:
-        conn: Read-only database connection
+        conn: Database connection
         entity_type: 'organizations' (people no longer supported here)
+        embedder: CompanyEmbedder instance for generating embeddings
         embedding_dim: Dimension of embeddings (default 768)
         M: Number of connections per node (default 32)
         ef_construction: Size of dynamic candidate list during construction (default 200)
         ef_search: Size of dynamic candidate list during search (default 200)
+        embed_batch_size: Batch size for embedding generation
         progress_callback: Optional callable(processed, total) for progress
 
     Returns:
@@ -667,79 +673,72 @@ def build_hnsw_index(
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
     cache_dir = db_path.parent
 
-    if entity_type == "organizations":
-        source_table = "organizations"
-        id_column = "id"
-        index_path = cache_dir / "organizations_usearch.bin"
-    else:
+    if entity_type != "organizations":
         raise ValueError(f"Unknown entity_type: {entity_type}. For people, use build_people_composite_index().")
 
-    # Count total vectors
-    total_count = conn.execute(f"SELECT COUNT(*) FROM {source_table} WHERE embedding IS NOT NULL").fetchone()[0]
+    index_path = cache_dir / "organizations_usearch.bin"
+
+    # Count total records
+    total_count = conn.execute("SELECT COUNT(*) FROM organizations").fetchone()[0]
     if total_count == 0:
-        logger.warning(f"No embeddings found in {source_table}")
+        logger.warning("No organizations found")
         return 0
 
-    logger.info(f"Building USearch index for {total_count:,} {entity_type} vectors")
+    logger.info(f"Building USearch index for {total_count:,} organizations (on-the-fly embeddings)")
     logger.info(f"Parameters: M={M}, ef_construction={ef_construction}, ef_search={ef_search}")
-    logger.info(f"Estimated time: ~{total_count / 1000 / 60:.0f}-{total_count / 500 / 60:.0f} minutes")
 
     # Initialize USearch index with int8 quantization
     index = Index(
         ndim=embedding_dim,
-        metric='cos',  # cosine similarity
-        dtype='i8',  # int8 quantization
+        metric='cos',
+        dtype='i8',
         connectivity=M,
         expansion_add=ef_construction,
         expansion_search=ef_search,
     )
 
-    # Fetch embeddings in batches and add to index incrementally to avoid OOM
-    BATCH_SIZE = 100_000
-    logger.info("Fetching embeddings from database and building index in batches...")
-    cursor = conn.execute(f"SELECT {id_column}, embedding FROM {source_table} WHERE embedding IS NOT NULL ORDER BY {id_column}")
-
-    batch_ids = []
-    batch_vecs = []
+    # Stream organizations in batches, generate embeddings, add to index
+    DB_BATCH_SIZE = 10_000
     total_added = 0
+    last_id = 0
 
-    for row in cursor:
-        entity_id = row[id_column]
-        embedding_blob = row["embedding"]
-        fp32_vec = np.frombuffer(embedding_blob, dtype=np.float32)
-        vec = np.clip(np.round(fp32_vec * 127), -127, 127).astype(np.int8)
+    while True:
+        cursor = conn.execute(
+            "SELECT id, name FROM organizations WHERE id > ? ORDER BY id LIMIT ?",
+            (last_id, DB_BATCH_SIZE),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            break
 
-        batch_ids.append(entity_id)
-        batch_vecs.append(vec)
+        ids = [row["id"] for row in rows]
+        names = [row["name"] for row in rows]
 
-        if len(batch_ids) >= BATCH_SIZE:
-            ids_array = np.array(batch_ids, dtype=np.int64)
-            vectors_array = np.stack(batch_vecs)
-            index.add(ids_array, vectors_array, threads=4)
-            total_added += len(batch_ids)
-            batch_ids.clear()
-            batch_vecs.clear()
+        # Generate embeddings in sub-batches
+        for i in range(0, len(ids), embed_batch_size):
+            sub_ids = ids[i:i + embed_batch_size]
+            sub_names = names[i:i + embed_batch_size]
 
-            if progress_callback:
-                logger.info(f"Indexed {total_added:,}/{total_count:,} vectors...")
-                progress_callback(total_added, total_count)
+            fp32_batch = embedder.embed_batch(sub_names, batch_size=embed_batch_size)
 
-    # Add remaining vectors
-    if batch_ids:
-        ids_array = np.array(batch_ids, dtype=np.int64)
-        vectors_array = np.stack(batch_vecs)
-        index.add(ids_array, vectors_array, threads=4)
-        total_added += len(batch_ids)
+            # Quantize to int8 and add to index
+            int8_batch = np.clip(np.round(fp32_batch * 127), -127, 127).astype(np.int8)
+            ids_array = np.array(sub_ids, dtype=np.int64)
+            index.add(ids_array, int8_batch)
+            total_added += len(sub_ids)
 
-    logger.info(f"Indexed {total_added:,} vectors total")
+        last_id = ids[-1]
+
+        if progress_callback:
+            progress_callback(total_added, total_count)
+        logger.info(f"Indexed {total_added:,}/{total_count:,} organization vectors...")
 
     # Save index
     logger.info(f"Saving index to {index_path.name}...")
     index.save(str(index_path))
 
     index_size_mb = index_path.stat().st_size / 1024**2
-    logger.info(f"USearch index built successfully: {total_added:,} vectors")
-    logger.info(f"  Index file: {index_path.name} ({index_size_mb:.1f} MB)")
+    logger.info(f"USearch index built successfully: {total_added:,} vectors ({index_size_mb:.1f} MB)")
 
     return total_added
 
@@ -836,7 +835,7 @@ def build_people_composite_index(
             # Quantize to int8 and add to index
             int8_batch = np.clip(np.round(fp32_batch * 127), -127, 127).astype(np.int8)
             ids_array = np.array(sub_ids, dtype=np.int64)
-            index.add(ids_array, int8_batch, threads=4)
+            index.add(ids_array, int8_batch)
             total_added += len(sub_ids)
 
         last_id = ids[-1]
@@ -953,7 +952,7 @@ def build_people_identity_index(
             # Quantize to int8 and add to index
             int8_batch = np.clip(np.round(fp32_batch * 127), -127, 127).astype(np.int8)
             ids_array = np.array(sub_ids, dtype=np.int64)
-            index.add(ids_array, int8_batch, threads=4)
+            index.add(ids_array, int8_batch)
             total_added += len(sub_ids)
 
         last_id = ids[-1]
@@ -992,11 +991,10 @@ def get_database(db_path: Optional[str | Path] = None, embedding_dim: int = 768,
 
 class OrganizationDatabase:
     """
-    SQLite database with sqlite-vec for organization vector search.
+    SQLite database with USearch for organization vector search.
 
-    Uses hybrid text + vector search:
-    1. Text filtering with Levenshtein distance to reduce candidates
-    2. sqlite-vec for semantic similarity ranking
+    Uses USearch HNSW indexes for fast approximate nearest neighbor search.
+    Embeddings live only in USearch indexes, never in SQLite.
     """
 
     def __init__(
@@ -1019,7 +1017,7 @@ class OrganizationDatabase:
         self._readonly = readonly
         self._conn: Optional[sqlite3.Connection] = None
         self._is_v2: Optional[bool] = None  # Detected on first connect
-        self._schema_version: int = 1  # Updated on connect (1=legacy, 2=normalized FKs, 3=no embeddings in lite)
+        self._schema_version: int = 1  # Updated on connect (1=legacy, 2=normalized FKs, 3=normalized FKs+lite, 4=no embedding columns)
         # USearch index for fast approximate nearest neighbor search
         self._hnsw_index: Optional[Any] = None  # usearch.index.Index
 
@@ -1044,7 +1042,7 @@ class OrganizationDatabase:
                 self._schema_version = 2
                 logger.debug("Detected v2 schema for organizations")
 
-            # Check for v3 metadata table
+            # Check for schema version in db_info metadata table
             cursor = self._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='db_info'"
             )
@@ -1065,14 +1063,15 @@ class OrganizationDatabase:
     def insert(
         self,
         record: CompanyRecord,
-        embedding: np.ndarray,
     ) -> int:
         """
-        Insert an organization record with its embedding.
+        Insert an organization record.
+
+        Embeddings are generated separately during index building and stored
+        only in the USearch index, not in the organizations table.
 
         Args:
             record: Organization record to insert
-            embedding: Embedding vector for the organization name (float32)
 
         Returns:
             Row ID of inserted record
@@ -1082,7 +1081,6 @@ class OrganizationDatabase:
         # Serialize record
         record_json = json.dumps(record.record)
         name_normalized = _normalize_name(record.name)
-        embedding_blob = embedding.astype(np.float32).tobytes()
 
         # v2+ schema: use FK IDs instead of TEXT columns
         source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
@@ -1103,8 +1101,8 @@ class OrganizationDatabase:
 
         cursor = conn.execute("""
             INSERT OR REPLACE INTO organizations
-            (name, name_normalized, source_id, source_identifier, qid, region_id, entity_type_id, from_date, to_date, record, embedding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (name, name_normalized, source_id, source_identifier, qid, region_id, entity_type_id, from_date, to_date, record)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             record.name,
             name_normalized,
@@ -1116,7 +1114,6 @@ class OrganizationDatabase:
             record.from_date or "",
             record.to_date or "",
             record_json,
-            embedding_blob,
         ))
 
         row_id = cursor.lastrowid
@@ -1128,15 +1125,16 @@ class OrganizationDatabase:
     def insert_batch(
         self,
         records: list[CompanyRecord],
-        embeddings: Optional[np.ndarray] = None,
         batch_size: int = 1000,
     ) -> int:
         """
-        Insert multiple organization records, optionally with embeddings.
+        Insert multiple organization records.
+
+        Embeddings are generated separately during index building and stored
+        only in the USearch index, not in the organizations table.
 
         Args:
             records: List of organization records
-            embeddings: Matrix of embeddings (N x dim) - float32, or None to insert NULL
             batch_size: Commit batch size
 
         Returns:
@@ -1148,7 +1146,6 @@ class OrganizationDatabase:
         for i, record in enumerate(records):
             record_json = json.dumps(record.record)
             name_normalized = _normalize_name(record.name)
-            embedding_blob = embeddings[i].astype(np.float32).tobytes() if embeddings is not None else None
 
             # v2+ schema: use FK IDs instead of TEXT columns
             source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
@@ -1166,8 +1163,8 @@ class OrganizationDatabase:
 
             cursor = conn.execute("""
                 INSERT OR REPLACE INTO organizations
-                (name, name_normalized, source_id, source_identifier, qid, region_id, entity_type_id, from_date, to_date, record, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (name, name_normalized, source_id, source_identifier, qid, region_id, entity_type_id, from_date, to_date, record)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.name,
                 name_normalized,
@@ -1179,7 +1176,6 @@ class OrganizationDatabase:
                 record.from_date or "",
                 record.to_date or "",
                 record_json,
-                embedding_blob,
             ))
 
             count += 1
@@ -1259,37 +1255,20 @@ class OrganizationDatabase:
         query_embedding: np.ndarray,
         top_k: int = 20,
         source_filter: Optional[str] = None,
-        query_text: Optional[str] = None,
-        max_text_candidates: int = 5000,
-        rerank_min_candidates: int = 500,
     ) -> list[tuple[CompanyRecord, float]]:
         """
-        Search for similar organizations using hybrid text + vector search.
-
-        Three-stage approach:
-        1. If query_text provided, use SQL LIKE to find candidates containing search terms
-        2. USearch HNSW index for fast approximate nearest neighbor search
-        3. Apply prominence-based re-ranking to boost major companies (SEC filers, tickers)
+        Search for similar organizations using USearch ANN search.
 
         Args:
             query_embedding: Query embedding vector
             top_k: Number of results to return
             source_filter: Optional filter by source (gleif, sec_edgar, etc.)
-            query_text: Optional query text for text-based pre-filtering
-            max_text_candidates: Max candidates to keep after text filtering
-            rerank_min_candidates: Minimum candidates to fetch for re-ranking (default 500)
 
         Returns:
-            List of (CompanyRecord, adjusted_score) tuples sorted by prominence-adjusted score
+            List of (CompanyRecord, similarity_score) tuples
         """
         start = time.time()
         self._connect()
-
-        # Log search mode
-        if query_text:
-            logger.info(f"Organization search: hybrid mode (text + embeddings) for '{query_text}'")
-        else:
-            logger.debug("Organization search: embeddings-only mode (fast KNN)")
 
         # Normalize query embedding
         query_norm = np.linalg.norm(query_embedding)
@@ -1297,226 +1276,17 @@ class OrganizationDatabase:
             return []
         query_normalized = query_embedding / query_norm
 
-        # Stage 1: Text filtering (if query_text provided)
-        candidate_ids: Optional[set[int]] = None
-        query_normalized_text = ""
-        if query_text:
-            query_normalized_text = _normalize_name(query_text)
-            if query_normalized_text:
-                candidate_ids = self._text_filter_candidates(
-                    query_normalized_text,
-                    max_candidates=max_text_candidates,
-                    source_filter=source_filter,
-                )
-                logger.info(f"Text filter: {len(candidate_ids)} candidates for '{query_text}'")
-                if len(candidate_ids) == 0:
-                    return []
-
-        # Stage 2: Vector ranking via USearch
+        # Quantize and search USearch index
         query_int8 = np.clip(np.round(query_normalized * 127), -127, 127).astype(np.int8)
 
-        # Fetch extra results if we'll be re-ranking (hybrid mode)
-        fetch_k = max(rerank_min_candidates, top_k * 5) if query_normalized_text else top_k
-
         if not self._load_hnsw_index():
-            raise RuntimeError("USearch index not found. Run: corp-extractor db build-index")
+            raise RuntimeError("USearch index not found. Run: corp-entity-db build-index")
 
-        results = self._hnsw_search(query_int8, fetch_k, candidate_ids, source_filter)
-
-        # Stage 3: Prominence-based re-ranking (hybrid mode only)
-        if results and query_normalized_text:
-            logger.debug(f"Applying prominence re-ranking to {len(results)} candidates")
-            results = self._apply_prominence_reranking(results, query_normalized_text, top_k)
-        else:
-            # No re-ranking, just trim to top_k
-            results = results[:top_k]
+        results = self._hnsw_search(query_int8, top_k, source_filter=source_filter)
 
         elapsed = time.time() - start
         logger.debug(f"Organization search took {elapsed:.3f}s (results={len(results)})")
         return results
-
-    def _calculate_prominence_boost(
-        self,
-        record: CompanyRecord,
-        query_normalized: str,
-        canon_sources: Optional[set[str]] = None,
-    ) -> float:
-        """
-        Calculate prominence boost for re-ranking search results.
-
-        Boosts scores based on signals that indicate a major/prominent company:
-        - Has ticker symbol (publicly traded)
-        - GLEIF source (has LEI)
-        - SEC source (vetted US filers)
-        - Wikidata source (Wikipedia-notable)
-        - Exact normalized name match
-
-        When canon_sources is provided (from a canonical group), boosts are
-        applied for ALL sources in the canon group, not just this record's source.
-
-        Args:
-            record: The company record to evaluate
-            query_normalized: Normalized query text for exact match check
-            canon_sources: Optional set of sources in this record's canonical group
-
-        Returns:
-            Boost value to add to embedding similarity (0.0 to ~0.21)
-        """
-        boost = 0.0
-
-        # Get all sources to consider (canon group or just this record)
-        sources_to_check = canon_sources or {record.source}
-
-        # Has ticker symbol = publicly traded major company
-        # Check if ANY record in canon group has ticker
-        if record.record.get("ticker") or (canon_sources and "sec_edgar" in canon_sources):
-            boost += 0.08
-
-        # Source-based boosts - accumulate for all sources in canon group
-        if "gleif" in sources_to_check:
-            boost += 0.05  # Has LEI = verified legal entity
-        if "sec_edgar" in sources_to_check:
-            boost += 0.03  # SEC filer
-        if "wikipedia" in sources_to_check:
-            boost += 0.02  # Wikipedia notable
-
-        # Exact normalized name match bonus
-        record_normalized = _normalize_name(record.name)
-        if query_normalized == record_normalized:
-            boost += 0.05
-
-        return boost
-
-    def _apply_prominence_reranking(
-        self,
-        results: list[tuple[CompanyRecord, float]],
-        query_normalized: str,
-        top_k: int,
-        similarity_weight: float = 0.3,
-    ) -> list[tuple[CompanyRecord, float]]:
-        """
-        Apply prominence-based re-ranking to search results with canon group awareness.
-
-        When records have been canonicalized, boosts are applied based on ALL sources
-        in the canonical group, not just the matched record's source.
-
-        Args:
-            results: List of (record, similarity) from vector search
-            query_normalized: Normalized query text
-            top_k: Number of results to return after re-ranking
-            similarity_weight: Weight for similarity score (0-1), lower = prominence matters more
-
-        Returns:
-            Re-ranked list of (record, adjusted_score) tuples
-        """
-        conn = self._conn
-        assert conn is not None
-
-        # Build canon_id -> sources mapping for all results that have canon_id
-        canon_sources_map: dict[int, set[str]] = {}
-        canon_ids = [
-            r.record.get("canon_id")
-            for r, _ in results
-            if r.record.get("canon_id") is not None
-        ]
-
-        if canon_ids:
-            # Fetch all sources for each canon_id in one query
-            unique_canon_ids = list(set(canon_ids))
-            placeholders = ",".join("?" * len(unique_canon_ids))
-            rows = conn.execute(f"""
-                SELECT canon_id, source
-                FROM organizations
-                WHERE canon_id IN ({placeholders})
-            """, unique_canon_ids).fetchall()
-
-            for row in rows:
-                canon_id = row["canon_id"]
-                canon_sources_map.setdefault(canon_id, set()).add(row["source"])
-
-        # Calculate boosted scores with canon group awareness
-        # Formula: adjusted = (similarity * weight) + boost
-        # With weight=0.3, a sim=0.65 SEC+ticker (boost=0.11) beats sim=0.75 no-boost
-        boosted_results: list[tuple[CompanyRecord, float, float, float]] = []
-        for record, similarity in results:
-            canon_id = record.record.get("canon_id")
-            # Get all sources in this record's canon group (if any)
-            canon_sources = canon_sources_map.get(canon_id) if canon_id else None
-
-            boost = self._calculate_prominence_boost(record, query_normalized, canon_sources)
-            adjusted_score = (similarity * similarity_weight) + boost
-            boosted_results.append((record, similarity, boost, adjusted_score))
-
-        # Sort by adjusted score (descending)
-        boosted_results.sort(key=lambda x: x[3], reverse=True)
-
-        # Log re-ranking details for top results
-        logger.debug(f"Prominence re-ranking for '{query_normalized}':")
-        for record, sim, boost, adj in boosted_results[:10]:
-            ticker = record.record.get("ticker", "")
-            ticker_str = f" ticker={ticker}" if ticker else ""
-            canon_id = record.record.get("canon_id")
-            canon_str = f" canon={canon_id}" if canon_id else ""
-            logger.debug(
-                f"  {record.name}: sim={sim:.3f} + boost={boost:.3f} = {adj:.3f} "
-                f"[{record.source}{ticker_str}{canon_str}]"
-            )
-
-        # Return top_k with adjusted scores
-        return [(r, adj) for r, _, _, adj in boosted_results[:top_k]]
-
-    def _text_filter_candidates(
-        self,
-        query_normalized: str,
-        max_candidates: int,
-        source_filter: Optional[str] = None,
-    ) -> set[int]:
-        """
-        Filter candidates using SQL LIKE for fast text matching.
-
-        This is a generous pre-filter to reduce the embedding search space.
-        Returns set of organization IDs that contain any search term.
-        Uses `name_normalized` column for consistent matching.
-        """
-        conn = self._conn
-        assert conn is not None
-
-        # Extract search terms from the normalized query
-        search_terms = _extract_search_terms(query_normalized)
-        if not search_terms:
-            return set()
-
-        logger.debug(f"Text filter search terms: {search_terms}")
-
-        # Build OR clause for LIKE matching on any term
-        # Use name_normalized for consistent matching (already lowercased, suffixes removed)
-        like_clauses = []
-        params: list = []
-        for term in search_terms:
-            like_clauses.append("name_normalized LIKE ?")
-            params.append(f"%{term}%")
-
-        where_clause = " OR ".join(like_clauses)
-
-        # Add source filter if specified
-        if source_filter:
-            query = f"""
-                SELECT id FROM organizations
-                WHERE ({where_clause}) AND source = ?
-                LIMIT ?
-            """
-            params.append(source_filter)
-        else:
-            query = f"""
-                SELECT id FROM organizations
-                WHERE {where_clause}
-                LIMIT ?
-            """
-
-        params.append(max_candidates)
-
-        cursor = conn.execute(query, params)
-        return set(row["id"] for row in cursor)
 
     # --- USearch approximate nearest neighbor search ---
 
@@ -1559,7 +1329,6 @@ class OrganizationDatabase:
         self,
         query_int8: np.ndarray,
         top_k: int,
-        candidate_ids: Optional[set[int]] = None,
         source_filter: Optional[str] = None,
     ) -> list[tuple[CompanyRecord, float]]:
         """
@@ -1568,7 +1337,6 @@ class OrganizationDatabase:
         Args:
             query_int8: Query embedding quantized to int8
             top_k: Number of results to return
-            candidate_ids: Optional set of candidate IDs to filter results
             source_filter: Optional source filter
 
         Returns:
@@ -1577,8 +1345,8 @@ class OrganizationDatabase:
         if self._hnsw_index is None:
             return []
 
-        # Query USearch index (fetch more if we need to filter)
-        fetch_k = top_k * 10 if (candidate_ids or source_filter) else top_k
+        # Query USearch index (fetch more if we need to filter by source)
+        fetch_k = top_k * 10 if source_filter else top_k
         fetch_k = min(fetch_k, len(self._hnsw_index))
 
         matches = self._hnsw_index.search(query_int8, fetch_k)
@@ -1587,10 +1355,6 @@ class OrganizationDatabase:
         results: list[tuple[CompanyRecord, float]] = []
         for org_id, dist in zip(matches.keys, matches.distances):
             org_id = int(org_id)
-
-            # Filter if needed
-            if candidate_ids and org_id not in candidate_ids:
-                continue
 
             # Convert distance to similarity (cosine distance is 1 - cosine similarity)
             similarity = 1.0 - float(dist)
@@ -2069,143 +1833,6 @@ class OrganizationDatabase:
         logger.info(f"Deleted {deleted} records from source '{source}'")
         return deleted
 
-    def get_missing_embedding_count(self) -> int:
-        """Get count of organizations without embeddings."""
-        conn = self._connect()
-
-        cursor = conn.execute("SELECT COUNT(*) FROM organizations WHERE embedding IS NULL")
-        return cursor.fetchone()[0]
-
-    def get_organizations_without_embeddings(
-        self,
-        batch_size: int = 1000,
-        source: Optional[str] = None,
-    ) -> Iterator[tuple[int, str]]:
-        """
-        Iterate over organizations that don't have embeddings.
-
-        Args:
-            batch_size: Number of records per batch
-            source: Optional source filter
-
-        Yields:
-            Tuples of (org_id, name)
-        """
-        conn = self._connect()
-
-        last_id = 0
-        while True:
-            if source:
-                cursor = conn.execute("""
-                    SELECT id, name FROM organizations
-                    WHERE embedding IS NULL AND id > ? AND source = ?
-                    ORDER BY id
-                    LIMIT ?
-                """, (last_id, source, batch_size))
-            else:
-                cursor = conn.execute("""
-                    SELECT id, name FROM organizations
-                    WHERE embedding IS NULL AND id > ?
-                    ORDER BY id
-                    LIMIT ?
-                """, (last_id, batch_size))
-
-            rows = cursor.fetchall()
-            if not rows:
-                break
-
-            for row in rows:
-                yield (row[0], row[1])
-                last_id = row[0]
-
-    def get_embeddings_by_ids(self, org_ids: list[int]) -> dict[int, np.ndarray]:
-        """
-        Fetch float32 embeddings for given org IDs.
-
-        Args:
-            org_ids: List of organization IDs
-
-        Returns:
-            Dict mapping org_id to float32 embedding array
-        """
-        conn = self._connect()
-
-        if not org_ids:
-            return {}
-
-        placeholders = ",".join("?" * len(org_ids))
-        cursor = conn.execute(f"""
-            SELECT id, embedding FROM organizations
-            WHERE id IN ({placeholders}) AND embedding IS NOT NULL
-        """, org_ids)
-
-        result = {}
-        for row in cursor:
-            embedding_blob = row["embedding"]
-            embedding = np.frombuffer(embedding_blob, dtype=np.float32)
-            result[row["id"]] = embedding
-        return result
-
-    def get_embedding_count(self) -> int:
-        """Get count of organizations with embeddings."""
-        conn = self._connect()
-        cursor = conn.execute("SELECT COUNT(*) FROM organizations WHERE embedding IS NOT NULL")
-        return cursor.fetchone()[0]
-
-    def get_missing_embedding_ids(self, batch_size: int = 1000) -> Iterator[list[tuple[int, str]]]:
-        """
-        Yield batches of (org_id, name) tuples for records missing embeddings.
-
-        Args:
-            batch_size: Number of IDs per batch
-
-        Yields:
-            Lists of (org_id, name) tuples needing embeddings
-        """
-        conn = self._connect()
-
-        last_id = 0
-        while True:
-            cursor = conn.execute("""
-                SELECT id, name FROM organizations
-                WHERE embedding IS NULL AND id > ?
-                ORDER BY id
-                LIMIT ?
-            """, (last_id, batch_size))
-
-            rows = cursor.fetchall()
-            if not rows:
-                break
-
-            results = [(row["id"], row["name"]) for row in rows]
-            yield results
-            last_id = results[-1][0]
-
-    def update_embeddings_batch(
-        self,
-        org_ids: list[int],
-        embeddings: np.ndarray,
-    ) -> int:
-        """
-        Update embeddings for existing organizations.
-
-        Args:
-            org_ids: List of organization IDs
-            embeddings: Matrix of float32 embeddings (N x dim)
-
-        Returns:
-            Number of embeddings updated
-        """
-        conn = self._connect()
-        count = 0
-
-        for org_id, embedding in zip(org_ids, embeddings):
-            fp32_blob = embedding.astype(np.float32).tobytes()
-            conn.execute("UPDATE organizations SET embedding = ? WHERE id = ?", (fp32_blob, org_id))
-            count += 1
-
-        conn.commit()
-        return count
 
 
 
@@ -2235,11 +1862,10 @@ def get_person_database(
 
 class PersonDatabase:
     """
-    SQLite database with sqlite-vec for person vector search.
+    SQLite database with USearch for person vector search.
 
-    Uses hybrid text + vector search:
-    1. Text filtering with LIKE to reduce candidates
-    2. sqlite-vec for semantic similarity ranking
+    Uses USearch HNSW indexes for fast approximate nearest neighbor search.
+    Embeddings live only in USearch indexes, never in SQLite.
 
     Stores people from sources like Wikidata with role/org context.
     """
@@ -2264,7 +1890,7 @@ class PersonDatabase:
         self._readonly = readonly
         self._conn: Optional[sqlite3.Connection] = None
         self._is_v2: Optional[bool] = None  # Detected on first connect
-        self._schema_version: int = 1  # Updated on connect (1=legacy, 2=normalized FKs, 3=no embeddings in lite)
+        self._schema_version: int = 1  # Updated on connect (1=legacy, 2=normalized FKs, 3=normalized FKs+lite, 4=no embedding columns)
         # USearch indexes for fast approximate nearest neighbor search
         self._hnsw_index: Optional[Any] = None  # primary composite 768-dim
         self._identity_index: Optional[Any] = None  # secondary identity 256-dim (fallback)
@@ -2290,7 +1916,7 @@ class PersonDatabase:
                 self._schema_version = 2
                 logger.debug("Detected v2 schema for people")
 
-            # Check for v3 metadata table
+            # Check for schema version in db_info metadata table
             cursor = self._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='db_info'"
             )
@@ -2830,18 +2456,15 @@ class PersonDatabase:
         self,
         query_embedding: np.ndarray,
         top_k: int = 20,
-        query_text: Optional[str] = None,
-        max_text_candidates: int = 5000,
         identity_query_embedding: Optional[np.ndarray] = None,
         fallback_threshold: float = 0.75,
     ) -> list[tuple[PersonRecord, float]]:
         """
         Search for similar people using composite embedding + optional identity fallback.
 
-        Three-stage approach:
-        1. If query_text provided, use SQL LIKE to find candidates containing search terms
-        2. Primary USearch HNSW index (768-dim composite) for fast ANN search
-        3. If identity_query_embedding provided and primary scores are low, also
+        Two-stage approach:
+        1. Primary USearch HNSW index (768-dim composite) for fast ANN search
+        2. If identity_query_embedding provided and primary scores are low, also
            search the secondary identity index (256-dim) and merge results
 
         The identity fallback is used when:
@@ -2851,8 +2474,6 @@ class PersonDatabase:
         Args:
             query_embedding: Composite query embedding (768-dim = name|role|org segments)
             top_k: Number of results to return
-            query_text: Optional query text for text-based pre-filtering
-            max_text_candidates: Max candidates to keep after text filtering
             identity_query_embedding: Optional 256-dim identity embedding for fallback search
             fallback_threshold: Primary score threshold below which identity fallback is used
 
@@ -2861,25 +2482,6 @@ class PersonDatabase:
         """
         start = time.time()
         self._connect()
-
-        # Log search mode
-        if query_text:
-            logger.info(f"Person search: hybrid mode (text + embeddings) for '{query_text}'")
-        else:
-            logger.debug("Person search: embeddings-only mode (fast KNN)")
-
-        # Stage 1: Text filtering (if query_text provided)
-        candidate_ids: Optional[set[int]] = None
-        if query_text:
-            query_normalized_text = _normalize_person_name(query_text)
-            if query_normalized_text:
-                candidate_ids = self._text_filter_candidates(
-                    query_normalized_text,
-                    max_candidates=max_text_candidates,
-                )
-                logger.info(f"Text filter: {len(candidate_ids)} candidates for '{query_text}'")
-                if len(candidate_ids) == 0:
-                    return []
 
         if not self._load_hnsw_index():
             raise RuntimeError("USearch index not found. Run: corp-entity-db build-index")
@@ -2890,9 +2492,9 @@ class PersonDatabase:
         query_normalized = query_embedding / query_norm
         query_int8 = np.clip(np.round(query_normalized * 127), -127, 127).astype(np.int8)
 
-        results = self._hnsw_search(query_int8, top_k, candidate_ids)
+        results = self._hnsw_search(query_int8, top_k)
 
-        # Stage 3: Identity fallback — if identity embedding provided and primary scores are weak
+        # Stage 2: Identity fallback — if identity embedding provided and primary scores are weak
         if (
             identity_query_embedding is not None
             and self._identity_index is not None
@@ -2903,13 +2505,12 @@ class PersonDatabase:
                 f"Identity fallback: primary best={best_score:.3f}, threshold={fallback_threshold}"
             )
             identity_results = self._identity_search(
-                identity_query_embedding, top_k, candidate_ids,
+                identity_query_embedding, top_k,
             )
 
             # Merge: deduplicate by person name+source, keep higher score
             seen: dict[int, tuple[PersonRecord, float]] = {}
             for record, score in results:
-                # Use the person's DB row id (source_id is unique per person)
                 key = hash((record.name, record.source, record.source_id))
                 seen[key] = (record, score)
             for record, score in identity_results:
@@ -2927,7 +2528,6 @@ class PersonDatabase:
         self,
         query_embedding: np.ndarray,
         top_k: int,
-        candidate_ids: Optional[set[int]] = None,
     ) -> list[tuple[PersonRecord, float]]:
         """Search using the secondary identity USearch index (256-dim)."""
         if self._identity_index is None:
@@ -2940,16 +2540,13 @@ class PersonDatabase:
         query_normalized = query_embedding / query_norm
         query_int8 = np.clip(np.round(query_normalized * 127), -127, 127).astype(np.int8)
 
-        fetch_k = top_k * 10 if candidate_ids else top_k
-        fetch_k = min(fetch_k, len(self._identity_index))
+        fetch_k = min(top_k, len(self._identity_index))
 
         matches = self._identity_index.search(query_int8, fetch_k)
 
         results: list[tuple[PersonRecord, float]] = []
         for person_id, dist in zip(matches.keys, matches.distances):
             person_id = int(person_id)
-            if candidate_ids and person_id not in candidate_ids:
-                continue
             similarity = 1.0 - float(dist)
             record = self._get_record_by_id(person_id)
             if record is not None:
@@ -2958,46 +2555,6 @@ class PersonDatabase:
                 break
 
         return results
-
-    def _text_filter_candidates(
-        self,
-        query_normalized: str,
-        max_candidates: int,
-    ) -> set[int]:
-        """
-        Filter candidates using SQL LIKE for fast text matching.
-
-        Uses `name_normalized` column for consistent matching.
-        """
-        conn = self._conn
-        assert conn is not None
-
-        # Extract search terms from the normalized query
-        search_terms = _extract_search_terms(query_normalized)
-        if not search_terms:
-            return set()
-
-        logger.debug(f"Person text filter search terms: {search_terms}")
-
-        # Build OR clause for LIKE matching on any term
-        like_clauses = []
-        params: list = []
-        for term in search_terms:
-            like_clauses.append("name_normalized LIKE ?")
-            params.append(f"%{term}%")
-
-        where_clause = " OR ".join(like_clauses)
-
-        query = f"""
-            SELECT id FROM people
-            WHERE {where_clause}
-            LIMIT ?
-        """
-
-        params.append(max_candidates)
-
-        cursor = conn.execute(query, params)
-        return set(row["id"] for row in cursor)
 
     # --- USearch approximate nearest neighbor search ---
 
@@ -3059,7 +2616,6 @@ class PersonDatabase:
         self,
         query_int8: np.ndarray,
         top_k: int,
-        candidate_ids: Optional[set[int]] = None,
     ) -> list[tuple[PersonRecord, float]]:
         """
         Search using USearch index.
@@ -3067,7 +2623,6 @@ class PersonDatabase:
         Args:
             query_int8: Query embedding quantized to int8
             top_k: Number of results to return
-            candidate_ids: Optional set of candidate IDs to filter results
 
         Returns:
             List of (PersonRecord, similarity) tuples
@@ -3075,9 +2630,7 @@ class PersonDatabase:
         if self._hnsw_index is None:
             return []
 
-        # Query USearch index (fetch more if we need to filter)
-        fetch_k = top_k * 10 if candidate_ids else top_k
-        fetch_k = min(fetch_k, len(self._hnsw_index))
+        fetch_k = min(top_k, len(self._hnsw_index))
 
         matches = self._hnsw_index.search(query_int8, fetch_k)
 
@@ -3085,10 +2638,6 @@ class PersonDatabase:
         results: list[tuple[PersonRecord, float]] = []
         for person_id, dist in zip(matches.keys, matches.distances):
             person_id = int(person_id)
-
-            # Filter if needed
-            if candidate_ids and person_id not in candidate_ids:
-                continue
 
             # Convert distance to similarity (cosine distance is 1 - cosine similarity)
             similarity = 1.0 - float(dist)

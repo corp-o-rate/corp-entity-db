@@ -31,6 +31,7 @@ def main(ctx: click.Context, db_version: int | None, verbose: bool):
         download               Download database from HuggingFace
         upload                 Upload database with lite variant
         create-lite            Create lite version (no record data)
+        migrate                Migrate database schema to latest version
         repair-resume          Backfill people from org executive data (DB only)
         fix-resume             Backfill people by re-scanning Wikidata dump
 
@@ -98,9 +99,9 @@ from .management import (
     db_download,
     db_upload,
     db_create_lite,
-    db_repair_embeddings,
     db_build_index,
     db_post_import,
+    db_migrate,
 )
 
 main.add_command(db_status)
@@ -108,9 +109,9 @@ main.add_command(db_canonicalize)
 main.add_command(db_download)
 main.add_command(db_upload)
 main.add_command(db_create_lite)
-main.add_command(db_repair_embeddings)
 main.add_command(db_build_index)
 main.add_command(db_post_import)
+main.add_command(db_migrate)
 
 from .repair import db_repair_resume, db_fix_resume, db_backfill_locations, db_backfill_roles
 

@@ -292,7 +292,7 @@ def db_upload(db_path: Optional[str], repo: str, message: str, no_lite: bool, ve
     Upload entity database to HuggingFace Hub.
 
     First VACUUMs the database, then creates and uploads:
-    - Full database + lite variant (without record data or embeddings)
+    - Full database + lite variant (without record data or name_normalized)
     - USearch HNSW index files (.bin)
 
     If no path is provided, uploads from the default cache location.
@@ -347,10 +347,10 @@ def db_upload(db_path: Optional[str], repo: str, message: str, no_lite: bool, ve
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def db_create_lite(db_path: str, output: Optional[str], verbose: bool):
     """
-    Create a lite version of the database without record data or embeddings.
+    Create a lite version of the database without record data or name_normalized.
 
-    The lite version strips the `record` column and drops all embedding
-    tables. Search uses USearch HNSW index files (.bin) instead.
+    The lite version strips the `record` column and drops `name_normalized`.
+    Search uses USearch HNSW index files (.bin) instead.
 
     \b
     Examples:
@@ -367,63 +367,6 @@ def db_create_lite(db_path: str, output: Optional[str], verbose: bool):
         click.echo(f"Lite database created: {lite_path}")
     except Exception as e:
         raise click.ClickException(f"Failed to create lite database: {e}")
-
-
-@click.command("repair-embeddings")
-@click.option("--db", "db_path", type=click.Path(), help="Database path")
-@click.option("--batch-size", type=int, default=1000, help="Batch size for embedding generation (default: 1000)")
-@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_repair_embeddings(db_path: Optional[str], batch_size: int, verbose: bool):
-    """
-    Generate missing embeddings for organizations and people in the database.
-
-    This repairs databases where records were imported without embeddings.
-
-    \b
-    Examples:
-        corp-entity-db repair-embeddings
-        corp-entity-db repair-embeddings --batch-size 500
-    """
-    _configure_logging(verbose)
-
-    from corp_entity_db import OrganizationDatabase, CompanyEmbedder
-    from corp_entity_db.store import (
-        _get_shared_connection,
-        build_people_composite_index,
-        build_people_identity_index,
-    )
-
-    db_path_obj = _resolve_db_path(db_path)
-    embedder = CompanyEmbedder()
-
-    # --- Organizations (embeddings stored in DB) ---
-    org_db = OrganizationDatabase(db_path=db_path_obj, readonly=False)
-    org_missing = org_db.get_missing_embedding_count()
-    if org_missing == 0:
-        click.echo("All organizations have embeddings.", err=True)
-    else:
-        click.echo(f"Found {org_missing:,} organizations without embeddings.", err=True)
-        count = 0
-        for batch in org_db.get_missing_embedding_ids(batch_size=batch_size):
-            ids = [item[0] for item in batch]
-            names = [item[1] for item in batch]
-            embeddings = embedder.embed_batch(names)
-            org_db.update_embeddings_batch(ids, embeddings)
-            count += len(ids)
-            click.echo(f"  Repaired {count:,} / {org_missing:,} org embeddings...", err=True)
-        click.echo(f"Repaired {count:,} org embeddings.", err=True)
-    org_db.close()
-
-    # --- People (composite embeddings → USearch index only) ---
-    click.echo("Rebuilding people composite USearch index...", err=True)
-    conn = _get_shared_connection(db_path_obj, readonly=True)
-    count = build_people_composite_index(conn, embedder)
-    click.echo(f"People USearch index rebuilt: {count:,} composite vectors.", err=True)
-
-    # --- People identity index ---
-    click.echo("Rebuilding people identity USearch index...", err=True)
-    count = build_people_identity_index(conn, embedder)
-    click.echo(f"People identity index rebuilt: {count:,} vectors.", err=True)
 
 
 @click.command("build-index")
@@ -476,6 +419,8 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
 
     conn = _get_shared_connection(db_path_obj, readonly=True)
 
+    embedder = None  # Lazy load — created when first needed
+
     if identity_only:
         # Only build the identity index, skip everything else
         click.echo("\n--- Building identity USearch index for people ---", err=True)
@@ -502,7 +447,8 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
     if people:
         click.echo("\n--- Building composite USearch index for people ---", err=True)
 
-        embedder = CompanyEmbedder()
+        if embedder is None:
+            embedder = CompanyEmbedder()
 
         def people_progress(done: int, total: int) -> None:
             click.echo(f"  Generated + indexed {done:,}/{total:,} vectors...", err=True)
@@ -539,12 +485,16 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
     if orgs:
         click.echo("\n--- Building USearch index for organizations ---", err=True)
 
+        if embedder is None:
+            embedder = CompanyEmbedder()
+
         def orgs_progress(done: int, total: int) -> None:
-            click.echo(f"  Loaded {done:,}/{total:,} vectors...", err=True)
+            click.echo(f"  Generated + indexed {done:,}/{total:,} vectors...", err=True)
 
         try:
             count = build_hnsw_index(
                 conn, "organizations",
+                embedder=embedder,
                 M=m,
                 ef_construction=ef_construction,
                 ef_search=ef_search,
@@ -557,18 +507,100 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
     click.echo("\nUSearch index build complete!", err=True)
 
 
+@click.command("migrate")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_migrate(db_path: Optional[str], verbose: bool):
+    """
+    Migrate database schema to the latest version (v4).
+
+    Drops legacy embedding columns from organizations and people tables,
+    bumps schema_version to 4, and VACUUMs.
+
+    \b
+    Examples:
+        corp-entity-db migrate
+        corp-entity-db migrate --db /path/to/entities.db
+    """
+    import logging
+    import sqlite3
+
+    _configure_logging(verbose)
+    logger = logging.getLogger(__name__)
+
+    db_path_obj = _resolve_db_path(db_path)
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    click.echo(f"Database: {db_path_obj}", err=True)
+
+    conn = sqlite3.connect(str(db_path_obj), isolation_level=None)
+
+    # Read current schema version
+    current_version = 0
+    try:
+        row = conn.execute("SELECT value FROM db_info WHERE key = 'schema_version'").fetchone()
+        if row:
+            current_version = int(row[0])
+    except sqlite3.OperationalError:
+        pass  # db_info table doesn't exist
+
+    click.echo(f"Current schema version: {current_version}", err=True)
+
+    if current_version >= 4:
+        click.echo("Already up to date (v4).", err=True)
+        conn.close()
+        return
+
+    # Drop embedding column from organizations if present
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(organizations)").fetchall()}
+        if "embedding" in cols:
+            conn.execute("ALTER TABLE organizations DROP COLUMN embedding")
+            logger.info("Dropped embedding column from organizations")
+            click.echo("  Dropped embedding column from organizations", err=True)
+        else:
+            click.echo("  organizations: no embedding column (already clean)", err=True)
+    except sqlite3.OperationalError as e:
+        logger.warning(f"Could not drop embedding from organizations: {e}")
+
+    # Drop embedding column from people if present
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(people)").fetchall()}
+        if "embedding" in cols:
+            conn.execute("ALTER TABLE people DROP COLUMN embedding")
+            logger.info("Dropped embedding column from people")
+            click.echo("  Dropped embedding column from people", err=True)
+        else:
+            click.echo("  people: no embedding column (already clean)", err=True)
+    except sqlite3.OperationalError as e:
+        logger.warning(f"Could not drop embedding from people: {e}")
+
+    # Bump schema version
+    conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '4')")
+    click.echo("  Updated schema_version to 4", err=True)
+
+    # VACUUM
+    click.echo("  Running VACUUM...", err=True)
+    conn.execute("VACUUM")
+    conn.close()
+
+    db_size_mb = db_path_obj.stat().st_size / 1024**2
+    click.echo(f"Migration complete. Database size: {db_size_mb:.1f} MB", err=True)
+
+
 def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, batch_size: int = 10000, embed_batch_size: int = 64) -> None:
     """
-    Standard post-import steps: generate embeddings, build USearch indexes, VACUUM.
+    Standard post-import steps: build USearch indexes, VACUUM.
 
-    Organizations: generate missing embeddings → store in DB → build index from DB.
-    People: generate composite embeddings on-the-fly → build index directly (no DB storage).
+    All embeddings (orgs + people) are generated on-the-fly during index building.
+    No embeddings are stored in SQLite.
 
     Called automatically after imports or manually via `db post-import`.
     """
     import sqlite3
 
-    from corp_entity_db import OrganizationDatabase, CompanyEmbedder
+    from corp_entity_db.embeddings import CompanyEmbedder
     from corp_entity_db.store import (
         _get_shared_connection,
         build_hnsw_index,
@@ -578,36 +610,8 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
 
     embedder = None  # Lazy load
 
-    # --- Step 1: Generate org embeddings for new records ---
-    if orgs:
-        click.echo("\n=== Step 1: Generate org embeddings ===", err=True)
-        org_db = OrganizationDatabase(db_path=db_path_obj, readonly=False)
-
-        org_generated = 0
-        for batch in org_db.get_missing_embedding_ids(batch_size=batch_size):
-            if not batch:
-                continue
-            if embedder is None:
-                click.echo("  Loading embedding model...", err=True)
-                embedder = CompanyEmbedder()
-            for i in range(0, len(batch), embed_batch_size):
-                sub_batch = batch[i:i + embed_batch_size]
-                ids = [item[0] for item in sub_batch]
-                names = [item[1] for item in sub_batch]
-                fp32_batch = embedder.embed_batch(names, batch_size=embed_batch_size)
-                org_db.update_embeddings_batch(ids, fp32_batch)
-                org_generated += len(ids)
-                if org_generated % 10000 == 0:
-                    click.echo(f"  Generated {org_generated:,} org embeddings...", err=True)
-        if org_generated:
-            click.echo(f"  Generated {org_generated:,} org embeddings", err=True)
-        else:
-            click.echo("  Organizations: all embeddings up to date", err=True)
-
-        org_db.close()
-
-    # --- Step 2: Build USearch indexes ---
-    click.echo("\n=== Step 2: Build USearch indexes ===", err=True)
+    # --- Step 1: Build USearch indexes ---
+    click.echo("\n=== Step 1: Build USearch indexes ===", err=True)
 
     conn = _get_shared_connection(db_path_obj, readonly=True)
 
@@ -635,11 +639,20 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
         click.echo(f"  People identity index: {count:,} vectors", err=True)
 
     if orgs:
-        count = build_hnsw_index(conn, "organizations")
+        if embedder is None:
+            click.echo("  Loading embedding model...", err=True)
+            embedder = CompanyEmbedder()
+
+        def orgs_progress(done: int, total: int) -> None:
+            click.echo(f"  Organizations: {done:,}/{total:,} vectors...", err=True)
+
+        count = build_hnsw_index(conn, "organizations", embedder=embedder,
+                                 embed_batch_size=embed_batch_size,
+                                 progress_callback=orgs_progress)
         click.echo(f"  Organizations USearch index: {count:,} vectors", err=True)
 
-    # --- Step 3: VACUUM ---
-    click.echo("\n=== Step 3: VACUUM database ===", err=True)
+    # --- Step 2: VACUUM ---
+    click.echo("\n=== Step 2: VACUUM database ===", err=True)
     vacuum_conn = sqlite3.connect(str(db_path_obj))
     vacuum_conn.execute("VACUUM")
     vacuum_conn.close()
@@ -657,15 +670,14 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def db_post_import(db_path: Optional[str], people: bool, orgs: bool, batch_size: int, verbose: bool):
     """
-    Run standard post-import steps: embeddings, USearch indexes, VACUUM.
+    Run standard post-import steps: build USearch indexes, VACUUM.
 
     Run this after any import command to ensure search indexes are up to date.
 
     \b
     Steps:
-    1. Generate embeddings for new records
-    2. Build USearch HNSW indexes for fast search
-    3. VACUUM database to reclaim space
+    1. Build USearch HNSW indexes for fast search (embeddings generated on-the-fly)
+    2. VACUUM database to reclaim space
 
     \b
     Examples:

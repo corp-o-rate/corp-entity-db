@@ -53,7 +53,6 @@ uv publish                     # Publish to PyPI (requires credentials)
 ### CLI Examples
 ```bash
 corp-entity-db search "Microsoft"              # Search organizations (USearch HNSW)
-corp-entity-db search "Microsoft" --hybrid     # Hybrid text + embeddings search
 corp-entity-db search-people "Tim Cook"        # Search people (composite embeddings)
 corp-entity-db search-people "Tim Cook" --role CEO --org Apple  # Constrained composite search
 corp-entity-db search-roles "CEO"              # Search roles
@@ -75,12 +74,11 @@ corp-entity-db import-ch-officers --file officers.zip --limit 10000
 corp-entity-db import-wikidata-dump --download --limit 50000
 
 # Database management
+corp-entity-db migrate                         # Migrate schema to v4 (drops embedding columns)
 corp-entity-db canonicalize                    # Link equivalent records across sources
-corp-entity-db post-import                     # Run after any import: embeddings + USearch index + VACUUM
+corp-entity-db post-import                     # Run after any import: build USearch indexes + VACUUM
 corp-entity-db build-index                     # Build all USearch HNSW indexes
 corp-entity-db build-index --identity-only     # Build only the people identity index
-corp-entity-db repair-embeddings               # Generate missing embeddings
-corp-entity-db migrate-embeddings              # Migrate from legacy vec0 tables to embedding column
 corp-entity-db download                        # Download lite version + USearch indexes (default)
 corp-entity-db download --full                 # Download full version + USearch indexes
 corp-entity-db upload                          # Upload with lite variant + USearch indexes
@@ -119,13 +117,12 @@ The frontend can connect to the entity database via two backends (configured by 
 - `Canonicalizer` - Link equivalent records across data sources
 
 ### Database Schema
-- Schema version: v3 with normalized FK references (INTEGER FKs replace TEXT enums)
-- Variants: full (`entities-v3.db`), lite (`entities-v3-lite.db` - drops org embedding column, uses USearch only)
-- Default DB path: `~/.cache/corp-extractor/entities-v2.db` (symlinked to v3)
+- Schema version: v4 with normalized FK references (INTEGER FKs replace TEXT enums), no embedding columns
+- Variants: full (`entities-v4.db`), lite (`entities-v4-lite.db` - drops `record` and `name_normalized` columns)
+- Default DB path: `~/.cache/corp-extractor/entities-v2.db` (symlinked to v4)
 - USearch indexes: `people_usearch.bin`, `people_identity_usearch.bin`, `organizations_usearch.bin` (same dir as DB)
-- People embeddings exist **only** in USearch indexes, never in the SQLite `people` table — they are generated on-the-fly during index building
+- **All embeddings** (orgs + people) exist **only** in USearch HNSW indexes, never in SQLite — generated on-the-fly during index building
 - Two people indexes: primary composite (768-dim, name|role|org segments) and secondary identity (256-dim Matryoshka, `"{name}, a {type_label}"`)
-- Organization embeddings are stored as float32 BLOBs in the `organizations` table (full DB) and also in USearch index
 - Tables: `organizations`, `people`, `roles`, `locations`, `location_types`, `db_info`
 
 ### Organization EntityType Classification
@@ -193,13 +190,11 @@ The default install (`pip install corp-entity-db`) includes only search dependen
 ### Key Technical Notes
 - USearch `expansion_search=200` must be set after `Index.restore()` (default resets to 64)
 - SQLite pragmas: 256MB mmap, 500MB page cache, WAL journal mode
-- **Organization embeddings**: stored as float32 BLOB in `organizations` table (NOT NULL in full DB); also indexed in USearch
-- **People embeddings**: stored **only** in USearch HNSW indexes, NOT in SQLite — generated on-the-fly during index building
+- **All embeddings** (orgs + people): stored **only** in USearch HNSW indexes, NOT in SQLite — generated on-the-fly during index building
 - **Primary people index** (`people_usearch.bin`): 768-dim composite embeddings (name|role|org as 3×256-dim segments). Name, role, and org are embedded separately, independently L2-normalized (Matryoshka truncation), weighted (name=8, role=1, org=4), and concatenated. This gives AND-style matching where a bad match on org cannot be compensated by a good match on role. Built by `build_people_composite_index()`.
 - **Secondary identity index** (`people_identity_usearch.bin`): 256-dim Matryoshka-truncated embeddings of `format_person_query()` text (e.g. `"Taylor Swift, an artist"`, `"Tim Cook, a CEO of Apple"`). Used as fallback when primary composite scores are below threshold (0.75). Built by `build_people_identity_index()`.
-- Lite database ships without org embedding column — uses USearch HNSW indexes for ANN search
+- Lite database drops `record` and `name_normalized` columns — uses USearch HNSW indexes for ANN search
 - Int8 quantization for USearch is computed on-the-fly during index build (not stored)
-- Hybrid search: text filtering + USearch embeddings
 - Embedding model: `google/embeddinggemma-300m` (300M params)
 - PyPI package: `corp-entity-db`
 - CLI entry point: `corp-entity-db`

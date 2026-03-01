@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 class SearchRequest(BaseModel):
     query: str
     limit: int = 10
-    hybrid: bool = False
 
 
 class SearchPeopleRequest(BaseModel):
@@ -158,7 +157,7 @@ def health():
 def search_organizations(req: SearchRequest):
     """Search organizations by name."""
     t0 = time.time()
-    logger.info(f"Search organizations: '{req.query}' (limit={req.limit}, hybrid={req.hybrid})")
+    logger.info(f"Search organizations: '{req.query}' (limit={req.limit})")
 
     embedder = _get_embedder()
     org_db = _get_org_db()
@@ -168,7 +167,6 @@ def search_organizations(req: SearchRequest):
     results = org_db.search(
         query_embedding,
         top_k=req.limit,
-        query_text=req.query if req.hybrid else None,
     )
 
     elapsed = time.time() - t0
@@ -206,7 +204,6 @@ def search_people(req: SearchPeopleRequest):
     results = person_db.search(
         query_embedding,
         top_k=req.limit,
-        query_text=req.query,
         identity_query_embedding=identity_embedding,
     )
 
@@ -282,7 +279,7 @@ def resolve_entity(req: ResolveRequest):
         query_embedding = embedder.embed_composite_person(req.name, role=None, org=None)
         identity_embedding = embedder.embed_for_identity_index(req.name)
         results = person_db.search(
-            query_embedding, top_k=1, query_text=req.name,
+            query_embedding, top_k=1,
             identity_query_embedding=identity_embedding,
         )
         elapsed = time.time() - t0

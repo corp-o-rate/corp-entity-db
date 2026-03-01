@@ -32,13 +32,13 @@ class TestEntityDBClient:
         mock_resp.json.return_value = [{"record": {"name": "Microsoft"}, "similarity_score": 0.95}]
         mock_httpx.post.return_value = mock_resp
 
-        result = client.search_organizations("Microsoft", limit=5, hybrid=True)
+        result = client.search_organizations("Microsoft", limit=5)
 
         assert len(result) == 1
         assert result[0]["record"]["name"] == "Microsoft"
         mock_httpx.post.assert_called_once_with(
             "http://localhost:9999/search",
-            json={"query": "Microsoft", "limit": 5, "hybrid": True},
+            json={"query": "Microsoft", "limit": 5},
             timeout=120,
         )
 

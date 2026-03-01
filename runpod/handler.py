@@ -44,9 +44,9 @@ result_cache: OrderedDict[str, str] = OrderedDict()
 cache_size_bytes = 0
 
 
-def get_cache_key(query: str, search_type: str, limit: int, hybrid: bool, role: str = None, org: str = None) -> str:
+def get_cache_key(query: str, search_type: str, limit: int, role: str = None, org: str = None) -> str:
     """Generate a cache key from input parameters."""
-    key_str = f"{search_type}:limit={limit}:hybrid={hybrid}:role={role}:org={org}:{query}"
+    key_str = f"{search_type}:limit={limit}:role={role}:org={org}:{query}"
     return hashlib.sha256(key_str.encode()).hexdigest()
 
 
@@ -104,13 +104,12 @@ def initialize():
     logger.info("All databases initialized")
 
 
-def search_organizations(query: str, limit: int, hybrid: bool) -> list[dict]:
+def search_organizations(query: str, limit: int) -> list[dict]:
     """Search organizations using embedding similarity."""
     embedding = embedder.embed(query)
     results = org_db.search(
         query_embedding=embedding,
         top_k=limit,
-        query_text=query if hybrid else None,
     )
     return [
         {"record": record.model_dump(mode="json"), "score": float(score)}
@@ -118,7 +117,7 @@ def search_organizations(query: str, limit: int, hybrid: bool) -> list[dict]:
     ]
 
 
-def search_people(query: str, limit: int, hybrid: bool, role: str = None, org: str = None, person_type: str = None) -> list[dict]:
+def search_people(query: str, limit: int, role: str = None, org: str = None, person_type: str = None) -> list[dict]:
     """Search people using composite embedding similarity (name + role + org) with identity fallback."""
     from corp_entity_db.store import format_person_query
 
@@ -131,7 +130,6 @@ def search_people(query: str, limit: int, hybrid: bool, role: str = None, org: s
     results = person_db.search(
         query_embedding=embedding,
         top_k=limit,
-        query_text=query if hybrid else None,
         identity_query_embedding=identity_embedding,
     )
     return [
@@ -167,8 +165,7 @@ def handler(job):
         "input": {
             "query": "Microsoft",
             "type": "org",        // "org" | "person" | "role" | "location"
-            "limit": 10,          // optional, default 10
-            "hybrid": false       // optional, default false (text + embeddings for org/person)
+            "limit": 10           // optional, default 10
         }
     }
     """
@@ -182,7 +179,6 @@ def handler(job):
 
     search_type = job_input.get("type", "org")
     limit = int(job_input.get("limit", 10))
-    hybrid = bool(job_input.get("hybrid", False))
 
     if search_type not in ("org", "person", "role", "location"):
         return {"error": f"Invalid type '{search_type}'. Must be one of: org, person, role, location"}
@@ -191,10 +187,10 @@ def handler(job):
     org = job_input.get("org", None)
     person_type = job_input.get("person_type", None)
 
-    logger.info(f"Search: type={search_type}, query='{query}', limit={limit}, hybrid={hybrid}, role={role}, org={org}")
+    logger.info(f"Search: type={search_type}, query='{query}', limit={limit}, role={role}, org={org}")
 
     # Check cache
-    cache_key = get_cache_key(query, search_type, limit, hybrid, role=role, org=org)
+    cache_key = get_cache_key(query, search_type, limit, role=role, org=org)
     if cache_key in result_cache:
         result_cache.move_to_end(cache_key)
         logger.info(f"Cache hit: {cache_key[:16]}...")
@@ -205,9 +201,9 @@ def handler(job):
     start_time = time.time()
 
     if search_type == "org":
-        results = search_organizations(query, limit, hybrid)
+        results = search_organizations(query, limit)
     elif search_type == "person":
-        results = search_people(query, limit, hybrid, role=role, org=org, person_type=person_type)
+        results = search_people(query, limit, role=role, org=org, person_type=person_type)
     elif search_type == "role":
         results = search_roles(query, limit)
     elif search_type == "location":
