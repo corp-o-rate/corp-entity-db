@@ -240,9 +240,9 @@ QUERY_TYPE_TO_PERSON_TYPE: dict[str, PersonType] = {
     "athlete": PersonType.ATHLETE,
     "artist": PersonType.ARTIST,
     "academic": PersonType.ACADEMIC,
-    "scientist": PersonType.SCIENTIST,
+    "scientist": PersonType.ACADEMIC,
     "journalist": PersonType.JOURNALIST,
-    "entrepreneur": PersonType.ENTREPRENEUR,
+    "entrepreneur": PersonType.EXECUTIVE,
     "activist": PersonType.ACTIVIST,
 }
 
@@ -818,11 +818,11 @@ class WikidataPeopleImporter:
             elif any(kw in description_lower for kw in ["professor", "academic"]):
                 person_type = PersonType.ACADEMIC
             elif any(kw in description_lower for kw in ["scientist", "researcher"]):
-                person_type = PersonType.SCIENTIST
+                person_type = PersonType.ACADEMIC
             elif any(kw in description_lower for kw in ["journalist", "reporter"]):
                 person_type = PersonType.JOURNALIST
             elif any(kw in description_lower for kw in ["founder", "entrepreneur"]):
-                person_type = PersonType.ENTREPRENEUR
+                person_type = PersonType.EXECUTIVE
 
             record = PersonRecord(
                 name=label,

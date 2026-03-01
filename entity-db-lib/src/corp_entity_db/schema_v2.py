@@ -356,6 +356,6 @@ def create_all_tables(conn, embedding_dim: int = 768) -> None:
         conn.execute(ddl)
 
     # Set schema version
-    conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '4')")
+    conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '5')")
 
     conn.commit()

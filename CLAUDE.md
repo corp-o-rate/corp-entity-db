@@ -74,7 +74,7 @@ corp-entity-db import-ch-officers --file officers.zip --limit 10000
 corp-entity-db import-wikidata-dump --download --limit 50000
 
 # Database management
-corp-entity-db migrate                         # Migrate schema to v4 (drops embedding columns)
+corp-entity-db migrate                         # Migrate schema to latest (v5)
 corp-entity-db canonicalize                    # Link equivalent records across sources
 corp-entity-db post-import                     # Run after any import: build USearch indexes + VACUUM
 corp-entity-db build-index                     # Build all USearch HNSW indexes
@@ -117,7 +117,7 @@ The frontend can connect to the entity database via two backends (configured by 
 - `Canonicalizer` - Link equivalent records across data sources
 
 ### Database Schema
-- Schema version: v4 with normalized FK references (INTEGER FKs replace TEXT enums), no embedding columns
+- Schema version: v5 with normalized FK references (INTEGER FKs replace TEXT enums), no embedding columns
 - Variants: full (`entities-v4.db`), lite (`entities-v4-lite.db` - drops `record` and `name_normalized` columns)
 - Default DB path: `~/.cache/corp-extractor/entities-v2.db` (symlinked to v4)
 - USearch indexes: `people_usearch.bin`, `people_identity_usearch.bin`, `organizations_usearch.bin` (same dir as DB)
@@ -151,7 +151,7 @@ The frontend can connect to the entity database via two backends (configured by 
 
 | PersonType | Description | Examples |
 |------------|-------------|----------|
-| `executive` | C-suite, board members | Tim Cook, Satya Nadella |
+| `executive` | CEOs, board members, C-suite, founders | Tim Cook, Jeff Bezos |
 | `politician` | Elected officials | Joe Biden, Angela Merkel |
 | `government` | Civil servants, diplomats | Ambassadors, agency heads |
 | `military` | Military officers | Generals, admirals |
@@ -160,10 +160,8 @@ The frontend can connect to the entity database via two backends (configured by 
 | `athlete` | Sports figures | LeBron James, Lionel Messi |
 | `artist` | Traditional creatives | Tom Hanks, Taylor Swift |
 | `media` | Internet/social media personalities | YouTubers, influencers |
-| `academic` | Professors, researchers | Neil deGrasse Tyson |
-| `scientist` | Scientists, inventors | Research scientists |
+| `academic` | Professors, researchers, scientists | Neil deGrasse Tyson, Albert Einstein |
 | `journalist` | Reporters, news presenters | Anderson Cooper |
-| `entrepreneur` | Founders, business owners | Mark Zuckerberg |
 | `activist` | Advocates, campaigners | Greta Thunberg |
 | `unknown` | Unclassified people | — |
 
@@ -202,7 +200,7 @@ The default install (`pip install corp-entity-db`) includes only search dependen
 - Person records include `birth_date` and `death_date` fields, with `is_historic` property for deceased individuals
 - Canonicalization priority: wikidata > sec_edgar > companies_house
 - People search uses dual-index strategy: primary composite index searched first, identity index as fallback when scores < 0.75 threshold
-- People search performance: 82.5% acc@1, 91.4% acc@20 on 280 queries across 14 person types, 60-80ms per query after model warmup (identity fallback improves accuracy for identity-defined types like artists, athletes, activists)
+- People search performance: 55.7% acc@1, 96.1% acc@20 on 280 queries across 12 person types, 300-400ms per query after model warmup (identity fallback improves accuracy for identity-defined types like artists, athletes, activists)
 
 ### Python Library API
 

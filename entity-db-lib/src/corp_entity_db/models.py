@@ -88,20 +88,18 @@ class PersonType(str, Enum):
 
     Used for categorizing people in the person database.
     """
-    EXECUTIVE = "executive"  # CEOs, board members, C-suite
+    EXECUTIVE = "executive"  # CEOs, board members, C-suite, founders
     POLITICIAN = "politician"  # Elected officials (presidents, MPs, mayors)
     GOVERNMENT = "government"  # Civil servants, diplomats, appointed officials
     MILITARY = "military"  # Military officers, armed forces personnel
     LEGAL = "legal"  # Judges, lawyers, legal professionals
     PROFESSIONAL = "professional"  # Known for their profession (doctors, engineers, architects)
-    ACADEMIC = "academic"  # Professors, researchers
+    ACADEMIC = "academic"  # Professors, researchers, scientists
     ARTIST = "artist"  # Traditional creatives (musicians, actors, painters, writers)
     MEDIA = "media"  # Internet/social media personalities (YouTubers, influencers, podcasters)
     ATHLETE = "athlete"  # Sports figures
-    ENTREPRENEUR = "entrepreneur"  # Founders, business owners
     JOURNALIST = "journalist"  # Reporters, news presenters, columnists
     ACTIVIST = "activist"  # Advocates, campaigners
-    SCIENTIST = "scientist"  # Scientists, inventors
     UNKNOWN = "unknown"  # Type not determined
 
 
@@ -284,8 +282,7 @@ class PersonRecord(BaseModel):
     _ORG_DEFINED_TYPES = {
         PersonType.EXECUTIVE, PersonType.POLITICIAN, PersonType.GOVERNMENT,
         PersonType.MILITARY, PersonType.LEGAL, PersonType.JOURNALIST,
-        PersonType.PROFESSIONAL, PersonType.ACADEMIC, PersonType.SCIENTIST,
-        PersonType.ENTREPRENEUR,
+        PersonType.PROFESSIONAL, PersonType.ACADEMIC,
     }
 
     # Preposition used to connect the role to the org for each org-defined type
@@ -298,8 +295,6 @@ class PersonRecord(BaseModel):
         PersonType.JOURNALIST: "at",
         PersonType.PROFESSIONAL: "at",
         PersonType.ACADEMIC: "at",
-        PersonType.SCIENTIST: "at",
-        PersonType.ENTREPRENEUR: "of",
     }
 
     # Display labels for identity-defined types

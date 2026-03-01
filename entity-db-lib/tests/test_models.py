@@ -112,11 +112,11 @@ class TestPersonRecord:
         )
         assert rec.get_embedding_text() == "Jerome Powell, a Chair at Federal Reserve"
 
-    def test_get_embedding_text_entrepreneur(self):
-        """Entrepreneur is org-defined with 'of' preposition."""
+    def test_get_embedding_text_executive_founder(self):
+        """Executive with founder role uses 'of' preposition."""
         rec = PersonRecord(
             name="Jensen Huang", source="wikidata", source_id="Q4",
-            person_type=PersonType.ENTREPRENEUR,
+            person_type=PersonType.EXECUTIVE,
             known_for_role="founder",
             known_for_org_name="Nvidia",
         )
@@ -250,7 +250,7 @@ class TestEnumCompleteness:
         values = {e.value for e in PersonType}
         assert "executive" in values
         assert "unknown" in values
-        assert len(values) >= 15
+        assert len(values) >= 13
 
     def test_source_type_enum_values(self):
         values = {e.value for e in SourceTypeEnum}

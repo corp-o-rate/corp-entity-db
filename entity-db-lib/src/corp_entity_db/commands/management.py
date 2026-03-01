@@ -512,10 +512,10 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def db_migrate(db_path: Optional[str], verbose: bool):
     """
-    Migrate database schema to the latest version (v4).
+    Migrate database schema to the latest version (v5).
 
-    Drops legacy embedding columns from organizations and people tables,
-    bumps schema_version to 4, and VACUUMs.
+    v4: Drops legacy embedding columns from organizations and people tables.
+    v5: Merges scientist→academic and entrepreneur→executive person types.
 
     \b
     Examples:
@@ -547,38 +547,69 @@ def db_migrate(db_path: Optional[str], verbose: bool):
 
     click.echo(f"Current schema version: {current_version}", err=True)
 
-    if current_version >= 4:
-        click.echo("Already up to date (v4).", err=True)
+    if current_version >= 5:
+        click.echo("Already up to date (v5).", err=True)
         conn.close()
         return
 
-    # Drop embedding column from organizations if present
-    try:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(organizations)").fetchall()}
-        if "embedding" in cols:
-            conn.execute("ALTER TABLE organizations DROP COLUMN embedding")
-            logger.info("Dropped embedding column from organizations")
-            click.echo("  Dropped embedding column from organizations", err=True)
-        else:
-            click.echo("  organizations: no embedding column (already clean)", err=True)
-    except sqlite3.OperationalError as e:
-        logger.warning(f"Could not drop embedding from organizations: {e}")
+    # --- v4 migration: drop embedding columns ---
+    if current_version < 4:
+        # Drop embedding column from organizations if present
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(organizations)").fetchall()}
+            if "embedding" in cols:
+                conn.execute("ALTER TABLE organizations DROP COLUMN embedding")
+                logger.info("Dropped embedding column from organizations")
+                click.echo("  Dropped embedding column from organizations", err=True)
+            else:
+                click.echo("  organizations: no embedding column (already clean)", err=True)
+        except sqlite3.OperationalError as e:
+            logger.warning(f"Could not drop embedding from organizations: {e}")
 
-    # Drop embedding column from people if present
-    try:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(people)").fetchall()}
-        if "embedding" in cols:
-            conn.execute("ALTER TABLE people DROP COLUMN embedding")
-            logger.info("Dropped embedding column from people")
-            click.echo("  Dropped embedding column from people", err=True)
-        else:
-            click.echo("  people: no embedding column (already clean)", err=True)
-    except sqlite3.OperationalError as e:
-        logger.warning(f"Could not drop embedding from people: {e}")
+        # Drop embedding column from people if present
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(people)").fetchall()}
+            if "embedding" in cols:
+                conn.execute("ALTER TABLE people DROP COLUMN embedding")
+                logger.info("Dropped embedding column from people")
+                click.echo("  Dropped embedding column from people", err=True)
+            else:
+                click.echo("  people: no embedding column (already clean)", err=True)
+        except sqlite3.OperationalError as e:
+            logger.warning(f"Could not drop embedding from people: {e}")
 
-    # Bump schema version
-    conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '4')")
-    click.echo("  Updated schema_version to 4", err=True)
+        conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '4')")
+        click.echo("  Updated schema_version to 4", err=True)
+
+    # --- v5 migration: merge scientist→academic, entrepreneur→executive ---
+    if current_version < 5:
+        click.echo("\n  Merging person types: scientist→academic, entrepreneur→executive", err=True)
+
+        # Count records to remap
+        row = conn.execute("SELECT COUNT(*) FROM people WHERE person_type_id = 14").fetchone()
+        scientist_count = row[0] if row else 0
+        row = conn.execute("SELECT COUNT(*) FROM people WHERE person_type_id = 11").fetchone()
+        entrepreneur_count = row[0] if row else 0
+
+        logger.info(f"Remapping {scientist_count:,} scientist records to academic (14→7)")
+        logger.info(f"Remapping {entrepreneur_count:,} entrepreneur records to executive (11→1)")
+
+        conn.execute("BEGIN")
+        # Remap scientist (14) → academic (7)
+        conn.execute("UPDATE people SET person_type_id = 7 WHERE person_type_id = 14")
+        click.echo(f"  Remapped {scientist_count:,} scientist → academic", err=True)
+
+        # Remap entrepreneur (11) → executive (1)
+        conn.execute("UPDATE people SET person_type_id = 1 WHERE person_type_id = 11")
+        click.echo(f"  Remapped {entrepreneur_count:,} entrepreneur → executive", err=True)
+
+        # Remove obsolete type rows
+        conn.execute("DELETE FROM people_types WHERE id IN (11, 14)")
+        click.echo("  Removed obsolete people_types rows (scientist, entrepreneur)", err=True)
+
+        conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '5')")
+        conn.execute("COMMIT")
+        click.echo("  Updated schema_version to 5", err=True)
 
     # VACUUM
     click.echo("  Running VACUUM...", err=True)

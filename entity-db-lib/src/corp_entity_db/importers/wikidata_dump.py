@@ -290,12 +290,12 @@ OCCUPATION_TO_TYPE: dict[str, PersonType] = {
     "Q1622272": PersonType.ACADEMIC,     # university professor
 
     # Scientists
-    "Q901": PersonType.SCIENTIST,        # scientist
-    "Q1650915": PersonType.SCIENTIST,    # researcher
-    "Q169470": PersonType.SCIENTIST,     # physicist
-    "Q593644": PersonType.SCIENTIST,     # chemist
-    "Q864503": PersonType.SCIENTIST,     # biologist
-    "Q11063": PersonType.SCIENTIST,      # astronomer
+    "Q901": PersonType.ACADEMIC,        # scientist
+    "Q1650915": PersonType.ACADEMIC,    # researcher
+    "Q169470": PersonType.ACADEMIC,     # physicist
+    "Q593644": PersonType.ACADEMIC,     # chemist
+    "Q864503": PersonType.ACADEMIC,     # biologist
+    "Q11063": PersonType.ACADEMIC,      # astronomer
 
     # Journalists
     "Q1930187": PersonType.JOURNALIST,   # journalist
@@ -309,8 +309,8 @@ OCCUPATION_TO_TYPE: dict[str, PersonType] = {
     "Q18939491": PersonType.ACTIVIST,    # environmental activist
 
     # Entrepreneurs/Executives via occupation
-    "Q131524": PersonType.ENTREPRENEUR,  # entrepreneur
-    "Q43845": PersonType.ENTREPRENEUR,   # businessperson
+    "Q131524": PersonType.EXECUTIVE,  # entrepreneur
+    "Q43845": PersonType.EXECUTIVE,   # businessperson
 
     # Additional common occupations (for role coverage)
     "Q10798782": PersonType.ARTIST,      # television actor

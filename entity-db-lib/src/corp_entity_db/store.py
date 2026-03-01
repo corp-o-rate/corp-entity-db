@@ -48,14 +48,13 @@ from .hub import DB_VERSION, DEFAULT_DB_FULL_FILENAME
 # Person types whose identity is defined by their role at an organization
 _ORG_DEFINED_TYPE_STRS = {
     "executive", "politician", "government", "military", "legal", "journalist",
-    "professional", "academic", "scientist", "entrepreneur",
+    "professional", "academic",
 }
 
 _TYPE_PREPOSITIONS: dict[str, str] = {
     "executive": "of", "politician": "of", "government": "at",
     "military": "of", "legal": "at", "journalist": "at",
-    "professional": "at", "academic": "at", "scientist": "at",
-    "entrepreneur": "of",
+    "professional": "at", "academic": "at",
 }
 
 _IDENTITY_LABELS: dict[str, str] = {
@@ -2457,25 +2456,20 @@ class PersonDatabase:
         query_embedding: np.ndarray,
         top_k: int = 20,
         identity_query_embedding: Optional[np.ndarray] = None,
-        fallback_threshold: float = 0.75,
+        rrf_k: int = 60,
     ) -> list[tuple[PersonRecord, float]]:
         """
-        Search for similar people using composite embedding + optional identity fallback.
+        Search for similar people using dual-index search with RRF re-ranking.
 
-        Two-stage approach:
-        1. Primary USearch HNSW index (768-dim composite) for fast ANN search
-        2. If identity_query_embedding provided and primary scores are low, also
-           search the secondary identity index (256-dim) and merge results
-
-        The identity fallback is used when:
-        - identity_query_embedding is provided, AND
-        - the best primary score < fallback_threshold
+        Always searches both the composite index (768-dim) and identity index (256-dim),
+        then merges results using Reciprocal Rank Fusion (RRF). This ensures identity-defined
+        types (artists, athletes, etc.) get good accuracy even without role/org context.
 
         Args:
             query_embedding: Composite query embedding (768-dim = name|role|org segments)
             top_k: Number of results to return
-            identity_query_embedding: Optional 256-dim identity embedding for fallback search
-            fallback_threshold: Primary score threshold below which identity fallback is used
+            identity_query_embedding: Optional 256-dim identity embedding for dual-index search
+            rrf_k: RRF smoothing constant (default 60)
 
         Returns:
             List of (PersonRecord, similarity_score) tuples
@@ -2492,43 +2486,47 @@ class PersonDatabase:
         query_normalized = query_embedding / query_norm
         query_int8 = np.clip(np.round(query_normalized * 127), -127, 127).astype(np.int8)
 
-        results = self._hnsw_search(query_int8, top_k)
+        composite_results = self._hnsw_search(query_int8, top_k)
 
-        # Stage 2: Identity fallback — if identity embedding provided and primary scores are weak
-        if (
-            identity_query_embedding is not None
-            and self._identity_index is not None
-            and (not results or results[0][1] < fallback_threshold)
-        ):
-            best_score = results[0][1] if results else 0.0
-            logger.info(
-                f"Identity fallback: primary best={best_score:.3f}, threshold={fallback_threshold}"
-            )
-            identity_results = self._identity_search(
-                identity_query_embedding, top_k,
-            )
+        # If no identity embedding or no identity index, return composite results directly
+        if identity_query_embedding is None or self._identity_index is None:
+            results = [(record, score) for _pid, record, score in composite_results]
+            elapsed = time.time() - start
+            logger.debug(f"Person search took {elapsed:.3f}s (results={len(results)}, composite-only)")
+            return results
 
-            # Merge: deduplicate by person name+source, keep higher score
-            seen: dict[int, tuple[PersonRecord, float]] = {}
-            for record, score in results:
-                key = hash((record.name, record.source, record.source_id))
-                seen[key] = (record, score)
-            for record, score in identity_results:
-                key = hash((record.name, record.source, record.source_id))
-                if key not in seen or score > seen[key][1]:
-                    seen[key] = (record, score)
+        # Dual-index search: also search identity index
+        identity_results = self._identity_search(identity_query_embedding, top_k)
 
-            results = sorted(seen.values(), key=lambda x: x[1], reverse=True)[:top_k]
+        # RRF merge using person_id as dedup key
+        rrf_scores: dict[int, float] = {}
+        best_sim: dict[int, float] = {}
+        records: dict[int, PersonRecord] = {}
+
+        for rank, (pid, record, score) in enumerate(composite_results):
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (rrf_k + rank + 1)
+            records[pid] = record
+            best_sim[pid] = max(best_sim.get(pid, 0.0), score)
+
+        for rank, (pid, record, score) in enumerate(identity_results):
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (rrf_k + rank + 1)
+            if pid not in records:
+                records[pid] = record
+            best_sim[pid] = max(best_sim.get(pid, 0.0), score)
+
+        # Sort by RRF score descending, return top_k
+        sorted_pids = sorted(rrf_scores, key=lambda pid: rrf_scores[pid], reverse=True)[:top_k]
+        results = [(records[pid], best_sim[pid]) for pid in sorted_pids]
 
         elapsed = time.time() - start
-        logger.debug(f"Person search took {elapsed:.3f}s (results={len(results)})")
+        logger.debug(f"Person search took {elapsed:.3f}s (results={len(results)}, dual-index RRF)")
         return results
 
     def _identity_search(
         self,
         query_embedding: np.ndarray,
         top_k: int,
-    ) -> list[tuple[PersonRecord, float]]:
+    ) -> list[tuple[int, PersonRecord, float]]:
         """Search using the secondary identity USearch index (256-dim)."""
         if self._identity_index is None:
             return []
@@ -2544,13 +2542,13 @@ class PersonDatabase:
 
         matches = self._identity_index.search(query_int8, fetch_k)
 
-        results: list[tuple[PersonRecord, float]] = []
+        results: list[tuple[int, PersonRecord, float]] = []
         for person_id, dist in zip(matches.keys, matches.distances):
             person_id = int(person_id)
             similarity = 1.0 - float(dist)
             record = self._get_record_by_id(person_id)
             if record is not None:
-                results.append((record, similarity))
+                results.append((person_id, record, similarity))
             if len(results) >= top_k:
                 break
 
@@ -2616,7 +2614,7 @@ class PersonDatabase:
         self,
         query_int8: np.ndarray,
         top_k: int,
-    ) -> list[tuple[PersonRecord, float]]:
+    ) -> list[tuple[int, PersonRecord, float]]:
         """
         Search using USearch index.
 
@@ -2625,7 +2623,7 @@ class PersonDatabase:
             top_k: Number of results to return
 
         Returns:
-            List of (PersonRecord, similarity) tuples
+            List of (person_id, PersonRecord, similarity) tuples
         """
         if self._hnsw_index is None:
             return []
@@ -2635,7 +2633,7 @@ class PersonDatabase:
         matches = self._hnsw_index.search(query_int8, fetch_k)
 
         # Convert to results
-        results: list[tuple[PersonRecord, float]] = []
+        results: list[tuple[int, PersonRecord, float]] = []
         for person_id, dist in zip(matches.keys, matches.distances):
             person_id = int(person_id)
 
@@ -2644,7 +2642,7 @@ class PersonDatabase:
 
             record = self._get_record_by_id(person_id)
             if record is not None:
-                results.append((record, similarity))
+                results.append((person_id, record, similarity))
 
             if len(results) >= top_k:
                 break

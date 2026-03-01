@@ -66,7 +66,7 @@ def _map_to_person_type(
     if is_director:
         return PersonType.EXECUTIVE  # Directors are also executives
     if is_ten_percent_owner:
-        return PersonType.ENTREPRENEUR  # Significant investors
+        return PersonType.EXECUTIVE  # Significant investors
     return PersonType.UNKNOWN
 
 

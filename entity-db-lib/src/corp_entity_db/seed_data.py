@@ -50,10 +50,8 @@ PEOPLE_TYPES: list[tuple[int, str]] = [
     (8, "artist"),
     (9, "media"),
     (10, "athlete"),
-    (11, "entrepreneur"),
     (12, "journalist"),
     (13, "activist"),
-    (14, "scientist"),
     (15, "unknown"),
 ]
 

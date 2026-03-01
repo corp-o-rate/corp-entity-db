@@ -88,7 +88,7 @@ corp-entity-db serve --port 9000      # Custom port
 - **Primary composite index** (`people_usearch.bin`, 768-dim): Name, role, and organization are embedded as separate 256-dim vectors using Matryoshka truncation, independently L2-normalized, weighted (name=8, role=1, org=4), and concatenated. This gives AND-style matching: a poor match on organization cannot be compensated by a good match on name, enabling precise queries like "find the CEO named Tim Cook at Apple." Built by `build_people_composite_index()`.
 - **Secondary identity index** (`people_identity_usearch.bin`, 256-dim): Natural language descriptions (e.g. "Taylor Swift, an artist", "Tim Cook, a CEO of Apple") embedded with Matryoshka truncation to 256 dims. Consulted as fallback when composite scores are below threshold (0.75). This improves accuracy for identity-defined people (artists, athletes, media, activists) who lack role/org context and would otherwise waste 512 of 768 composite dims as zeros. Built by `build_people_identity_index()`.
 
-Search accuracy: 82.5% acc@1, 91.4% acc@20 on 280 queries across 14 person types (60-80ms per query after model warmup), with identity fallback improving accuracy for identity-defined types.
+Search accuracy: 55.7% acc@1, 96.1% acc@20 on 280 queries across 12 person types (300-400ms per query after model warmup), with identity fallback improving accuracy for identity-defined types.
 
 ## Database Variants
 
@@ -100,7 +100,7 @@ In both variants, all embeddings exist only in USearch index files (`organizatio
 ## Database Management
 
 ```bash
-corp-entity-db migrate                 # Migrate schema to v4 (drops embedding columns)
+corp-entity-db migrate                 # Migrate schema to latest (v5)
 corp-entity-db post-import             # Build USearch indexes + VACUUM
 corp-entity-db build-index             # Rebuild all USearch HNSW indexes
 corp-entity-db build-index --identity-only  # Rebuild only the people identity index
