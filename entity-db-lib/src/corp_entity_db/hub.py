@@ -19,7 +19,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # Database schema version — bump this when the schema changes
-DB_VERSION = 4
+DB_VERSION = 5
 
 # Default HuggingFace repo for entity database
 DEFAULT_REPO_ID = "Corp-o-Rate-Community/entity-references"
@@ -27,8 +27,24 @@ DEFAULT_DB_FILENAME = f"entities-v{DB_VERSION}-lite.db"  # Lite is the default (
 DEFAULT_DB_FULL_FILENAME = f"entities-v{DB_VERSION}.db"
 DEFAULT_DB_LITE_FILENAME = f"entities-v{DB_VERSION}-lite.db"
 
-# USearch index filenames (co-located with database)
-USEARCH_INDEX_FILES = ["organizations_usearch.bin", "people_usearch.bin", "people_identity_usearch.bin"]
+# USearch index base names (versioned to match DB)
+USEARCH_INDEX_BASES = ["organizations_usearch", "people_usearch", "people_identity_usearch"]
+
+# Default-version index filenames (for upload/download of current version)
+USEARCH_INDEX_FILES = [f"{base}_v{DB_VERSION}.bin" for base in USEARCH_INDEX_BASES]
+
+
+def usearch_index_filenames(version: int | None = None) -> list[str]:
+    """Return versioned USearch index filenames for a given DB version.
+
+    Args:
+        version: Schema version number. None uses DB_VERSION (latest).
+
+    Returns:
+        List of versioned index filenames.
+    """
+    v = version or DB_VERSION
+    return [f"{base}_v{v}.bin" for base in USEARCH_INDEX_BASES]
 
 # Local cache directory
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "corp-extractor"
@@ -73,15 +89,13 @@ def get_database_path(
     # Check if database exists in cache
     cache_dir = DEFAULT_CACHE_DIR
 
-    # Check common locations (v4 first, then v3/v2 fallback)
+    # Check common locations (v5 first, then older fallbacks)
     possible_paths = [
         cache_dir / filename,
+        cache_dir / "entities-v5.db",
+        cache_dir / "entities-v5-lite.db",
         cache_dir / "entities-v4.db",
         cache_dir / "entities-v4-lite.db",
-        cache_dir / "entities-v3.db",
-        cache_dir / "entities-v3-lite.db",
-        cache_dir / "entities-v2.db",  # v2 fallback (or symlink target)
-        cache_dir / "entities.db",  # Legacy v1 fallback
         Path.home() / ".cache" / "huggingface" / "hub" / f"datasets--{repo_id.replace('/', '--')}" / filename,
     ]
 
@@ -163,52 +177,6 @@ def upload_database(
 
     logger.info("Database uploaded successfully")
     return result
-
-
-def get_latest_version(repo_id: str = DEFAULT_REPO_ID) -> Optional[str]:
-    """
-    Get the latest version/commit of the database repo.
-
-    Args:
-        repo_id: HuggingFace repo ID
-
-    Returns:
-        Latest commit SHA or None if unavailable
-    """
-    try:
-        from huggingface_hub import HfApi
-
-        api = HfApi()
-        info = api.repo_info(repo_id=repo_id, repo_type="dataset")
-        return info.sha
-    except Exception as e:
-        logger.debug(f"Failed to get repo info: {e}")
-        return None
-
-
-def check_for_updates(
-    repo_id: str = DEFAULT_REPO_ID,
-    current_version: Optional[str] = None,
-) -> tuple[bool, Optional[str]]:
-    """
-    Check if a newer version of the database is available.
-
-    Args:
-        repo_id: HuggingFace repo ID
-        current_version: Current cached version (commit SHA)
-
-    Returns:
-        Tuple of (update_available: bool, latest_version: str or None)
-    """
-    latest = get_latest_version(repo_id)
-
-    if latest is None:
-        return False, None
-
-    if current_version is None:
-        return True, latest
-
-    return latest != current_version, latest
 
 
 def vacuum_database(db_path: str | Path) -> None:

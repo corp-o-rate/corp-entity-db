@@ -490,23 +490,3 @@ class SecForm4Importer:
         Form4Progress.clear()
         logger.info(f"Completed Form 4 import: {count} total records")
 
-    def get_available_quarters(self, start_year: int = 2020) -> list[tuple[int, int]]:
-        """
-        Get list of available (year, quarter) pairs.
-
-        Args:
-            start_year: First year to check
-
-        Returns:
-            List of (year, quarter) tuples
-        """
-        current_year = datetime.now().year
-        current_quarter = (datetime.now().month - 1) // 3 + 1
-
-        quarters = []
-        for year in range(start_year, current_year + 1):
-            max_q = current_quarter if year == current_year else 4
-            for quarter in range(1, max_q + 1):
-                quarters.append((year, quarter))
-
-        return quarters

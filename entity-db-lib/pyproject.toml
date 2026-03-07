@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "corp-entity-db"
-version = "0.3.0"
+version = "0.4.0"
 description = "Entity database for organizations, people, roles, and locations with embedding search"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
     "pydantic>=2.0.0",
@@ -17,6 +17,8 @@ dependencies = [
     "usearch>=2.0.0",
     "huggingface_hub>=0.20.0",
     "pycountry>=24.6.1",
+    "diskcache>=5.0.0",
+    "corp-names>=0.3.1",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +45,34 @@ packages = ["src/corp_entity_db"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.deadcode]
+exclude = ["tests"]
+ignore_names = [
+    # Enum members (accessed dynamically)
+    "GLEIF", "SEC_EDGAR", "COMPANIES_HOUSE", "WIKIDATA", "OTHER",
+    # Pydantic model fields/methods
+    "model_dump_for_db", "is_historic",
+    "canonical_name", "match_confidence", "match_details",
+    # FastAPI route handlers (registered via decorators)
+    "health", "search_organizations", "search_people",
+    "search_roles", "search_locations", "resolve_entity",
+    # Public API client
+    "EntityDBClient",
+    # SQLite row_factory assignments
+    "row_factory",
+    # NamedTuple fields
+    "embedding_texts",
+    # Public API methods
+    "resolve_with_candidates",
+    # XML iterator unpacking
+    "event",
+    # Used only in tests but testing important logic
+    "quantize_to_int8", "search_similar",
+    "PEOPLE_TYPE_ID_TO_NAME", "ORG_TYPE_ID_TO_NAME",
+    "_regions_match", "_names_match_for_canon", "_extract_search_terms",
+    "insert", "get_by_id",
+]
 
 [dependency-groups]
 dev = [

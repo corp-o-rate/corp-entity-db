@@ -29,11 +29,8 @@ from .models import (
 from .schema_v2 import create_all_tables
 from .seed_data import (
     LOCATION_TYPE_NAME_TO_ID,
-    LOCATION_TYPE_QID_TO_ID,
     LOCATION_TYPE_TO_SIMPLIFIED,
-    ORG_TYPE_ID_TO_NAME,
     ORG_TYPE_NAME_TO_ID,
-    PEOPLE_TYPE_ID_TO_NAME,
     PEOPLE_TYPE_NAME_TO_ID,
     SIMPLIFIED_LOCATION_TYPE_ID_TO_NAME,
     SOURCE_ID_TO_NAME,
@@ -43,7 +40,17 @@ from .seed_data import (
 
 logger = logging.getLogger(__name__)
 
-from .hub import DB_VERSION, DEFAULT_DB_FULL_FILENAME
+from .hub import DB_VERSION, DEFAULT_DB_FULL_FILENAME, USEARCH_INDEX_BASES
+
+import re
+_DB_VERSION_RE = re.compile(r"entities-v(\d+)")
+
+
+def _usearch_filename(db_path: Path, base_index: int) -> str:
+    """Return versioned USearch index filename matching the DB version in db_path."""
+    m = _DB_VERSION_RE.search(db_path.name)
+    v = int(m.group(1)) if m else DB_VERSION
+    return f"{USEARCH_INDEX_BASES[base_index]}_v{v}.bin"
 
 # Person types whose identity is defined by their role at an organization
 _ORG_DEFINED_TYPE_STRS = {
@@ -58,6 +65,17 @@ _TYPE_PREPOSITIONS: dict[str, str] = {
 }
 
 _IDENTITY_LABELS: dict[str, str] = {
+    "artist": "artist", "media": "media personality",
+    "athlete": "athlete", "activist": "activist",
+}
+
+# Type labels for ALL person types — used as fallback "{name}, a {label}"
+# when role/org are not available (identity index queries, name-only searches)
+_TYPE_LABELS: dict[str, str] = {
+    "executive": "executive", "politician": "politician",
+    "government": "government official", "military": "military officer",
+    "legal": "legal professional", "journalist": "journalist",
+    "professional": "professional", "academic": "academic",
     "artist": "artist", "media": "media personality",
     "athlete": "athlete", "activist": "activist",
 }
@@ -84,10 +102,10 @@ def format_person_query(name: str, person_type: Optional[str] = None,
             return f"{name}, {_a_or_an(role)} {role}"
         elif org:
             return f"{name} {prep} {org}"
-        return name
+        # No role/org — fall through to type label below
 
-    if person_type and person_type in _IDENTITY_LABELS:
-        label = _IDENTITY_LABELS[person_type]
+    if person_type and person_type in _TYPE_LABELS:
+        label = _TYPE_LABELS[person_type]
         return f"{name}, {_a_or_an(label)} {label}"
 
     # Unknown type or no type — use role+org if available
@@ -99,47 +117,6 @@ def format_person_query(name: str, person_type: Optional[str] = None,
         return f"{name} at {org}"
     return name
 
-
-def format_person_query_variants(name: str, person_type: Optional[str] = None,
-                                 role: Optional[str] = None, org: Optional[str] = None) -> list[str]:
-    """Generate up to 4 query embedding variants for multi-variant person search.
-
-    Variants (deduplicated):
-      [0] name_only:  "Tim Cook"
-      [1] name_type:  "Tim Cook, a CEO" (org-defined) / "Taylor Swift, an artist" (identity)
-      [2] name_org:   "Tim Cook of Apple" (with type-appropriate preposition)
-      [3] name_full:  "Tim Cook, a CEO of Apple" (full context, same as format_person_query)
-
-    When fields are missing, variants degrade to simpler forms. Duplicate texts
-    are kept in the list (the caller can deduplicate embeddings).
-    """
-    # Variant 0: name only
-    v_name = name
-
-    # Variant 1: name + type/role
-    v_name_type = name
-    if person_type and person_type in _ORG_DEFINED_TYPE_STRS:
-        if role:
-            v_name_type = f"{name}, {_a_or_an(role)} {role}"
-    elif person_type and person_type in _IDENTITY_LABELS:
-        label = _IDENTITY_LABELS[person_type]
-        v_name_type = f"{name}, {_a_or_an(label)} {label}"
-    elif role:
-        v_name_type = f"{name}, {_a_or_an(role)} {role}"
-
-    # Variant 2: name + org
-    v_name_org = name
-    if org:
-        if person_type and person_type in _ORG_DEFINED_TYPE_STRS:
-            prep = _TYPE_PREPOSITIONS[person_type]
-        else:
-            prep = "at"
-        v_name_org = f"{name} {prep} {org}"
-
-    # Variant 3: full context (same as format_person_query)
-    v_full = format_person_query(name, person_type=person_type, role=role, org=org)
-
-    return [v_name, v_name_type, v_name_org, v_full]
 
 # Default database location
 DEFAULT_DB_PATH = Path.home() / ".cache" / "corp-extractor" / DEFAULT_DB_FULL_FILENAME
@@ -213,14 +190,6 @@ def _get_shared_connection(
 
     return _shared_connections[path_key]
 
-
-def close_shared_connection(db_path: Optional[Path] = None) -> None:
-    """Close a shared database connection."""
-    path_key = str(db_path or DEFAULT_DB_PATH)
-    if path_key in _shared_connections:
-        _shared_connections[path_key].close()
-        del _shared_connections[path_key]
-        logger.debug(f"Closed shared database connection for {path_key}")
 
 # Comprehensive set of corporate legal suffixes (international)
 COMPANY_SUFFIXES: set[str] = {
@@ -641,7 +610,7 @@ def build_hnsw_index(
     M: int = 32,
     ef_construction: int = 200,
     ef_search: int = 200,
-    embed_batch_size: int = 64,
+    embed_batch_size: int = 192,
     progress_callback: Optional[Any] = None,
 ) -> int:
     """Build HNSW index for organizations by generating embeddings on-the-fly.
@@ -675,7 +644,7 @@ def build_hnsw_index(
     if entity_type != "organizations":
         raise ValueError(f"Unknown entity_type: {entity_type}. For people, use build_people_composite_index().")
 
-    index_path = cache_dir / "organizations_usearch.bin"
+    index_path = cache_dir / _usearch_filename(db_path, 0)
 
     # Count total records
     total_count = conn.execute("SELECT COUNT(*) FROM organizations").fetchone()[0]
@@ -713,18 +682,11 @@ def build_hnsw_index(
         ids = [row["id"] for row in rows]
         names = [row["name"] for row in rows]
 
-        # Generate embeddings in sub-batches
-        for i in range(0, len(ids), embed_batch_size):
-            sub_ids = ids[i:i + embed_batch_size]
-            sub_names = names[i:i + embed_batch_size]
-
-            fp32_batch = embedder.embed_batch(sub_names, batch_size=embed_batch_size)
-
-            # Quantize to int8 and add to index
-            int8_batch = np.clip(np.round(fp32_batch * 127), -127, 127).astype(np.int8)
-            ids_array = np.array(sub_ids, dtype=np.int64)
-            index.add(ids_array, int8_batch)
-            total_added += len(sub_ids)
+        fp32_batch = embedder.embed_batch(names, batch_size=embed_batch_size)
+        int8_batch = np.clip(np.round(fp32_batch * 127), -127, 127).astype(np.int8)
+        ids_array = np.array(ids, dtype=np.int64)
+        index.add(ids_array, int8_batch)
+        total_added += len(ids)
 
         last_id = ids[-1]
 
@@ -749,7 +711,7 @@ def build_people_composite_index(
     M: int = 32,
     ef_construction: int = 200,
     ef_search: int = 200,
-    embed_batch_size: int = 64,
+    embed_batch_size: int = 192,
     progress_callback: Optional[Any] = None,
 ) -> int:
     """Build USearch HNSW index for people using composite embeddings.
@@ -775,11 +737,11 @@ def build_people_composite_index(
 
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
     cache_dir = db_path.parent
-    index_path = cache_dir / "people_usearch.bin"
+    index_path = cache_dir / _usearch_filename(db_path, 1)
 
-    total_count = conn.execute("SELECT COUNT(*) FROM people").fetchone()[0]
+    total_count = conn.execute("SELECT COUNT(*) FROM people WHERE known_for_org_id IS NOT NULL").fetchone()[0]
     if total_count == 0:
-        logger.warning("No people records found")
+        logger.warning("No people with org associations found for composite index")
         return 0
 
     logger.info(f"Building composite USearch index for {total_count:,} people")
@@ -804,7 +766,7 @@ def build_people_composite_index(
             SELECT p.id, p.name, r.name as role_name, kfo.name as org_name
             FROM people p
             LEFT JOIN roles r ON p.known_for_role_id = r.id
-            LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
+            JOIN organizations kfo ON p.known_for_org_id = kfo.id
             WHERE p.id > ?
             ORDER BY p.id
             LIMIT ?
@@ -819,23 +781,14 @@ def build_people_composite_index(
         roles = [row["role_name"] for row in rows]
         orgs = [row["org_name"] for row in rows]
 
-        # Generate composite embeddings in sub-batches
-        for i in range(0, len(ids), embed_batch_size):
-            sub_ids = ids[i:i + embed_batch_size]
-            sub_names = names[i:i + embed_batch_size]
-            sub_roles = roles[i:i + embed_batch_size]
-            sub_orgs = orgs[i:i + embed_batch_size]
-
-            fp32_batch = embedder.embed_composite_person_batch(
-                names=sub_names, roles=sub_roles, orgs=sub_orgs,
-                batch_size=embed_batch_size,
-            )
-
-            # Quantize to int8 and add to index
-            int8_batch = np.clip(np.round(fp32_batch * 127), -127, 127).astype(np.int8)
-            ids_array = np.array(sub_ids, dtype=np.int64)
-            index.add(ids_array, int8_batch)
-            total_added += len(sub_ids)
+        fp32_batch = embedder.embed_composite_person_batch(
+            names=names, roles=roles, orgs=orgs,
+            batch_size=embed_batch_size,
+        )
+        int8_batch = np.clip(np.round(fp32_batch * 127), -127, 127).astype(np.int8)
+        ids_array = np.array(ids, dtype=np.int64)
+        index.add(ids_array, int8_batch)
+        total_added += len(ids)
 
         last_id = ids[-1]
 
@@ -845,6 +798,7 @@ def build_people_composite_index(
 
     logger.info(f"Saving people index to {index_path.name}...")
     index.save(str(index_path))
+    embedder.clear_segment_cache()
 
     index_size_mb = index_path.stat().st_size / 1024**2
     logger.info(f"People USearch index built: {total_added:,} vectors ({index_size_mb:.1f} MB)")
@@ -855,26 +809,23 @@ def build_people_composite_index(
 def build_people_identity_index(
     conn: sqlite3.Connection,
     embedder: "CompanyEmbedder",
-    identity_dim: int = 256,
+    segment_dim: int = 256,
     M: int = 32,
     ef_construction: int = 200,
     ef_search: int = 200,
     embed_batch_size: int = 192,
     progress_callback: Optional[Any] = None,
 ) -> int:
-    """Build USearch HNSW index for people using identity embeddings (Matryoshka 256-dim).
+    """Build USearch HNSW index for people using name-only embeddings.
 
-    For each person, builds embedding text using the same logic as
-    PersonRecord.get_embedding_text() — identity types get "{name}, a {type_label}",
-    org-defined types get their full natural language form.
-
-    The embedding is truncated to `identity_dim` dimensions and L2-normalized
-    (Matryoshka truncation), then quantized to int8 for the USearch index.
+    Embeds each person's name, truncates to segment_dim (Matryoshka),
+    L2-normalizes, and stores as int8. This index serves as a fallback
+    when composite search and SQL name lookup both fail.
 
     Args:
         conn: Database connection
         embedder: CompanyEmbedder instance for generating embeddings
-        identity_dim: Dimension of identity embeddings (default 256)
+        segment_dim: Truncation dimension (default 256, Matryoshka)
         M: HNSW connections per node
         ef_construction: Construction quality parameter
         ef_search: Search quality parameter
@@ -888,18 +839,18 @@ def build_people_identity_index(
 
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
     cache_dir = db_path.parent
-    index_path = cache_dir / "people_identity_usearch.bin"
+    index_path = cache_dir / _usearch_filename(db_path, 2)
 
     total_count = conn.execute("SELECT COUNT(*) FROM people").fetchone()[0]
     if total_count == 0:
-        logger.warning("No people records found")
+        logger.warning("No people found for identity index")
         return 0
 
-    logger.info(f"Building identity USearch index for {total_count:,} people ({identity_dim}-dim)")
+    logger.info(f"Building identity USearch index for {total_count:,} people (dim={segment_dim})")
     logger.info(f"Parameters: M={M}, ef_construction={ef_construction}, ef_search={ef_search}")
 
     index = Index(
-        ndim=identity_dim,
+        ndim=segment_dim,
         metric='cos',
         dtype='i8',
         connectivity=M,
@@ -912,47 +863,27 @@ def build_people_identity_index(
     last_id = 0
 
     while True:
-        cursor = conn.execute("""
-            SELECT p.id, p.name, pt.name as person_type,
-                   r.name as role_name, kfo.name as org_name
-            FROM people p
-            JOIN people_types pt ON p.person_type_id = pt.id
-            LEFT JOIN roles r ON p.known_for_role_id = r.id
-            LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
-            WHERE p.id > ?
-            ORDER BY p.id
-            LIMIT ?
-        """, (last_id, DB_BATCH_SIZE))
-
-        rows = cursor.fetchall()
+        rows = conn.execute(
+            "SELECT id, name FROM people WHERE id > ? ORDER BY id LIMIT ?",
+            (last_id, DB_BATCH_SIZE),
+        ).fetchall()
         if not rows:
             break
 
-        # Build embedding texts using format_person_query (mirrors PersonRecord.get_embedding_text)
         ids = [row["id"] for row in rows]
-        texts: list[str] = []
-        for row in rows:
-            texts.append(format_person_query(
-                row["name"],
-                person_type=row["person_type"],
-                role=row["role_name"],
-                org=row["org_name"],
-            ))
+        names = [row["name"] for row in rows]
 
-        # Embed in sub-batches, truncate to identity_dim, L2-normalize
-        for i in range(0, len(ids), embed_batch_size):
-            sub_ids = ids[i:i + embed_batch_size]
-            sub_texts = texts[i:i + embed_batch_size]
+        # Embed names, truncate to segment_dim, L2-normalize (Matryoshka)
+        fp32_batch = embedder.embed_batch(names, batch_size=embed_batch_size)
+        truncated = fp32_batch[:, :segment_dim].copy()
+        norms = np.linalg.norm(truncated, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        truncated /= norms
 
-            fp32_batch = embedder.embed_for_identity_index_batch(
-                sub_texts, dim=identity_dim, batch_size=embed_batch_size,
-            )
-
-            # Quantize to int8 and add to index
-            int8_batch = np.clip(np.round(fp32_batch * 127), -127, 127).astype(np.int8)
-            ids_array = np.array(sub_ids, dtype=np.int64)
-            index.add(ids_array, int8_batch)
-            total_added += len(sub_ids)
+        int8_batch = np.clip(np.round(truncated * 127), -127, 127).astype(np.int8)
+        ids_array = np.array(ids, dtype=np.int64)
+        index.add(ids_array, int8_batch)
+        total_added += len(ids)
 
         last_id = ids[-1]
 
@@ -964,9 +895,10 @@ def build_people_identity_index(
     index.save(str(index_path))
 
     index_size_mb = index_path.stat().st_size / 1024**2
-    logger.info(f"People identity index built: {total_added:,} vectors ({index_size_mb:.1f} MB)")
+    logger.info(f"Identity USearch index built: {total_added:,} vectors ({index_size_mb:.1f} MB)")
 
     return total_added
+
 
 
 def get_database(db_path: Optional[str | Path] = None, embedding_dim: int = 768, readonly: bool = True) -> "OrganizationDatabase":
@@ -1019,10 +951,6 @@ class OrganizationDatabase:
         self._schema_version: int = 1  # Updated on connect (1=legacy, 2=normalized FKs, 3=normalized FKs+lite, 4=no embedding columns)
         # USearch index for fast approximate nearest neighbor search
         self._hnsw_index: Optional[Any] = None  # usearch.index.Index
-
-    def _ensure_dir(self) -> None:
-        """Ensure database directory exists."""
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _connect(self) -> sqlite3.Connection:
         """Get or create database connection using shared connection pool."""
@@ -1291,7 +1219,7 @@ class OrganizationDatabase:
 
     def _get_hnsw_index_path(self) -> Path:
         """Get path to USearch index file."""
-        return self._db_path.parent / "organizations_usearch.bin"
+        return self._db_path.parent / _usearch_filename(self._db_path, 0)
 
     def _load_hnsw_index(self) -> bool:
         """
@@ -1723,116 +1651,6 @@ class OrganizationDatabase:
 
         conn.commit()
 
-    def get_canon_stats(self) -> dict[str, int]:
-        """Get statistics about canonicalization status."""
-        conn = self._connect()
-
-        # Total records
-        cursor = conn.execute("SELECT COUNT(*) FROM organizations")
-        total = cursor.fetchone()[0]
-
-        # Records with canon_id set
-        cursor = conn.execute("SELECT COUNT(*) FROM organizations WHERE canon_id IS NOT NULL")
-        canonicalized = cursor.fetchone()[0]
-
-        # Number of canonical groups (unique canon_ids)
-        cursor = conn.execute("SELECT COUNT(DISTINCT canon_id) FROM organizations WHERE canon_id IS NOT NULL")
-        groups = cursor.fetchone()[0]
-
-        # Multi-record groups (canon_size > 1)
-        cursor = conn.execute("SELECT COUNT(*) FROM organizations WHERE canon_size > 1")
-        multi_record_groups = cursor.fetchone()[0]
-
-        # Records in multi-record groups
-        cursor = conn.execute("""
-            SELECT COUNT(*) FROM organizations o1
-            WHERE EXISTS (SELECT 1 FROM organizations o2 WHERE o2.id = o1.canon_id AND o2.canon_size > 1)
-        """)
-        records_in_multi = cursor.fetchone()[0]
-
-        return {
-            "total_records": total,
-            "canonicalized_records": canonicalized,
-            "canonical_groups": groups,
-            "multi_record_groups": multi_record_groups,
-            "records_in_multi_groups": records_in_multi,
-        }
-
-    def migrate_name_normalized(self, batch_size: int = 50000) -> int:
-        """
-        Populate the name_normalized column for all records.
-
-        This is a one-time migration for databases that don't have
-        normalized names populated.
-
-        Args:
-            batch_size: Number of records to process per batch
-
-        Returns:
-            Number of records updated
-        """
-        conn = self._connect()
-
-        # Check how many need migration (empty, null, or placeholder "-")
-        cursor = conn.execute(
-            "SELECT COUNT(*) FROM organizations WHERE name_normalized = '' OR name_normalized IS NULL OR name_normalized = '-'"
-        )
-        empty_count = cursor.fetchone()[0]
-
-        if empty_count == 0:
-            logger.info("All records already have name_normalized populated")
-            return 0
-
-        logger.info(f"Populating name_normalized for {empty_count} records...")
-
-        updated = 0
-        last_id = 0
-
-        while True:
-            # Get batch of records that need normalization, ordered by ID
-            cursor = conn.execute("""
-                SELECT id, name FROM organizations
-                WHERE id > ? AND (name_normalized = '' OR name_normalized IS NULL OR name_normalized = '-')
-                ORDER BY id
-                LIMIT ?
-            """, (last_id, batch_size))
-
-            rows = cursor.fetchall()
-            if not rows:
-                break
-
-            # Update each record
-            for row in rows:
-                # _normalize_name now always returns non-empty for valid input
-                normalized = _normalize_name(row["name"])
-                conn.execute(
-                    "UPDATE organizations SET name_normalized = ? WHERE id = ?",
-                    (normalized, row["id"])
-                )
-                last_id = row["id"]
-
-            conn.commit()
-            updated += len(rows)
-            logger.info(f"  Updated {updated}/{empty_count} records...")
-
-        logger.info(f"Migration complete: {updated} name_normalized values populated")
-        return updated
-
-    def delete_source(self, source: str) -> int:
-        """Delete all records from a specific source."""
-        conn = self._connect()
-
-        source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
-        cursor = conn.execute("DELETE FROM organizations WHERE source_id = ?", (source_type_id,))
-
-        deleted = cursor.rowcount
-
-        conn.commit()
-
-        logger.info(f"Deleted {deleted} records from source '{source}'")
-        return deleted
-
-
 
 
 def get_person_database(
@@ -1891,12 +1709,8 @@ class PersonDatabase:
         self._is_v2: Optional[bool] = None  # Detected on first connect
         self._schema_version: int = 1  # Updated on connect (1=legacy, 2=normalized FKs, 3=normalized FKs+lite, 4=no embedding columns)
         # USearch indexes for fast approximate nearest neighbor search
-        self._hnsw_index: Optional[Any] = None  # primary composite 768-dim
-        self._identity_index: Optional[Any] = None  # secondary identity 256-dim (fallback)
-
-    def _ensure_dir(self) -> None:
-        """Ensure database directory exists."""
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._hnsw_index: Optional[Any] = None  # composite 768-dim
+        self._identity_hnsw_index: Optional[Any] = None  # identity 768-dim name-only
 
     def _connect(self) -> sqlite3.Connection:
         """Get or create database connection using shared connection pool."""
@@ -2218,6 +2032,7 @@ class PersonDatabase:
 
         updated = 0
         skipped = 0
+        unresolved_orgs = 0
         for row in rows:
             row_id, person_qid, record_json = row[0], row[1], row[2]
             rec = json.loads(record_json) if record_json else {}
@@ -2245,6 +2060,8 @@ class PersonDatabase:
                 org_info = qid_to_org.get(int(org_qid_str[1:]))
                 if org_info:
                     org_id = org_info[0]
+                else:
+                    unresolved_orgs += 1
 
             # Resolve role → role_id from P39 position QID.
             # Only fall back to P106 occupations when there is NO role_qid
@@ -2288,9 +2105,9 @@ class PersonDatabase:
 
         conn.commit()
         if skipped:
-            logger.warning(f"Resolved {updated:,} person FKs total ({skipped:,} skipped due to UNIQUE conflicts)")
+            logger.warning(f"Resolved {updated:,} person FKs total ({skipped:,} skipped due to UNIQUE conflicts, {unresolved_orgs:,} org QIDs not in organizations table)")
         else:
-            logger.info(f"Resolved {updated:,} person FKs total")
+            logger.info(f"Resolved {updated:,} person FKs total ({unresolved_orgs:,} org QIDs not in organizations table)")
         return updated
 
     def update_dates(self, source: str, source_id: str, from_date: Optional[str], to_date: Optional[str]) -> bool:
@@ -2451,25 +2268,39 @@ class PersonDatabase:
         logger.info(f"Backfilled {updated:,} known_for_org records total")
         return updated
 
+    # Tier thresholds for composite score confidence
+    COMPOSITE_HIGH = 0.95
+    COMPOSITE_LOW = 0.80
+
     def search(
         self,
         query_embedding: np.ndarray,
         top_k: int = 20,
-        identity_query_embedding: Optional[np.ndarray] = None,
-        rrf_k: int = 60,
+        query_name: Optional[str] = None,
+        embedder: Optional["CompanyEmbedder"] = None,
+        query_person_type: Optional[str] = None,
+        query_role: Optional[str] = None,
+        query_org: Optional[str] = None,
     ) -> list[tuple[PersonRecord, float]]:
         """
-        Search for similar people using dual-index search with RRF re-ranking.
+        Search for similar people using composite embeddings + name lookup fallback.
 
-        Always searches both the composite index (768-dim) and identity index (256-dim),
-        then merges results using Reciprocal Rank Fusion (RRF). This ensures identity-defined
-        types (artists, athletes, etc.) get good accuracy even without role/org context.
+        Queries composite (768-dim) HNSW index, then falls back to SQL name
+        lookup on name_normalized when composite confidence is not high.
+
+        Tiers based on max composite score:
+          - High (> 0.95): Composite only, sort by raw score.
+          - Low/Medium (<= 0.95): Merge composite + SQL name matches,
+            rerank by embedding similarity when embedder is provided.
 
         Args:
             query_embedding: Composite query embedding (768-dim = name|role|org segments)
             top_k: Number of results to return
-            identity_query_embedding: Optional 256-dim identity embedding for dual-index search
-            rrf_k: RRF smoothing constant (default 60)
+            query_name: Query name for name lookup and Levenshtein re-ranking
+            embedder: Optional embedder for description-based disambiguation
+            query_person_type: Person type hint for query description embedding
+            query_role: Role hint for query description embedding
+            query_org: Organization hint for query description embedding
 
         Returns:
             List of (PersonRecord, similarity_score) tuples
@@ -2486,94 +2317,238 @@ class PersonDatabase:
         query_normalized = query_embedding / query_norm
         query_int8 = np.clip(np.round(query_normalized * 127), -127, 127).astype(np.int8)
 
+        # Always query composite index
         composite_results = self._hnsw_search(query_int8, top_k)
 
-        # If no identity embedding or no identity index, return composite results directly
-        if identity_query_embedding is None or self._identity_index is None:
-            results = [(record, score) for _pid, record, score in composite_results]
-            elapsed = time.time() - start
-            logger.debug(f"Person search took {elapsed:.3f}s (results={len(results)}, composite-only)")
-            return results
+        max_composite_score = max((s for _, _, s in composite_results), default=0.0)
 
-        # Dual-index search: also search identity index
-        identity_results = self._identity_search(identity_query_embedding, top_k)
+        # Tier selection based on max composite score
+        if max_composite_score > self.COMPOSITE_HIGH:
+            tier = "high"
+            ranked = [(record, score) for _, record, score in composite_results]
+            ranked.sort(key=lambda x: x[1], reverse=True)
+            n_name = 0
+            n_identity = 0
+        else:
+            # Identity fallback: SQL normalized-name lookup
+            name_results = self._name_lookup(query_name, top_k) if query_name else []
+            n_name = len(name_results)
+            n_identity = 0
+            tier = "low" if max_composite_score < self.COMPOSITE_LOW else "medium"
 
-        # RRF merge using person_id as dedup key
-        rrf_scores: dict[int, float] = {}
-        best_sim: dict[int, float] = {}
-        records: dict[int, PersonRecord] = {}
+            if name_results and embedder and query_name:
+                # Disambiguate identity matches using description embeddings
+                query_desc = format_person_query(
+                    query_name, person_type=query_person_type,
+                    role=query_role, org=query_org,
+                )
+                query_desc_emb = embedder.embed(query_desc)
+                identity_candidates = [(record, score) for _pid, record, score in name_results]
+                ranked = self._disambiguate_by_embedding(
+                    identity_candidates, query_desc_emb, embedder,
+                )
+            elif name_results:
+                # No embedder — fall back to Levenshtein rerank
+                merged: list[tuple[PersonRecord, float, bool]] = [
+                    (record, score, False) for _pid, record, score in name_results
+                ]
+                ranked = self._rerank(merged, query_name)
+            else:
+                # No name results — fall back to identity HNSW index (name-only embeddings)
+                if embedder and query_name and self._load_identity_hnsw_index():
+                    name_emb = embedder.embed(query_name)
+                    identity_results = self._identity_hnsw_search(name_emb, top_k)
+                    n_identity = len(identity_results)
+                    logger.debug(f"Identity HNSW fallback: {n_identity} results")
 
-        for rank, (pid, record, score) in enumerate(composite_results):
-            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (rrf_k + rank + 1)
-            records[pid] = record
-            best_sim[pid] = max(best_sim.get(pid, 0.0), score)
-
-        for rank, (pid, record, score) in enumerate(identity_results):
-            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (rrf_k + rank + 1)
-            if pid not in records:
-                records[pid] = record
-            best_sim[pid] = max(best_sim.get(pid, 0.0), score)
-
-        # Sort by RRF score descending, return top_k
-        sorted_pids = sorted(rrf_scores, key=lambda pid: rrf_scores[pid], reverse=True)[:top_k]
-        results = [(records[pid], best_sim[pid]) for pid in sorted_pids]
+                    if identity_results:
+                        # Disambiguate identity results using description embeddings
+                        query_desc = format_person_query(
+                            query_name, person_type=query_person_type,
+                            role=query_role, org=query_org,
+                        )
+                        query_desc_emb = embedder.embed(query_desc)
+                        identity_candidates = [(record, score) for _pid, record, score in identity_results]
+                        ranked = self._disambiguate_by_embedding(
+                            identity_candidates, query_desc_emb, embedder,
+                        )
+                    else:
+                        ranked = [(record, score) for _, record, score in composite_results]
+                        ranked.sort(key=lambda x: x[1], reverse=True)
+                else:
+                    # No embedder or no identity index — use composite results as-is
+                    ranked = [(record, score) for _, record, score in composite_results]
+                    ranked.sort(key=lambda x: x[1], reverse=True)
 
         elapsed = time.time() - start
-        logger.debug(f"Person search took {elapsed:.3f}s (results={len(results)}, dual-index RRF)")
-        return results
+        logger.debug(
+            f"Person search took {elapsed:.3f}s tier={tier} "
+            f"(composite={len(composite_results)}, name={n_name}, "
+            f"identity={n_identity}, max_composite={max_composite_score:.3f})"
+        )
 
-    def _identity_search(
+        return ranked[:top_k]
+
+    def _name_lookup(
         self,
-        query_embedding: np.ndarray,
+        query_name: str,
         top_k: int,
     ) -> list[tuple[int, PersonRecord, float]]:
-        """Search using the secondary identity USearch index (256-dim)."""
-        if self._identity_index is None:
+        """Look up people by normalized name using SQL index.
+
+        Normalizes the query name with corp-names, then does an exact match
+        on name_normalized. Returns results with score=1.0 (exact name match).
+        """
+        from corp_names import normalize_name
+
+        normalized = normalize_name(query_name).normalized
+        if not normalized:
             return []
 
-        # Normalize and quantize
-        query_norm = np.linalg.norm(query_embedding)
-        if query_norm == 0:
-            return []
-        query_normalized = query_embedding / query_norm
-        query_int8 = np.clip(np.round(query_normalized * 127), -127, 127).astype(np.int8)
-
-        fetch_k = min(top_k, len(self._identity_index))
-
-        matches = self._identity_index.search(query_int8, fetch_k)
+        rows = self._conn.execute(
+            """SELECT id FROM people
+               WHERE name_normalized = ?
+               ORDER BY canon_size DESC, id
+               LIMIT ?""",
+            (normalized, top_k),
+        ).fetchall()
 
         results: list[tuple[int, PersonRecord, float]] = []
-        for person_id, dist in zip(matches.keys, matches.distances):
-            person_id = int(person_id)
-            similarity = 1.0 - float(dist)
-            record = self._get_record_by_id(person_id)
+        seen_canon: set[int] = set()
+        for row in rows:
+            person_id = row[0]
+            canon_id = self._get_canon_id(person_id)
+            if canon_id in seen_canon:
+                continue
+            seen_canon.add(canon_id)
+            record = self._get_record_by_id(canon_id)
             if record is not None:
-                results.append((person_id, record, similarity))
-            if len(results) >= top_k:
-                break
+                results.append((canon_id, record, 1.0))
 
+        logger.debug(f"Name lookup '{query_name}' -> '{normalized}': {len(results)} matches")
         return results
+
+    @staticmethod
+    def _levenshtein_ratio(a: str, b: str) -> float:
+        """Normalized Levenshtein similarity between two strings (0.0 to 1.0)."""
+        a, b = a.lower(), b.lower()
+        if a == b:
+            return 1.0
+        len_a, len_b = len(a), len(b)
+        if not len_a or not len_b:
+            return 0.0
+        # Standard DP Levenshtein distance
+        prev = list(range(len_b + 1))
+        for i in range(1, len_a + 1):
+            curr = [i] + [0] * len_b
+            for j in range(1, len_b + 1):
+                cost = 0 if a[i - 1] == b[j - 1] else 1
+                curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+            prev = curr
+        return 1.0 - prev[len_b] / max(len_a, len_b)
+
+    @staticmethod
+    def _get_embedding_cache() -> "diskcache.Cache":
+        """Get or create the diskcache for person description embeddings."""
+        import diskcache
+        cache_dir = Path.home() / ".cache" / "corp-extractor" / "person-embeddings"
+        return diskcache.Cache(directory=str(cache_dir))
+
+    def _disambiguate_by_embedding(
+        self,
+        candidates: list[tuple[PersonRecord, float]],
+        query_desc_embedding: np.ndarray,
+        embedder: "CompanyEmbedder",
+    ) -> list[tuple[PersonRecord, float]]:
+        """
+        Re-score identity-match candidates using description embedding similarity.
+
+        All candidates share the same normalized name (from identity lookup).
+        Builds a natural language description for each, embeds it, and scores
+        by cosine similarity against the query description embedding.
+        """
+        cache = self._get_embedding_cache()
+
+        uncached_texts: list[str] = []
+        uncached_indices: list[int] = []
+        candidate_embs: dict[int, np.ndarray] = {}
+
+        for idx, (record, _score) in enumerate(candidates):
+            cache_key = f"v1:{record.source}:{record.source_id}"
+            cached = cache.get(cache_key)
+            if cached is not None:
+                candidate_embs[idx] = np.frombuffer(cached, dtype=np.float32)
+            else:
+                desc = format_person_query(
+                    record.name,
+                    person_type=record.person_type.value,
+                    role=record.known_for_role,
+                    org=record.known_for_org_name,
+                )
+                uncached_texts.append(desc)
+                uncached_indices.append(idx)
+
+        # Batch-embed uncached descriptions
+        if uncached_texts:
+            embeddings = embedder.embed_batch(uncached_texts)
+            for i, idx in enumerate(uncached_indices):
+                emb = embeddings[i]
+                candidate_embs[idx] = emb
+                record = candidates[idx][0]
+                cache_key = f"v1:{record.source}:{record.source_id}"
+                cache.set(cache_key, emb.tobytes())
+
+        # Score by cosine similarity against query description
+        scored: list[tuple[PersonRecord, float]] = []
+        for idx, (record, _score) in enumerate(candidates):
+            emb = candidate_embs[idx]
+            sim = float(np.dot(query_desc_embedding, emb))
+            scored.append((record, sim))
+
+        logger.debug(
+            f"Disambiguation: {len(candidates)} identity candidates scored by embedding "
+            f"({len(uncached_texts)} newly embedded, {len(candidates) - len(uncached_texts)} cached)"
+        )
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored
+
+    @staticmethod
+    def _rerank(
+        results: list[tuple[PersonRecord, float, bool]],
+        query_name: Optional[str],
+    ) -> list[tuple[PersonRecord, float]]:
+        """
+        Re-rank merged results by Levenshtein name similarity then raw score.
+
+        Sort key (descending): name_similarity > raw_score.
+        No composite bonus — name similarity disambiguates.
+        """
+        if query_name:
+            def sort_key(r: tuple[PersonRecord, float, bool]) -> tuple[float, float]:
+                record, score, _from_composite = r
+                name_sim = PersonDatabase._levenshtein_ratio(query_name, record.name)
+                return (name_sim, score)
+        else:
+            def sort_key(r: tuple[PersonRecord, float, bool]) -> tuple[float, float]:
+                _record, score, _from_composite = r
+                return (0.0, score)
+
+        ranked = sorted(results, key=sort_key, reverse=True)
+        return [(record, score) for record, score, _from_composite in ranked]
 
     # --- USearch approximate nearest neighbor search ---
 
     def _get_hnsw_index_path(self) -> Path:
         """Get path to USearch index file."""
-        return self._db_path.parent / "people_usearch.bin"
-
-    def _get_identity_index_path(self) -> Path:
-        """Get path to identity USearch index file."""
-        return self._db_path.parent / "people_identity_usearch.bin"
+        return self._db_path.parent / _usearch_filename(self._db_path, 1)
 
     def _load_hnsw_index(self) -> bool:
         """
-        Load pre-built USearch indexes from disk.
-
-        Loads both the primary composite index (768-dim) and the secondary
-        identity index (256-dim). The identity index is optional — if missing,
-        fallback search is simply not available.
+        Load pre-built USearch composite index (768-dim) from disk.
 
         Returns:
-            True if primary index successfully loaded, False otherwise.
+            True if index successfully loaded, False otherwise.
         """
         if self._hnsw_index is not None:
             return True  # Already loaded
@@ -2586,23 +2561,12 @@ class PersonDatabase:
         try:
             from usearch.index import Index
 
-            # Load primary composite index
             logger.info(f"Loading USearch index from {index_path.name}...")
             index = Index.restore(str(index_path))
             # USearch doesn't persist expansion_search — restore it for good recall on large indexes
             index.expansion_search = 200
             self._hnsw_index = index
             logger.info(f"Loaded USearch index: {len(index):,} vectors, connectivity={index.connectivity}, ef_search={index.expansion_search}")
-
-            # Load secondary identity index (non-fatal if missing)
-            identity_path = self._get_identity_index_path()
-            if identity_path.exists():
-                identity_index = Index.restore(str(identity_path))
-                identity_index.expansion_search = 200
-                self._identity_index = identity_index
-                logger.info(f"Loaded identity index: {len(identity_index):,} vectors ({identity_index.ndim}-dim)")
-            else:
-                logger.debug(f"Identity index not found: {identity_path} (fallback disabled)")
 
             return True
 
@@ -2628,21 +2592,106 @@ class PersonDatabase:
         if self._hnsw_index is None:
             return []
 
-        fetch_k = min(top_k, len(self._hnsw_index))
+        fetch_k = min(top_k * 3, len(self._hnsw_index))
 
         matches = self._hnsw_index.search(query_int8, fetch_k)
 
-        # Convert to results
+        # Convert to results, deduplicating by canon_id so each canonical person appears once
+        seen_canon: set[int] = set()
         results: list[tuple[int, PersonRecord, float]] = []
         for person_id, dist in zip(matches.keys, matches.distances):
             person_id = int(person_id)
+            canon_id = self._get_canon_id(person_id)
+            if canon_id in seen_canon:
+                continue
+            seen_canon.add(canon_id)
 
             # Convert distance to similarity (cosine distance is 1 - cosine similarity)
             similarity = 1.0 - float(dist)
 
-            record = self._get_record_by_id(person_id)
+            # Always resolve to canonical record
+            record = self._get_record_by_id(canon_id)
             if record is not None:
-                results.append((person_id, record, similarity))
+                results.append((canon_id, record, similarity))
+
+            if len(results) >= top_k:
+                break
+
+        return results
+
+    # --- Identity HNSW index (768-dim name-only embeddings) ---
+
+    def _get_identity_index_path(self) -> Path:
+        """Get path to USearch identity index file."""
+        return self._db_path.parent / _usearch_filename(self._db_path, 2)
+
+    def _load_identity_hnsw_index(self) -> bool:
+        """Load pre-built USearch identity index (768-dim name-only) from disk."""
+        if self._identity_hnsw_index is not None:
+            return True
+
+        index_path = self._get_identity_index_path()
+        if not index_path.exists():
+            logger.debug(f"Identity USearch index not found: {index_path}")
+            return False
+
+        try:
+            from usearch.index import Index
+
+            logger.info(f"Loading identity USearch index from {index_path.name}...")
+            index = Index.restore(str(index_path))
+            index.expansion_search = 200
+            self._identity_hnsw_index = index
+            logger.info(f"Loaded identity index: {len(index):,} vectors, connectivity={index.connectivity}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to load identity USearch index: {e}")
+            return False
+
+    def _identity_hnsw_search(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int,
+    ) -> list[tuple[int, PersonRecord, float]]:
+        """Search using identity (name-only) USearch index.
+
+        Args:
+            query_embedding: 768-dim name embedding (float32, normalized).
+                Truncated to 256 dims (Matryoshka) and re-normalized before search.
+            top_k: Number of results to return
+
+        Returns:
+            List of (person_id, PersonRecord, similarity) tuples
+        """
+        if self._identity_hnsw_index is None:
+            return []
+
+        # Truncate to 256 dims (Matryoshka) and re-normalize
+        truncated = query_embedding[:256].copy()
+        norm = np.linalg.norm(truncated)
+        if norm == 0:
+            return []
+        truncated /= norm
+
+        # Quantize to int8
+        query_int8 = np.clip(np.round(truncated * 127), -127, 127).astype(np.int8)
+
+        fetch_k = min(top_k * 3, len(self._identity_hnsw_index))
+        matches = self._identity_hnsw_index.search(query_int8, fetch_k)
+
+        seen_canon: set[int] = set()
+        results: list[tuple[int, PersonRecord, float]] = []
+        for person_id, dist in zip(matches.keys, matches.distances):
+            person_id = int(person_id)
+            canon_id = self._get_canon_id(person_id)
+            if canon_id in seen_canon:
+                continue
+            seen_canon.add(canon_id)
+
+            similarity = 1.0 - float(dist)
+            record = self._get_record_by_id(canon_id)
+            if record is not None:
+                results.append((canon_id, record, similarity))
 
             if len(results) >= top_k:
                 break
@@ -2667,6 +2716,13 @@ class PersonDatabase:
             death_date=row["death_date"] or "",
             record=json.loads(row["record"]),
         )
+
+    def _get_canon_id(self, person_id: int) -> int:
+        """Get the canon_id for a person_id. Returns person_id itself if no canon."""
+        row = self._conn.execute(
+            "SELECT canon_id FROM people WHERE id = ?", (person_id,)
+        ).fetchone()
+        return row[0] if row and row[0] is not None else person_id
 
     def _get_record_by_id(self, person_id: int) -> Optional[PersonRecord]:
         """Get a person record by ID."""
@@ -2737,51 +2793,6 @@ class PersonDatabase:
             "by_type": by_type,
             "by_source": by_source,
         }
-
-    def iter_all_for_embedding(self, batch_size: int = 10000) -> Iterator[list[tuple[int, str, str | None, str | None]]]:
-        """
-        Yield batches of (person_id, name, role_name, org_name) for all people.
-
-        Used by the index builder to generate composite embeddings on-the-fly.
-        People embeddings are stored only in the USearch index, not in SQLite.
-
-        Args:
-            batch_size: Number of rows per batch
-
-        Yields:
-            Lists of (person_id, name, role_name, org_name) tuples
-        """
-        conn = self._connect()
-
-        last_id = 0
-        while True:
-            cursor = conn.execute("""
-                SELECT p.id, p.name, r.name as role_name,
-                       kfo.name as org_name
-                FROM people p
-                LEFT JOIN roles r ON p.known_for_role_id = r.id
-                LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
-                WHERE p.id > ?
-                ORDER BY p.id
-                LIMIT ?
-            """, (last_id, batch_size))
-
-            rows = cursor.fetchall()
-            if not rows:
-                break
-
-            results = [
-                (row["id"], row["name"], row["role_name"], row["org_name"])
-                for row in rows
-            ]
-            yield results
-            last_id = results[-1][0]
-
-    def get_people_count(self) -> int:
-        """Get total count of people records."""
-        conn = self._connect()
-        cursor = conn.execute("SELECT COUNT(*) FROM people")
-        return cursor.fetchone()[0]
 
     def get_all_source_ids(self, source: Optional[str] = None) -> set[str]:
         """
@@ -3384,7 +3395,6 @@ class LocationsDatabase:
         self._conn: Optional[sqlite3.Connection] = None
         self._location_cache: dict[str, int] = {}  # lookup_key -> location_id
         self._location_type_cache: dict[str, int] = {}  # type_name -> type_id
-        self._location_type_qid_cache: dict[int, int] = {}  # qid -> type_id
 
     def _connect(self) -> sqlite3.Connection:
         """Get or create database connection using shared connection pool."""
@@ -3456,7 +3466,6 @@ class LocationsDatabase:
         """Build lookup caches from database and seed data."""
         # Load location type caches from seed data
         self._location_type_cache = dict(LOCATION_TYPE_NAME_TO_ID)
-        self._location_type_qid_cache = dict(LOCATION_TYPE_QID_TO_ID)
 
         # Load existing locations into cache
         conn = self._conn
@@ -3552,96 +3561,6 @@ class LocationsDatabase:
         if source_identifier:
             self._location_cache[source_identifier.lower()] = location_id
         return location_id
-
-    def get_or_create_by_qid(
-        self,
-        name: str,
-        wikidata_type_qid: int,
-        source_id: int = 4,
-        entity_qid: Optional[int] = None,
-        source_identifier: Optional[str] = None,
-        parent_ids: Optional[list[int]] = None,
-    ) -> int:
-        """
-        Get or create a location using Wikidata P31 type QID.
-
-        Args:
-            name: Location name
-            wikidata_type_qid: Wikidata instance-of QID (e.g., 515 for city)
-            source_id: FK to source_types table
-            entity_qid: Wikidata QID of the entity itself
-            source_identifier: Optional source-specific identifier
-            parent_ids: Optional list of parent location IDs
-
-        Returns:
-            Location ID
-        """
-        location_type_id = self.get_location_type_id_from_qid(wikidata_type_qid)
-        return self.get_or_create(
-            name=name,
-            location_type_id=location_type_id,
-            source_id=source_id,
-            qid=entity_qid,
-            source_identifier=source_identifier,
-            parent_ids=parent_ids,
-        )
-
-    def get_by_id(self, location_id: int) -> Optional[LocationRecord]:
-        """Get a location record by ID."""
-        conn = self._connect()
-
-        cursor = conn.execute(
-            """
-            SELECT id, qid, name, source_id, source_identifier, location_type_id,
-                   parent_ids, from_date, to_date, record
-            FROM locations WHERE id = ?
-            """,
-            (location_id,)
-        )
-        row = cursor.fetchone()
-        if row:
-            source_name = SOURCE_ID_TO_NAME.get(row["source_id"], "wikidata")
-            location_type_id = row["location_type_id"]
-            location_type_name = self._get_location_type_name(location_type_id)
-            simplified_id = LOCATION_TYPE_TO_SIMPLIFIED.get(location_type_id, 7)
-            simplified_name = SIMPLIFIED_LOCATION_TYPE_ID_TO_NAME.get(simplified_id, "other")
-
-            parent_ids = json.loads(row["parent_ids"]) if row["parent_ids"] else []
-
-            return LocationRecord(
-                name=row["name"],
-                source=source_name,
-                source_id=row["source_identifier"],
-                qid=row["qid"],
-                location_type=location_type_name,
-                simplified_type=SimplifiedLocationType(simplified_name),
-                parent_ids=parent_ids,
-                from_date=row["from_date"],
-                to_date=row["to_date"],
-                record=json.loads(row["record"]) if row["record"] else {},
-            )
-        return None
-
-    def _get_location_type_name(self, type_id: int) -> str:
-        """Get location type name from ID."""
-        # Reverse lookup in cache
-        for name, id_ in self._location_type_cache.items():
-            if id_ == type_id:
-                return name
-        return "other"
-
-    def get_location_type_id(self, type_name: str) -> int:
-        """Get location_type_id for a type name."""
-        return self._location_type_cache.get(type_name, 36)  # default to "other"
-
-    def get_location_type_id_from_qid(self, wikidata_qid: int) -> int:
-        """Get location_type_id from Wikidata P31 QID."""
-        return self._location_type_qid_cache.get(wikidata_qid, 36)  # default to "other"
-
-    def get_simplified_type(self, location_type_id: int) -> str:
-        """Get simplified type name for a location_type_id."""
-        simplified_id = LOCATION_TYPE_TO_SIMPLIFIED.get(location_type_id, 7)
-        return SIMPLIFIED_LOCATION_TYPE_ID_TO_NAME.get(simplified_id, "other")
 
     def resolve_region_text(self, text: str) -> Optional[int]:
         """

@@ -78,7 +78,11 @@ corp-entity-db migrate                         # Migrate schema to latest (v5)
 corp-entity-db canonicalize                    # Link equivalent records across sources
 corp-entity-db post-import                     # Run after any import: build USearch indexes + VACUUM
 corp-entity-db build-index                     # Build all USearch HNSW indexes
-corp-entity-db build-index --identity-only     # Build only the people identity index
+corp-entity-db build-identity-index            # Build only the people identity index
+corp-entity-db normalize-people                # Normalize people names using corp-names
+corp-entity-db reclassify-people               # Recalculate person_type classifications
+corp-entity-db people-test                     # Run people search accuracy test
+corp-entity-db org-test                        # Run organization search accuracy test
 corp-entity-db download                        # Download lite version + USearch indexes (default)
 corp-entity-db download --full                 # Download full version + USearch indexes
 corp-entity-db upload                          # Upload with lite variant + USearch indexes
@@ -112,18 +116,17 @@ The frontend can connect to the entity database via two backends (configured by 
 - `PersonDatabase` - Search and manage people (composite embedding search)
 - `RolesDatabase` - Search roles/positions
 - `LocationsDatabase` - Search locations
-- `CompanyEmbedder` - Generate embeddings using google/embeddinggemma-300m (300M params), including composite person embeddings and identity index embeddings
+- `CompanyEmbedder` - Generate embeddings using google/embeddinggemma-300m (300M params), including composite person embeddings
 - `OrganizationResolver` - Resolve organization names to canonical records
 - `Canonicalizer` - Link equivalent records across data sources
 
 ### Database Schema
 - Schema version: v5 with normalized FK references (INTEGER FKs replace TEXT enums), no embedding columns
-- Variants: full (`entities-v4.db`), lite (`entities-v4-lite.db` - drops `record` and `name_normalized` columns)
-- Default DB path: `~/.cache/corp-extractor/entities-v2.db` (symlinked to v4)
-- USearch indexes: `people_usearch.bin`, `people_identity_usearch.bin`, `organizations_usearch.bin` (same dir as DB)
+- Variants: full (`entities-v5.db`), lite (`entities-v5-lite.db` - drops `record` and `name_normalized` columns)
+- Default DB path: `~/.cache/corp-extractor/entities-v5.db`
+- USearch indexes: versioned, co-located with DB (e.g. `organizations_usearch_v5.bin`, `people_usearch_v5.bin`, `people_identity_usearch_v5.bin`)
 - **All embeddings** (orgs + people) exist **only** in USearch HNSW indexes, never in SQLite — generated on-the-fly during index building
-- Two people indexes: primary composite (768-dim, name|role|org segments) and secondary identity (256-dim Matryoshka, `"{name}, a {type_label}"`)
-- Tables: `organizations`, `people`, `roles`, `locations`, `location_types`, `db_info`
+- Tables: `organizations`, `people`, `roles`, `locations`, `organization_types`, `people_types`, `location_types`, `simplified_location_types`, `source_types`, `db_info`
 
 ### Organization EntityType Classification
 
@@ -189,8 +192,8 @@ The default install (`pip install corp-entity-db`) includes only search dependen
 - USearch `expansion_search=200` must be set after `Index.restore()` (default resets to 64)
 - SQLite pragmas: 256MB mmap, 500MB page cache, WAL journal mode
 - **All embeddings** (orgs + people): stored **only** in USearch HNSW indexes, NOT in SQLite — generated on-the-fly during index building
-- **Primary people index** (`people_usearch.bin`): 768-dim composite embeddings (name|role|org as 3×256-dim segments). Name, role, and org are embedded separately, independently L2-normalized (Matryoshka truncation), weighted (name=8, role=1, org=4), and concatenated. This gives AND-style matching where a bad match on org cannot be compensated by a good match on role. Built by `build_people_composite_index()`.
-- **Secondary identity index** (`people_identity_usearch.bin`): 256-dim Matryoshka-truncated embeddings of `format_person_query()` text (e.g. `"Taylor Swift, an artist"`, `"Tim Cook, a CEO of Apple"`). Used as fallback when primary composite scores are below threshold (0.75). Built by `build_people_identity_index()`.
+- **People composite index** (`people_usearch_v5.bin`): 768-dim composite embeddings (name|role|org as 3×256-dim segments) for people with org associations only. Name, role, and org are embedded separately, independently L2-normalized (Matryoshka truncation), weighted (name=8, role=1, org=4), and concatenated. This gives AND-style matching where a bad match on org cannot be compensated by a good match on role. Built by `build_people_composite_index()`.
+- **People identity index** (`people_identity_usearch_v5.bin`): 256-dim Matryoshka-truncated name-only embeddings for all people. Used as fallback when composite search and SQL name lookup fail.
 - Lite database drops `record` and `name_normalized` columns — uses USearch HNSW indexes for ANN search
 - Int8 quantization for USearch is computed on-the-fly during index build (not stored)
 - Embedding model: `google/embeddinggemma-300m` (300M params)
@@ -199,8 +202,9 @@ The default install (`pip install corp-entity-db`) includes only search dependen
 - Server default port: 8222
 - Person records include `birth_date` and `death_date` fields, with `is_historic` property for deceased individuals
 - Canonicalization priority: wikidata > sec_edgar > companies_house
-- People search uses dual-index strategy: primary composite index searched first, identity index as fallback when scores < 0.75 threshold
-- People search performance: 55.7% acc@1, 96.1% acc@20 on 280 queries across 12 person types, 300-400ms per query after model warmup (identity fallback improves accuracy for identity-defined types like artists, athletes, activists)
+- People search uses composite HNSW index (only people with org associations) with SQL name-lookup fallback when composite scores ≤ 0.95, plus an identity HNSW index (768-dim name-only) as a secondary fallback
+- Composite index only indexes people with `known_for_org_id IS NOT NULL`
+- HNSW search results are canon-deduplicated (each canonical person appears once)
 
 ### Python Library API
 
@@ -209,25 +213,19 @@ from corp_entity_db import OrganizationDatabase, CompanyEmbedder, get_database_p
 
 # Search organizations
 db = OrganizationDatabase(get_database_path())
-matches = db.search("Microsoft", limit=10)
-for match in matches:
-    print(f"{match.record.name} ({match.record.entity_type}) - score: {match.score:.3f}")
+embedder = CompanyEmbedder()
+matches = db.search(embedder.embed("Microsoft"), top_k=10)
+for record, score in matches:
+    print(f"{record.name} ({record.entity_type}) - score: {score:.3f}")
 
-# Search people (composite embeddings + identity fallback)
+# Search people (composite embeddings + name fallback + identity fallback)
 from corp_entity_db import PersonDatabase, get_person_database
-from corp_entity_db.store import format_person_query
 person_db = get_person_database()
 embedder = CompanyEmbedder()
 
-# Org-defined person: composite embedding is authoritative
+# Composite search with name + identity fallback
 query_emb = embedder.embed_composite_person("Tim Cook", role="CEO", org="Apple")
-identity_emb = embedder.embed_for_identity_index(format_person_query("Tim Cook", person_type="executive"))
-matches = person_db.search(query_emb, top_k=5, identity_query_embedding=identity_emb)
-
-# Identity-defined person: composite scores low, identity fallback kicks in
-query_emb = embedder.embed_composite_person("Taylor Swift")
-identity_emb = embedder.embed_for_identity_index(format_person_query("Taylor Swift", person_type="artist"))
-matches = person_db.search(query_emb, top_k=5, identity_query_embedding=identity_emb)
+matches = person_db.search(query_emb, top_k=5, query_name="Tim Cook", embedder=embedder, query_role="CEO", query_org="Apple")
 
 # Resolve organization names
 from corp_entity_db import OrganizationResolver, get_organization_resolver

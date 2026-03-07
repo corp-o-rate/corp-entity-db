@@ -82,14 +82,16 @@ main.add_command(db_import_wikidata_dump)
 from .search import (
     db_search,
     db_search_people,
-    db_search_people_perf_test,
+    db_people_test,
+    db_org_test,
     db_search_roles,
     db_search_locations,
 )
 
 main.add_command(db_search)
 main.add_command(db_search_people)
-main.add_command(db_search_people_perf_test)
+main.add_command(db_people_test)
+main.add_command(db_org_test)
 main.add_command(db_search_roles)
 main.add_command(db_search_locations)
 
@@ -100,8 +102,11 @@ from .management import (
     db_upload,
     db_create_lite,
     db_build_index,
+    db_build_identity_index,
     db_post_import,
     db_migrate,
+    db_normalize_people,
+    db_reclassify_people,
 )
 
 main.add_command(db_status)
@@ -110,8 +115,11 @@ main.add_command(db_download)
 main.add_command(db_upload)
 main.add_command(db_create_lite)
 main.add_command(db_build_index)
+main.add_command(db_build_identity_index)
 main.add_command(db_post_import)
 main.add_command(db_migrate)
+main.add_command(db_normalize_people)
+main.add_command(db_reclassify_people)
 
 from .repair import db_repair_resume, db_fix_resume, db_backfill_locations, db_backfill_roles
 

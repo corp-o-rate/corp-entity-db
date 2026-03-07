@@ -1063,58 +1063,6 @@ class WikidataImporter:
             logger.debug(f"Failed to parse Wikidata binding: {e}")
             return None
 
-    def search_company(self, name: str, limit: int = 10) -> list[CompanyRecord]:
-        """
-        Search for a specific company by name.
 
-        Args:
-            name: Company name to search for
-            limit: Maximum results to return
-
-        Returns:
-            List of matching CompanyRecords
-        """
-        # Use Wikidata search API for better name matching
-        search_url = "https://www.wikidata.org/w/api.php"
-        params = urllib.parse.urlencode({
-            "action": "wbsearchentities",
-            "search": name,
-            "language": "en",
-            "type": "item",
-            "limit": limit,
-            "format": "json",
-        })
-
-        req = urllib.request.Request(
-            f"{search_url}?{params}",
-            headers={"User-Agent": "corp-extractor/1.0"}
-        )
-
-        with urllib.request.urlopen(req, timeout=30) as response:
-            data = json.loads(response.read().decode("utf-8"))
-
-        results = []
-        for item in data.get("search", []):
-            qid = item.get("id")
-            label = item.get("label", "")
-            description = item.get("description", "")
-
-            # Check if it looks like a company
-            company_keywords = ["company", "corporation", "inc", "ltd", "enterprise", "business"]
-            if not any(kw in description.lower() for kw in company_keywords):
-                continue
-
-            record = CompanyRecord(
-                name=label,
-                source="wikipedia",
-                source_id=qid,
-                region="",  # Not available from search API
-                record={
-                    "wikidata_id": qid,
-                    "label": label,
-                    "description": description,
-                },
-            )
-            results.append(record)
 
         return results

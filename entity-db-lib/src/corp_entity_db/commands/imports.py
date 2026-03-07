@@ -589,7 +589,7 @@ def db_import_people(db_path: Optional[str], limit: Optional[int], batch_size: i
 
         if people_to_enrich:
             click.echo(f"Found {len(people_to_enrich)} people to enrich with dates...", err=True)
-            enriched = importer.enrich_people_batch(people_to_enrich, delay_seconds=0.3)
+            importer.enrich_people_batch(people_to_enrich, delay_seconds=0.3)
 
             # Persist the enriched dates
             updated = 0
@@ -652,7 +652,7 @@ def _reader_thread(
     people_yielded = 0
     orgs_yielded = 0
 
-    def progress_callback(entity_index: int, entity_id: str, ppl_count: int, org_count: int) -> None:
+    def progress_callback(entity_index: int, entity_id: str, _ppl_count: int, _org_count: int) -> None:
         nonlocal last_entity_index, last_entity_id
         last_entity_index = entity_index
         last_entity_id = entity_id
@@ -947,7 +947,7 @@ def db_import_wikidata_dump(
         last_entity_index = start_index
         last_entity_id = ""
 
-        def location_progress_callback(entity_index: int, entity_id: str, loc_count: int) -> None:
+        def location_progress_callback(entity_index: int, entity_id: str, _loc_count: int) -> None:
             nonlocal last_entity_index, last_entity_id
             last_entity_index = entity_index
             last_entity_id = entity_id

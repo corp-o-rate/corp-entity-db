@@ -5,7 +5,6 @@ This module contains all enum values that are seeded into lookup tables
 when creating a fresh database or migrating from v1.
 """
 
-from typing import Any
 
 # =============================================================================
 # SOURCE TYPES
@@ -99,9 +98,6 @@ SIMPLIFIED_LOCATION_TYPES: list[tuple[int, str]] = [
     (7, "other"),        # Unclassified locations
 ]
 
-SIMPLIFIED_LOCATION_TYPE_NAME_TO_ID: dict[str, int] = {
-    name: id_ for id_, name in SIMPLIFIED_LOCATION_TYPES
-}
 SIMPLIFIED_LOCATION_TYPE_ID_TO_NAME: dict[int, str] = {
     id_: name for id_, name in SIMPLIFIED_LOCATION_TYPES
 }
@@ -169,15 +165,6 @@ LOCATION_TYPES: list[tuple[int, str, int | None, int]] = [
 LOCATION_TYPE_NAME_TO_ID: dict[str, int] = {
     name: id_ for id_, name, _, _ in LOCATION_TYPES
 }
-LOCATION_TYPE_ID_TO_NAME: dict[int, str] = {
-    id_: name for id_, name, _, _ in LOCATION_TYPES
-}
-
-# Mapping from Wikidata QID (P31 value) to location_type_id
-LOCATION_TYPE_QID_TO_ID: dict[int, int] = {
-    qid: id_ for id_, name, qid, _ in LOCATION_TYPES if qid is not None
-}
-
 # Mapping from location_type_id to simplified_id
 LOCATION_TYPE_TO_SIMPLIFIED: dict[int, int] = {
     id_: simplified_id for id_, _, _, simplified_id in LOCATION_TYPES
@@ -187,26 +174,6 @@ LOCATION_TYPE_TO_SIMPLIFIED: dict[int, int] = {
 # =============================================================================
 # PYCOUNTRY INTEGRATION
 # =============================================================================
-
-def get_pycountry_countries() -> list[dict[str, Any]]:
-    """
-    Get all countries from pycountry for seeding the locations table.
-
-    Returns:
-        List of dicts with keys: name, alpha_2, alpha_3, numeric
-    """
-    import pycountry
-
-    countries = []
-    for country in pycountry.countries:
-        countries.append({
-            "name": country.name,
-            "alpha_2": country.alpha_2,
-            "alpha_3": getattr(country, "alpha_3", None),
-            "numeric": getattr(country, "numeric", None),
-        })
-    return countries
-
 
 # =============================================================================
 # SEED FUNCTIONS
@@ -319,39 +286,3 @@ def seed_all_enums(conn) -> dict[str, int]:
         "simplified_location_types": seed_simplified_location_types(conn),
         "location_types": seed_location_types(conn),
     }
-
-
-def seed_pycountry_locations(conn, source_id: int = 4) -> int:
-    """
-    Seed locations table with pycountry countries.
-
-    Args:
-        conn: SQLite connection
-        source_id: Source ID to use (default: 4 = wikidata, used for pycountry data)
-
-    Returns:
-        Number of locations inserted
-    """
-    import pycountry
-
-    # Get country location_type_id
-    country_type_id = LOCATION_TYPE_NAME_TO_ID["country"]
-    count = 0
-
-    for country in pycountry.countries:
-        name = country.name
-        alpha_2 = country.alpha_2
-        name_normalized = name.lower()
-
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO locations
-            (name, name_normalized, source_id, source_identifier, location_type_id)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (name, name_normalized, source_id, alpha_2, country_type_id)
-        )
-        count += 1
-
-    conn.commit()
-    return count

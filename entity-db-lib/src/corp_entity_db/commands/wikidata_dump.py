@@ -61,9 +61,7 @@ def _reader_thread(
     people_yielded = 0
     orgs_yielded = 0
     locations_yielded = 0
-    roles_yielded = 0
-
-    def progress_callback(entity_index: int, entity_id: str, ppl_count: int, org_count: int) -> None:
+    def progress_callback(entity_index: int, entity_id: str, _ppl_count: int, _org_count: int) -> None:
         nonlocal last_entity_index, last_entity_id
         last_entity_index = entity_index
         last_entity_id = entity_id
@@ -112,9 +110,8 @@ def _reader_thread(
             location_records = []
 
     def flush_roles() -> None:
-        nonlocal role_records, roles_yielded
+        nonlocal role_records
         if role_records and not shutdown_event.is_set():
-            roles_yielded += len(role_records)
             role_queue.put(list(role_records))
             role_records = []
 
@@ -267,6 +264,53 @@ def _run_fk_only(db_path: Path, *, people: bool, orgs: bool, locations: bool) ->
         else:
             click.echo("  All occupation/position QIDs already have role records", err=True)
         roles_database.close()
+
+    # Insert discovered organizations: scan people records for org QIDs not in organizations table
+    if people and orgs and org_database:
+        click.echo("  Scanning people records for org QIDs...", err=True)
+        needed_org_qids: set[int] = set()
+        cursor = conn.execute(
+            "SELECT record FROM people WHERE source_id = 4 AND record IS NOT NULL"
+        )
+        for row in cursor:
+            rec = _json.loads(row[0]) if row[0] else {}
+            org_qid = rec.get("org_qid", "")
+            if org_qid and org_qid.startswith("Q") and org_qid[1:].isdigit():
+                needed_org_qids.add(int(org_qid[1:]))
+
+        if needed_org_qids:
+            org_conn = org_database._connect()
+            existing_org_qids = {row[0] for row in org_conn.execute(
+                "SELECT qid FROM organizations WHERE qid IS NOT NULL"
+            )}
+            missing_org_qids = needed_org_qids - existing_org_qids
+
+            if missing_org_qids:
+                click.echo(f"  Found {len(missing_org_qids):,} org QIDs not in organizations table", err=True)
+                with click.progressbar(
+                    length=len(missing_org_qids),
+                    label=f"  Fetching {len(missing_org_qids):,} org labels",
+                    file=sys.stderr,
+                ) as bar:
+                    api_labels = WikidataDumpImporter.fetch_qid_labels(
+                        missing_org_qids,
+                        progress_callback=lambda done, total: bar.update(done - bar.pos),
+                    )
+                from corp_entity_db.models import CompanyRecord, EntityType
+                org_records = []
+                for qid_int, label in api_labels.items():
+                    org_records.append(CompanyRecord(
+                        name=label,
+                        source="wikipedia",
+                        source_id=f"Q{qid_int}",
+                        entity_type=EntityType.UNKNOWN,
+                        record={"wikidata_id": f"Q{qid_int}", "label": label, "discovered_from": "people_import"},
+                    ))
+                if org_records:
+                    inserted = org_database.insert_batch(org_records)
+                    click.echo(f"  Inserted {inserted:,} discovered organizations", err=True)
+            else:
+                click.echo("  All org QIDs already in organizations table", err=True)
 
     # People FKs: resolve_fks reads each row's record JSON directly
     # Resolves country_id, known_for_org_id, and known_for_role_id
@@ -517,7 +561,7 @@ def db_import_wikidata_dump(
         last_entity_index = start_index
         last_entity_id = ""
 
-        def location_progress_callback(entity_index: int, entity_id: str, loc_count: int) -> None:
+        def location_progress_callback(entity_index: int, entity_id: str, _loc_count: int) -> None:
             nonlocal last_entity_index, last_entity_id
             last_entity_index = entity_index
             last_entity_id = entity_id
@@ -842,6 +886,53 @@ def db_import_wikidata_dump(
             click.echo("  No role records to backfill", err=True)
     else:
         click.echo("  All occupation/position QIDs already have role records", err=True)
+
+    # === Insert discovered organizations ===
+    # People referenced org QIDs (P108 employer, P39 qualifiers, etc.) that may not be
+    # in the organizations table. Insert them as stubs with labels from the Wikidata API.
+    if people and orgs and org_database:
+        discovered_qids = importer.get_discovered_org_qids()
+        if discovered_qids:
+            org_conn = org_database._connect()
+            existing_org_qids = {row[0] for row in org_conn.execute(
+                "SELECT qid FROM organizations WHERE qid IS NOT NULL"
+            )}
+            missing_qids = set()
+            for q in discovered_qids:
+                if q.startswith("Q") and q[1:].isdigit():
+                    qid_int = int(q[1:])
+                    if qid_int not in existing_org_qids:
+                        missing_qids.add(qid_int)
+
+            if missing_qids:
+                click.echo(f"\n=== Inserting {len(missing_qids):,} discovered organizations ===", err=True)
+                sys.stderr.flush()
+                with click.progressbar(
+                    length=len(missing_qids),
+                    label=f"  Fetching {len(missing_qids):,} org labels",
+                    file=sys.stderr,
+                ) as bar:
+                    api_labels = WikidataDumpImporter.fetch_qid_labels(
+                        missing_qids,
+                        progress_callback=lambda done, total: bar.update(done - bar.pos),
+                    )
+                from ..models import CompanyRecord, EntityType
+                org_records = []
+                for qid_int, label in api_labels.items():
+                    org_records.append(CompanyRecord(
+                        name=label,
+                        source="wikipedia",
+                        source_id=f"Q{qid_int}",
+                        entity_type=EntityType.UNKNOWN,
+                        record={"wikidata_id": f"Q{qid_int}", "label": label, "discovered_from": "people_import"},
+                    ))
+                if org_records:
+                    inserted = org_database.insert_batch(org_records)
+                    click.echo(f"  Inserted {inserted:,} discovered organizations", err=True)
+                else:
+                    click.echo("  No labels resolved for discovered organizations", err=True)
+            else:
+                click.echo("  All discovered org QIDs already in organizations table", err=True)
 
     # === Pass 2: Resolve FK relations ===
     click.echo("\n=== Pass 2: Resolving FK relations ===", err=True)

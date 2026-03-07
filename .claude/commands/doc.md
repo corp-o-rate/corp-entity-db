@@ -31,7 +31,9 @@ To get the current sizes and other database information.
 
 State on the website and in the README.md the current accuracy of the performance tests. Make sure any reference to the performance of the API (i.e. speed in milliseconds) is tied to the results of running (Don't use the warmup, first two or three values!!!):
 
-`uv run corp-entity-db search-people-perf-test --top-k=20 --for-llm`
+`uv run corp-entity-db people-test --top-k=20 --for-llm`
+
+The command prints the path to a JSON results file. Read that file to get the accuracy and performance data.
 
 ## Process
 

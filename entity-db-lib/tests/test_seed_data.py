@@ -11,7 +11,6 @@ from corp_entity_db.seed_data import (
     SOURCE_NAME_TO_ID,
     SOURCE_TYPES,
     seed_all_enums,
-    seed_pycountry_locations,
 )
 
 
@@ -50,18 +49,6 @@ def test_seed_all_enums_populates_tables(db_conn):
 
     cursor = db_conn.execute("SELECT COUNT(*) FROM organization_types")
     assert cursor.fetchone()[0] == len(ORGANIZATION_TYPES)
-
-
-def test_seed_pycountry_locations(db_conn):
-    """seed_pycountry_locations should insert countries; spot-check United States."""
-    seed_pycountry_locations(db_conn)
-
-    cursor = db_conn.execute(
-        "SELECT name FROM locations WHERE source_identifier = 'US'"
-    )
-    row = cursor.fetchone()
-    assert row is not None
-    assert row["name"] == "United States"
 
 
 def test_source_types_count():

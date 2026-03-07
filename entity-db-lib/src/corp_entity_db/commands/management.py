@@ -376,9 +376,8 @@ def db_create_lite(db_path: str, output: Optional[str], verbose: bool):
 @click.option("--ef-search", type=int, default=200, help="Search quality parameter (default 200)")
 @click.option("--people/--no-people", default=True, help="Build USearch index for people")
 @click.option("--orgs/--no-orgs", default=True, help="Build USearch index for organizations")
-@click.option("--identity-only", is_flag=True, help="Build only the people identity index (skip composite)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_search: int, people: bool, orgs: bool, identity_only: bool, verbose: bool):
+def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_search: int, people: bool, orgs: bool, verbose: bool):
     """
     Build USearch index for fast approximate nearest neighbor search.
 
@@ -397,7 +396,6 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
         corp-entity-db build-index --M 16              # Faster build, less memory
         corp-entity-db build-index --M 64 --ef-construction 400   # Highest quality
         corp-entity-db build-index --no-orgs           # People only
-        corp-entity-db build-index --identity-only     # Identity index only (skip composite)
     """
     _configure_logging(verbose)
 
@@ -420,29 +418,6 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
     conn = _get_shared_connection(db_path_obj, readonly=True)
 
     embedder = None  # Lazy load — created when first needed
-
-    if identity_only:
-        # Only build the identity index, skip everything else
-        click.echo("\n--- Building identity USearch index for people ---", err=True)
-        embedder = CompanyEmbedder()
-
-        def identity_only_progress(done: int, total: int) -> None:
-            click.echo(f"  Generated + indexed {done:,}/{total:,} identity vectors...", err=True)
-
-        try:
-            count = build_people_identity_index(
-                conn, embedder,
-                M=m,
-                ef_construction=ef_construction,
-                ef_search=ef_search,
-                progress_callback=identity_only_progress,
-            )
-            click.echo(f"People identity index: {count:,} vectors indexed", err=True)
-        except Exception as e:
-            raise click.ClickException(f"People identity index build failed: {e}")
-
-        click.echo("\nUSearch index build complete!", err=True)
-        return
 
     if people:
         click.echo("\n--- Building composite USearch index for people ---", err=True)
@@ -468,7 +443,7 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
         click.echo("\n--- Building identity USearch index for people ---", err=True)
 
         def identity_progress(done: int, total: int) -> None:
-            click.echo(f"  Generated + indexed {done:,}/{total:,} identity vectors...", err=True)
+            click.echo(f"  Generated + indexed {done:,}/{total:,} vectors...", err=True)
 
         try:
             count = build_people_identity_index(
@@ -478,7 +453,7 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
                 ef_search=ef_search,
                 progress_callback=identity_progress,
             )
-            click.echo(f"People identity index: {count:,} vectors indexed", err=True)
+            click.echo(f"People identity index: {count:,} name vectors indexed", err=True)
         except Exception as e:
             raise click.ClickException(f"People identity index build failed: {e}")
 
@@ -505,6 +480,58 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
             raise click.ClickException(f"Organizations USearch index build failed: {e}")
 
     click.echo("\nUSearch index build complete!", err=True)
+
+
+@click.command("build-identity-index")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--M", type=int, default=32, help="Number of connections per node (default 32)")
+@click.option("--ef-construction", type=int, default=200, help="Construction quality parameter (default 200)")
+@click.option("--ef-search", type=int, default=200, help="Search quality parameter (default 200)")
+@click.option("--batch-size", "embed_batch_size", type=int, default=192, help="Embedding batch size (default 192)")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_build_identity_index(db_path: Optional[str], m: int, ef_construction: int, ef_search: int, embed_batch_size: int, verbose: bool):
+    """
+    Build identity (name-only) USearch index for people.
+
+    Embeds each person's name, truncates to 256 dims (Matryoshka),
+    and builds an HNSW index. Used as a fallback when composite search
+    and SQL name lookup both fail.
+
+    \b
+    Examples:
+        corp-entity-db build-identity-index
+        corp-entity-db build-identity-index --batch-size 384
+    """
+    _configure_logging(verbose)
+
+    from corp_entity_db.embeddings import CompanyEmbedder
+    from corp_entity_db.store import _get_shared_connection, build_people_identity_index
+
+    db_path_obj = _resolve_db_path(db_path)
+
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    click.echo(f"Database: {db_path_obj}", err=True)
+
+    conn = _get_shared_connection(db_path_obj, readonly=True)
+    embedder = CompanyEmbedder()
+
+    def progress(done: int, total: int) -> None:
+        click.echo(f"  Generated + indexed {done:,}/{total:,} vectors...", err=True)
+
+    try:
+        count = build_people_identity_index(
+            conn, embedder,
+            M=m,
+            ef_construction=ef_construction,
+            ef_search=ef_search,
+            embed_batch_size=embed_batch_size,
+            progress_callback=progress,
+        )
+        click.echo(f"Identity index built: {count:,} name vectors indexed", err=True)
+    except Exception as e:
+        raise click.ClickException(f"Identity index build failed: {e}")
 
 
 @click.command("migrate")
@@ -620,7 +647,7 @@ def db_migrate(db_path: Optional[str], verbose: bool):
     click.echo(f"Migration complete. Database size: {db_size_mb:.1f} MB", err=True)
 
 
-def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, batch_size: int = 10000, embed_batch_size: int = 64) -> None:
+def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, embed_batch_size: int = 192) -> None:
     """
     Standard post-import steps: build USearch indexes, VACUUM.
 
@@ -664,10 +691,10 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
             click.echo(f"  Identity: {done:,}/{total:,} vectors...", err=True)
 
         count = build_people_identity_index(
-            conn, embedder,
+            conn, embedder, embed_batch_size=embed_batch_size,
             progress_callback=identity_progress,
         )
-        click.echo(f"  People identity index: {count:,} vectors", err=True)
+        click.echo(f"  People identity index: {count:,} name vectors", err=True)
 
     if orgs:
         if embedder is None:
@@ -697,9 +724,9 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
 @click.option("--db", "db_path", type=click.Path(), help="Database path")
 @click.option("--people/--no-people", default=True, help="Process people")
 @click.option("--orgs/--no-orgs", default=True, help="Process organizations")
-@click.option("--batch-size", type=int, default=10000, help="Batch size (default: 10000)")
+@click.option("--batch-size", "embed_batch_size", type=int, default=192, help="Embedding batch size (default: 192)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_post_import(db_path: Optional[str], people: bool, orgs: bool, batch_size: int, verbose: bool):
+def db_post_import(db_path: Optional[str], people: bool, orgs: bool, embed_batch_size: int, verbose: bool):
     """
     Run standard post-import steps: build USearch indexes, VACUUM.
 
@@ -724,5 +751,204 @@ def db_post_import(db_path: Optional[str], people: bool, orgs: bool, batch_size:
         raise click.ClickException(f"Database not found: {db_path_obj}")
 
     click.echo(f"Database: {db_path_obj}", err=True)
-    _run_post_import(db_path_obj, people=people, orgs=orgs, batch_size=batch_size)
+    _run_post_import(db_path_obj, people=people, orgs=orgs, embed_batch_size=embed_batch_size)
+
+
+@click.command("reclassify-people")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--batch-size", type=int, default=10_000, help="Batch size for updates")
+@click.option("--dry-run", is_flag=True, help="Show changes without writing to DB")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_reclassify_people(db_path: Optional[str], batch_size: int, dry_run: bool, verbose: bool):
+    """
+    Recalculate person_type for all people using current classification rules.
+
+    Re-applies the position (P39) and occupation (P106) classification logic
+    from the Wikidata dump importer to every person record that has stored
+    positions/occupations in its record JSON.
+
+    \b
+    Examples:
+        corp-entity-db reclassify-people
+        corp-entity-db reclassify-people --dry-run
+        corp-entity-db reclassify-people -v
+    """
+    import json
+    import logging
+    import sqlite3
+    import time
+
+    _configure_logging(verbose)
+    logger = logging.getLogger("corp_entity_db")
+
+    from corp_entity_db.importers.wikidata_dump import (
+        EXECUTIVE_POSITION_QIDS,
+        OCCUPATION_TO_TYPE,
+        POLITICIAN_POSITION_QIDS,
+    )
+    from corp_entity_db.models import PersonType
+    from corp_entity_db.seed_data import PEOPLE_TYPE_NAME_TO_ID
+
+    db_path_obj = _resolve_db_path(db_path)
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    conn = sqlite3.connect(str(db_path_obj))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-500000")
+
+    total = conn.execute("SELECT COUNT(*) FROM people").fetchone()[0]
+    click.echo(f"Reclassifying {total:,} people in {db_path_obj}", err=True)
+    if dry_run:
+        click.echo("DRY RUN — no changes will be written", err=True)
+
+    def classify(positions: list[str], occupations: list[str]) -> PersonType:
+        """Classify person type from position QIDs and occupation QIDs."""
+        for qid in positions:
+            if qid in EXECUTIVE_POSITION_QIDS:
+                return PersonType.EXECUTIVE
+            if qid in POLITICIAN_POSITION_QIDS:
+                return PersonType.POLITICIAN
+        for qid in occupations:
+            if qid in OCCUPATION_TO_TYPE:
+                return OCCUPATION_TO_TYPE[qid]
+        return PersonType.UNKNOWN
+
+    updated = 0
+    unchanged = 0
+    last_id = 0
+    start = time.time()
+    changes_by_type: dict[str, int] = {}
+
+    while True:
+        rows = conn.execute(
+            "SELECT id, person_type_id, record FROM people WHERE id > ? ORDER BY id LIMIT ?",
+            (last_id, batch_size),
+        ).fetchall()
+        if not rows:
+            break
+
+        updates: list[tuple[int, int]] = []
+        for row_id, current_type_id, record_json in rows:
+            if not record_json:
+                unchanged += 1
+                continue
+
+            rec = json.loads(record_json)
+            positions = rec.get("positions", [])
+            occupations = rec.get("occupations", [])
+
+            new_type = classify(positions, occupations)
+            new_type_id = PEOPLE_TYPE_NAME_TO_ID[new_type.value]
+
+            if new_type_id != current_type_id:
+                updates.append((new_type_id, row_id))
+                key = f"{current_type_id}->{new_type_id}"
+                changes_by_type[key] = changes_by_type.get(key, 0) + 1
+            else:
+                unchanged += 1
+
+        if updates and not dry_run:
+            conn.executemany(
+                "UPDATE people SET person_type_id = ? WHERE id = ?",
+                updates,
+            )
+            conn.commit()
+
+        updated += len(updates)
+        last_id = rows[-1][0]
+        elapsed = time.time() - start
+        processed = updated + unchanged
+        rate = processed / elapsed if elapsed > 0 else 0
+        logger.info(f"Processed {processed:,}/{total:,} ({rate:,.0f}/s) — {updated:,} changed")
+
+    elapsed = time.time() - start
+    click.echo(f"\nDone in {elapsed:.1f}s. {updated:,} changed, {unchanged:,} unchanged.", err=True)
+
+    if changes_by_type:
+        # Resolve type IDs to names for display
+        type_id_to_name: dict[int, str] = {}
+        for name, tid in PEOPLE_TYPE_NAME_TO_ID.items():
+            type_id_to_name[tid] = name
+
+        click.echo("\nChanges by type:", err=True)
+        for key, count in sorted(changes_by_type.items(), key=lambda x: -x[1]):
+            from_id, to_id = key.split("->")
+            from_name = type_id_to_name.get(int(from_id), from_id)
+            to_name = type_id_to_name.get(int(to_id), to_id)
+            click.echo(f"  {from_name} -> {to_name}: {count:,}", err=True)
+
+    conn.close()
+
+
+@click.command("normalize-people")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--batch-size", type=int, default=10_000, help="Batch size for updates")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_normalize_people(db_path: Optional[str], batch_size: int, verbose: bool):
+    """
+    Normalize all people names using corp-names and store in name_normalized column.
+
+    Strips titles, suffixes, middle initials, and resolves nicknames to canonical forms.
+    E.g. "Dr. Robert S. Mueller III" → "robert mueller"
+
+    \b
+    Examples:
+        corp-entity-db normalize-people
+        corp-entity-db normalize-people --batch-size 50000
+    """
+    import logging
+    import sqlite3
+    import time
+
+    from corp_names import normalize_name
+
+    _configure_logging(verbose)
+    logger = logging.getLogger("corp_entity_db")
+
+    db_path_obj = _resolve_db_path(db_path)
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    conn = sqlite3.connect(str(db_path_obj))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-500000")
+
+    total = conn.execute("SELECT COUNT(*) FROM people").fetchone()[0]
+    click.echo(f"Normalizing {total:,} people names in {db_path_obj}", err=True)
+
+    updated = 0
+    last_id = 0
+    start = time.time()
+
+    while True:
+        rows = conn.execute(
+            "SELECT id, name FROM people WHERE id > ? ORDER BY id LIMIT ?",
+            (last_id, batch_size),
+        ).fetchall()
+        if not rows:
+            break
+
+        updates: list[tuple[str, int]] = []
+        for row_id, name in rows:
+            result = normalize_name(name)
+            updates.append((result.normalized, row_id))
+
+        conn.executemany(
+            "UPDATE people SET name_normalized = ? WHERE id = ?",
+            updates,
+        )
+        conn.commit()
+
+        updated += len(rows)
+        last_id = rows[-1][0]
+        elapsed = time.time() - start
+        rate = updated / elapsed if elapsed > 0 else 0
+        logger.info(f"Normalized {updated:,}/{total:,} ({rate:,.0f}/s)")
+
+    conn.close()
+    elapsed = time.time() - start
+    click.echo(f"Done. Normalized {updated:,} names in {elapsed:.1f}s", err=True)
 

@@ -2,8 +2,8 @@
 Wikidata dump importer for people and organizations.
 
 Uses the Wikidata JSON dump (~100GB compressed) to import:
-1. People: All humans (P31=Q5) with English Wikipedia articles
-2. Organizations: All organizations with English Wikipedia articles
+1. People: All humans (P31=Q5)
+2. Organizations: All organizations (optionally filtered to those with English Wikipedia articles)
 
 This avoids SPARQL query timeouts that occur with large result sets.
 The dump is processed line-by-line to minimize memory usage.
@@ -177,150 +177,370 @@ POLITICIAN_POSITION_QIDS = {
 # =============================================================================
 
 OCCUPATION_TO_TYPE: dict[str, PersonType] = {
-    # Politicians (elected officials)
-    "Q82955": PersonType.POLITICIAN,     # politician
-    "Q193391": PersonType.POLITICIAN,    # member of parliament
-    "Q372436": PersonType.POLITICIAN,    # statesperson
+    # =========================================================================
+    # POLITICIANS (elected officials)
+    # =========================================================================
+    "Q82955": PersonType.POLITICIAN,      # politician
+    "Q193391": PersonType.POLITICIAN,     # member of parliament
+    "Q372436": PersonType.POLITICIAN,     # statesperson
+    "Q116852": PersonType.POLITICIAN,     # head of state (occupation)
+    "Q2285706": PersonType.POLITICIAN,    # head of government (occupation)
 
-    # Government (civil servants, diplomats, appointed officials)
-    "Q212238": PersonType.GOVERNMENT,    # civil servant
-    "Q806798": PersonType.GOVERNMENT,    # diplomat
-    "Q15627169": PersonType.GOVERNMENT,  # trade unionist (often govt-adjacent)
+    # =========================================================================
+    # GOVERNMENT (civil servants, diplomats, appointed officials)
+    # =========================================================================
+    "Q212238": PersonType.GOVERNMENT,     # civil servant
+    "Q806798": PersonType.GOVERNMENT,     # diplomat
+    "Q15627169": PersonType.GOVERNMENT,   # trade unionist
+    "Q889821": PersonType.GOVERNMENT,     # ambassador
+    "Q15966511": PersonType.GOVERNMENT,   # diplomat (alternative)
+    "Q294414": PersonType.GOVERNMENT,     # public office holder
+    "Q3099732": PersonType.GOVERNMENT,    # ombudsman
+    "Q11612": PersonType.GOVERNMENT,      # spy/intelligence officer
+    "Q3380760": PersonType.GOVERNMENT,    # police officer
 
-    # Military
-    "Q189290": PersonType.MILITARY,      # military officer
-    "Q47064": PersonType.MILITARY,       # military personnel
-    "Q4991371": PersonType.MILITARY,     # soldier
-    "Q10669499": PersonType.MILITARY,    # naval officer
-    "Q11974939": PersonType.MILITARY,    # air force officer
-    "Q10974448": PersonType.MILITARY,    # army officer
+    # =========================================================================
+    # MILITARY
+    # =========================================================================
+    "Q189290": PersonType.MILITARY,       # military officer
+    "Q47064": PersonType.MILITARY,        # military personnel
+    "Q4991371": PersonType.MILITARY,      # soldier
+    "Q10669499": PersonType.MILITARY,     # naval officer
+    "Q11974939": PersonType.MILITARY,     # air force officer
+    "Q10974448": PersonType.MILITARY,     # army officer
+    "Q36834": PersonType.MILITARY,        # general (rank)
+    "Q467598": PersonType.MILITARY,       # admiral
+    "Q156839": PersonType.MILITARY,       # colonel
+    "Q130278": PersonType.MILITARY,       # lieutenant
+    "Q19100": PersonType.MILITARY,        # captain (military)
+    "Q55983715": PersonType.MILITARY,     # military leader
 
-    # Legal professionals
-    "Q16533": PersonType.LEGAL,          # judge
-    "Q40348": PersonType.LEGAL,          # lawyer
-    "Q185351": PersonType.LEGAL,         # jurist
-    "Q3242871": PersonType.LEGAL,        # prosecutor
-    "Q1792450": PersonType.LEGAL,        # barrister
-    "Q3406182": PersonType.LEGAL,        # solicitor
+    # =========================================================================
+    # LEGAL PROFESSIONALS
+    # =========================================================================
+    "Q16533": PersonType.LEGAL,           # judge
+    "Q40348": PersonType.LEGAL,           # lawyer
+    "Q185351": PersonType.LEGAL,          # jurist
+    "Q3242871": PersonType.LEGAL,         # prosecutor
+    "Q1792450": PersonType.LEGAL,         # barrister
+    "Q3406182": PersonType.LEGAL,         # solicitor
+    "Q1234634": PersonType.LEGAL,         # magistrate
+    "Q1402561": PersonType.LEGAL,         # notary
+    "Q188539": PersonType.LEGAL,          # advocate
 
-    # Athletes
-    "Q2066131": PersonType.ATHLETE,      # athlete
-    "Q937857": PersonType.ATHLETE,       # football player
-    "Q3665646": PersonType.ATHLETE,      # basketball player
-    "Q10871364": PersonType.ATHLETE,     # baseball player
-    "Q19204627": PersonType.ATHLETE,     # ice hockey player
-    "Q10843402": PersonType.ATHLETE,     # tennis player
-    "Q13381376": PersonType.ATHLETE,     # golfer
-    "Q11338576": PersonType.ATHLETE,     # boxer
-    "Q10873124": PersonType.ATHLETE,     # swimmer
-    "Q11303721": PersonType.ATHLETE,     # racing driver
-    "Q10833314": PersonType.ATHLETE,     # cricket player
-    "Q13141064": PersonType.ATHLETE,     # rugby player
+    # =========================================================================
+    # ATHLETES — root types and major sport-specific occupations
+    # P279 subclass resolution will catch niche sport variants
+    # =========================================================================
+    "Q2066131": PersonType.ATHLETE,       # athlete (root type)
+    "Q18536342": PersonType.ATHLETE,      # competitive sports person
 
-    # Artists (traditional creative professions)
-    "Q33999": PersonType.ARTIST,         # actor
-    "Q177220": PersonType.ARTIST,        # singer
-    "Q639669": PersonType.ARTIST,        # musician
-    "Q2526255": PersonType.ARTIST,       # film director
-    "Q36180": PersonType.ARTIST,         # writer
-    "Q483501": PersonType.ARTIST,        # artist
-    "Q488205": PersonType.ARTIST,        # singer-songwriter
-    "Q753110": PersonType.ARTIST,        # songwriter
-    "Q2405480": PersonType.ARTIST,       # voice actor
-    "Q10800557": PersonType.ARTIST,      # film actor
-    "Q3455803": PersonType.ARTIST,       # director
-    "Q28389": PersonType.ARTIST,         # screenwriter
-    "Q6625963": PersonType.ARTIST,       # comedian
-    "Q2259451": PersonType.ARTIST,       # stand-up comedian
-    "Q2490358": PersonType.ARTIST,       # choreographer
-    "Q2722764": PersonType.ARTIST,       # DJ (disc jockey)
-    "Q183945": PersonType.ARTIST,        # record producer
-    "Q3282637": PersonType.ARTIST,       # film producer
-    "Q49757": PersonType.ARTIST,         # poet
-    "Q28640": PersonType.ARTIST,         # illustrator
-    "Q1028181": PersonType.ARTIST,       # painter
-    "Q1281618": PersonType.ARTIST,       # sculptor
-    "Q33231": PersonType.ARTIST,         # photographer
-    "Q806349": PersonType.ARTIST,        # band leader
-    "Q855091": PersonType.ARTIST,        # rapper
-    "Q4351403": PersonType.ARTIST,       # novelist
-    "Q158852": PersonType.ARTIST,        # conductor (music)
-    "Q486748": PersonType.ARTIST,        # pianist
-    "Q1415090": PersonType.ARTIST,       # guitarist
+    # Football/Soccer
+    "Q937857": PersonType.ATHLETE,        # association football player
+    "Q13382519": PersonType.ATHLETE,      # association football player (alternative QID)
+    "Q628099": PersonType.ATHLETE,        # association football manager
 
-    # Media (internet/social media personalities)
-    "Q6168364": PersonType.MEDIA,        # YouTuber
-    "Q15077007": PersonType.MEDIA,       # podcaster
-    "Q17125263": PersonType.MEDIA,       # social media influencer
-    "Q15981151": PersonType.MEDIA,       # internet celebrity
-    "Q2059704": PersonType.MEDIA,        # television personality
-    "Q4610556": PersonType.MEDIA,        # model
-    "Q578109": PersonType.MEDIA,         # television producer
-    "Q2516866": PersonType.MEDIA,        # publisher
-    "Q93191800": PersonType.MEDIA,       # content creator
-    "Q105756498": PersonType.MEDIA,      # streamer (Twitch etc.)
+    # Major team sports
+    "Q3665646": PersonType.ATHLETE,       # basketball player
+    "Q10871364": PersonType.ATHLETE,      # baseball player
+    "Q19204627": PersonType.ATHLETE,      # ice hockey player
+    "Q10833314": PersonType.ATHLETE,      # cricket player
+    "Q12299841": PersonType.ATHLETE,      # cricketer (alternative)
+    "Q13141064": PersonType.ATHLETE,      # rugby player
+    "Q14089670": PersonType.ATHLETE,      # rugby union player
+    "Q13415036": PersonType.ATHLETE,      # rugby league player
+    "Q10843263": PersonType.ATHLETE,      # volleyball player
+    "Q12840545": PersonType.ATHLETE,      # handball player
+    "Q10871621": PersonType.ATHLETE,      # field hockey player
+    "Q4009406": PersonType.ATHLETE,       # water polo player
+    "Q11774891": PersonType.ATHLETE,      # American football player
 
-    # Professionals (known for their profession/work)
-    "Q39631": PersonType.PROFESSIONAL,   # physician/doctor
-    "Q774306": PersonType.PROFESSIONAL,  # surgeon
-    "Q1234713": PersonType.PROFESSIONAL, # dentist
+    # Racket sports
+    "Q10843402": PersonType.ATHLETE,      # tennis player
+    "Q15117395": PersonType.ATHLETE,      # badminton player
+    "Q15117302": PersonType.ATHLETE,      # table tennis player
+    "Q13219637": PersonType.ATHLETE,      # squash player
+
+    # Combat sports
+    "Q11338576": PersonType.ATHLETE,      # boxer
+    "Q847517": PersonType.ATHLETE,        # martial artist
+    "Q13381689": PersonType.ATHLETE,      # judoka
+    "Q11607585": PersonType.ATHLETE,      # wrestler
+    "Q14128148": PersonType.ATHLETE,      # fencer (sport)
+    "Q10873567": PersonType.ATHLETE,      # karateka
+    "Q11422780": PersonType.ATHLETE,      # taekwondo practitioner
+
+    # Track & field / Athletics
+    "Q11513337": PersonType.ATHLETE,      # athletics competitor
+    "Q4009182": PersonType.ATHLETE,       # sprinter
+    "Q11296761": PersonType.ATHLETE,      # marathon runner
+
+    # Water sports
+    "Q10873124": PersonType.ATHLETE,      # swimmer
+    "Q13382576": PersonType.ATHLETE,      # canoeist
+    "Q13382608": PersonType.ATHLETE,      # rower
+    "Q13382122": PersonType.ATHLETE,      # sailor (sport)
+    "Q13561328": PersonType.ATHLETE,      # surfer
+    "Q16029547": PersonType.ATHLETE,      # diver (sport)
+
+    # Winter sports
+    "Q4270517": PersonType.ATHLETE,       # skier
+    "Q13381753": PersonType.ATHLETE,      # speed skater
+    "Q13219587": PersonType.ATHLETE,      # figure skater
+    "Q2340674": PersonType.ATHLETE,       # biathlete
+    "Q14625788": PersonType.ATHLETE,      # cross-country skier
+    "Q13382700": PersonType.ATHLETE,      # ski jumper
+    "Q13382566": PersonType.ATHLETE,      # bobsledder
+    "Q15117415": PersonType.ATHLETE,      # curler
+
+    # Motor sports
+    "Q11303721": PersonType.ATHLETE,      # racing driver
+    "Q10843958": PersonType.ATHLETE,      # motorcycle racer
+
+    # Individual sports
+    "Q13381376": PersonType.ATHLETE,      # golfer
+    "Q2309784": PersonType.ATHLETE,       # cyclist
+    "Q13382981": PersonType.ATHLETE,      # sport shooter
+    "Q13382363": PersonType.ATHLETE,      # weightlifter
+    "Q11513339": PersonType.ATHLETE,      # gymnast
+    "Q1647623": PersonType.ATHLETE,       # jockey
+    "Q13381863": PersonType.ATHLETE,      # archer (sport)
+    "Q14373094": PersonType.ATHLETE,      # triathlete
+    "Q13474373": PersonType.ATHLETE,      # polo player
+    "Q10842936": PersonType.ATHLETE,      # chess player
+
+    # Coaching / Management
+    "Q41583": PersonType.ATHLETE,         # coach (sport)
+    "Q3303330": PersonType.ATHLETE,       # sports manager
+
+    # =========================================================================
+    # ARTISTS (traditional creative professions)
+    # =========================================================================
+    # Acting
+    "Q33999": PersonType.ARTIST,          # actor
+    "Q10800557": PersonType.ARTIST,       # film actor
+    "Q10798782": PersonType.ARTIST,       # television actor
+    "Q2405480": PersonType.ARTIST,        # voice actor
+    "Q3387717": PersonType.ARTIST,        # stage actor
+    "Q2259451": PersonType.ARTIST,        # stand-up comedian
+    "Q6625963": PersonType.ARTIST,        # comedian
+    "Q2490358": PersonType.ARTIST,        # choreographer
+
+    # Music
+    "Q177220": PersonType.ARTIST,         # singer
+    "Q639669": PersonType.ARTIST,         # musician
+    "Q488205": PersonType.ARTIST,         # singer-songwriter
+    "Q753110": PersonType.ARTIST,         # songwriter
+    "Q130857": PersonType.ARTIST,         # composer
+    "Q183945": PersonType.ARTIST,         # record producer
+    "Q806349": PersonType.ARTIST,         # band leader
+    "Q855091": PersonType.ARTIST,         # rapper
+    "Q158852": PersonType.ARTIST,         # conductor (music)
+    "Q486748": PersonType.ARTIST,         # pianist
+    "Q1415090": PersonType.ARTIST,        # guitarist
+    "Q2722764": PersonType.ARTIST,        # DJ (disc jockey)
+    "Q3658608": PersonType.ARTIST,        # opera singer
+    "Q16145150": PersonType.ARTIST,       # drummer
+    "Q1198887": PersonType.ARTIST,        # violinist
+    "Q12800682": PersonType.ARTIST,       # saxophonist
+    "Q1075651": PersonType.ARTIST,        # bassist
+    "Q3076272": PersonType.ARTIST,        # organist
+    "Q12377274": PersonType.ARTIST,       # trumpeter
+    "Q1639825": PersonType.ARTIST,        # cellist
+    "Q12902372": PersonType.ARTIST,       # flautist
+
+    # Film / TV direction & production
+    "Q2526255": PersonType.ARTIST,        # film director
+    "Q3455803": PersonType.ARTIST,        # director
+    "Q1053574": PersonType.ARTIST,        # television director
+    "Q3282637": PersonType.ARTIST,        # film producer
+    "Q28389": PersonType.ARTIST,          # screenwriter
+    "Q578109": PersonType.ARTIST,         # television producer (also MEDIA, but creative)
+    "Q4220892": PersonType.ARTIST,        # cinematographer
+    "Q7042855": PersonType.ARTIST,        # film editor
+
+    # Writing / Literature
+    "Q36180": PersonType.ARTIST,          # writer
+    "Q49757": PersonType.ARTIST,          # poet
+    "Q4351403": PersonType.ARTIST,        # novelist
+    "Q214917": PersonType.ARTIST,         # dramatist/playwright
+    "Q15949613": PersonType.ARTIST,       # short story writer
+    "Q333634": PersonType.ARTIST,         # translator
+    "Q11774202": PersonType.ARTIST,       # essayist
+    "Q4853732": PersonType.ARTIST,        # lyricist
+    "Q482994": PersonType.ARTIST,         # manga artist
+    "Q1114448": PersonType.ARTIST,        # cartoonist
+
+    # Visual arts
+    "Q483501": PersonType.ARTIST,         # artist (root type)
+    "Q1028181": PersonType.ARTIST,        # painter
+    "Q1281618": PersonType.ARTIST,        # sculptor
+    "Q33231": PersonType.ARTIST,          # photographer
+    "Q28640": PersonType.ARTIST,          # illustrator
+    "Q644687": PersonType.ARTIST,         # graphic designer
+    "Q5322166": PersonType.ARTIST,        # engraver
+    "Q3391743": PersonType.ARTIST,        # visual artist
+    "Q15296811": PersonType.ARTIST,       # video artist
+    "Q17505902": PersonType.ARTIST,       # graffiti artist
+    "Q627325": PersonType.ARTIST,         # graphic novelist
+
+    # Design / Fashion
+    "Q3501317": PersonType.ARTIST,        # fashion designer
+
+    # Dance
+    "Q5716684": PersonType.ARTIST,        # dancer
+    "Q10843527": PersonType.ARTIST,       # ballet dancer
+
+    # =========================================================================
+    # MEDIA (internet/social media personalities, TV/radio hosts)
+    # =========================================================================
+    "Q6168364": PersonType.MEDIA,         # YouTuber
+    "Q15077007": PersonType.MEDIA,        # podcaster
+    "Q17125263": PersonType.MEDIA,        # social media influencer
+    "Q15981151": PersonType.MEDIA,        # internet celebrity
+    "Q2059704": PersonType.MEDIA,         # television personality
+    "Q4610556": PersonType.MEDIA,         # model
+    "Q2516866": PersonType.MEDIA,         # publisher
+    "Q93191800": PersonType.MEDIA,        # content creator
+    "Q105756498": PersonType.MEDIA,       # streamer (Twitch etc.)
+    "Q19844021": PersonType.MEDIA,        # fashion model
+    "Q3286043": PersonType.MEDIA,         # radio presenter
+    "Q18844224": PersonType.MEDIA,        # radio personality
+    "Q11631093": PersonType.MEDIA,        # TV host
+    "Q15077008": PersonType.MEDIA,        # vlogger
+
+    # =========================================================================
+    # PROFESSIONALS (known for their profession/work)
+    # =========================================================================
+    # Medical
+    "Q39631": PersonType.PROFESSIONAL,    # physician/doctor
+    "Q774306": PersonType.PROFESSIONAL,   # surgeon
+    "Q1234713": PersonType.PROFESSIONAL,  # dentist
     "Q15924224": PersonType.PROFESSIONAL, # psychiatrist
-    "Q212980": PersonType.PROFESSIONAL,  # psychologist
-    "Q81096": PersonType.PROFESSIONAL,   # engineer
-    "Q42603": PersonType.PROFESSIONAL,   # priest/clergy
-    "Q432386": PersonType.PROFESSIONAL,  # architect
-    "Q3621491": PersonType.PROFESSIONAL, # nurse
-    "Q18805": PersonType.PROFESSIONAL,   # pharmacist
+    "Q212980": PersonType.PROFESSIONAL,   # psychologist
+    "Q3621491": PersonType.PROFESSIONAL,  # nurse
+    "Q18805": PersonType.PROFESSIONAL,    # pharmacist
     "Q15895020": PersonType.PROFESSIONAL, # veterinarian
-    "Q131512": PersonType.PROFESSIONAL,  # chef
-    "Q3499072": PersonType.PROFESSIONAL, # pilot
-    "Q15895449": PersonType.PROFESSIONAL, # accountant
-    "Q806750": PersonType.PROFESSIONAL,  # consultant
-    "Q584301": PersonType.PROFESSIONAL,  # economist (often professional)
-    "Q1371925": PersonType.PROFESSIONAL, # real estate agent
-    "Q266569": PersonType.PROFESSIONAL,  # librarian
-    "Q5323050": PersonType.PROFESSIONAL, # electrical engineer
+    "Q205375": PersonType.PROFESSIONAL,   # pharmacologist
+    "Q1650260": PersonType.PROFESSIONAL,  # midwife
+
+    # Engineering
+    "Q81096": PersonType.PROFESSIONAL,    # engineer
+    "Q5323050": PersonType.PROFESSIONAL,  # electrical engineer
     "Q13582652": PersonType.PROFESSIONAL, # civil engineer
-    "Q81965": PersonType.PROFESSIONAL,   # software engineer
-    "Q5482740": PersonType.PROFESSIONAL, # data scientist
+    "Q81965": PersonType.PROFESSIONAL,    # software engineer
+    "Q5482740": PersonType.PROFESSIONAL,  # data scientist
+    "Q511093": PersonType.PROFESSIONAL,   # mechanical engineer
 
-    # Academics
-    "Q121594": PersonType.ACADEMIC,      # professor
-    "Q3400985": PersonType.ACADEMIC,     # academic
-    "Q1622272": PersonType.ACADEMIC,     # university professor
+    # Architecture / Design
+    "Q432386": PersonType.PROFESSIONAL,   # architect
+    "Q3816358": PersonType.PROFESSIONAL,  # urban planner
 
-    # Scientists
-    "Q901": PersonType.ACADEMIC,        # scientist
-    "Q1650915": PersonType.ACADEMIC,    # researcher
-    "Q169470": PersonType.ACADEMIC,     # physicist
-    "Q593644": PersonType.ACADEMIC,     # chemist
-    "Q864503": PersonType.ACADEMIC,     # biologist
-    "Q11063": PersonType.ACADEMIC,      # astronomer
+    # Religious
+    "Q42603": PersonType.PROFESSIONAL,    # priest/clergy
+    "Q250867": PersonType.PROFESSIONAL,   # Catholic priest
+    "Q611644": PersonType.PROFESSIONAL,   # Catholic bishop
+    "Q1144754": PersonType.PROFESSIONAL,  # imam
+    "Q133485": PersonType.PROFESSIONAL,   # rabbi
+    "Q191808": PersonType.PROFESSIONAL,   # pastor
+    "Q152002": PersonType.PROFESSIONAL,   # Anglican bishop
+    "Q42857": PersonType.PROFESSIONAL,    # monk
+    "Q219477": PersonType.PROFESSIONAL,   # missionary
 
-    # Journalists
-    "Q1930187": PersonType.JOURNALIST,   # journalist
-    "Q13590141": PersonType.JOURNALIST,  # news presenter
-    "Q947873": PersonType.JOURNALIST,    # television presenter
-    "Q4263842": PersonType.JOURNALIST,   # columnist
+    # Education
+    "Q37226": PersonType.PROFESSIONAL,    # teacher
+    "Q1607826": PersonType.PROFESSIONAL,  # school principal
+    "Q23833535": PersonType.PROFESSIONAL, # school teacher
 
-    # Activists
-    "Q15253558": PersonType.ACTIVIST,    # activist
-    "Q11631410": PersonType.ACTIVIST,    # human rights activist
-    "Q18939491": PersonType.ACTIVIST,    # environmental activist
+    # Other professions
+    "Q131512": PersonType.PROFESSIONAL,   # chef
+    "Q3499072": PersonType.PROFESSIONAL,  # pilot
+    "Q15895449": PersonType.PROFESSIONAL, # accountant
+    "Q806750": PersonType.PROFESSIONAL,   # consultant
+    "Q584301": PersonType.PROFESSIONAL,   # economist
+    "Q188094": PersonType.PROFESSIONAL,   # economist (alternative)
+    "Q1371925": PersonType.PROFESSIONAL,  # real estate agent
+    "Q266569": PersonType.PROFESSIONAL,   # librarian
+    "Q3140857": PersonType.PROFESSIONAL,  # farmer
+    "Q15839134": PersonType.PROFESSIONAL, # explorer
+    "Q205862": PersonType.PROFESSIONAL,   # inventor
+    "Q16323414": PersonType.PROFESSIONAL, # cartographer
 
-    # Entrepreneurs/Executives via occupation
-    "Q131524": PersonType.EXECUTIVE,  # entrepreneur
-    "Q43845": PersonType.EXECUTIVE,   # businessperson
+    # =========================================================================
+    # ACADEMICS (professors, researchers, scientists)
+    # =========================================================================
+    "Q121594": PersonType.ACADEMIC,       # professor
+    "Q3400985": PersonType.ACADEMIC,      # academic
+    "Q1622272": PersonType.ACADEMIC,      # university professor
 
-    # Additional common occupations (for role coverage)
-    "Q10798782": PersonType.ARTIST,      # television actor
-    "Q201788": PersonType.ACADEMIC,      # historian
-    "Q250867": PersonType.PROFESSIONAL,  # Catholic priest
-    "Q628099": PersonType.ATHLETE,       # association football coach
-    "Q333634": PersonType.ARTIST,        # translator
-    "Q611644": PersonType.PROFESSIONAL,  # Catholic bishop
-    "Q12299841": PersonType.ATHLETE,     # cricketer
-    "Q188094": PersonType.PROFESSIONAL,  # economist
+    # Scientists (root + major disciplines)
+    "Q901": PersonType.ACADEMIC,          # scientist
+    "Q1650915": PersonType.ACADEMIC,      # researcher
+    "Q169470": PersonType.ACADEMIC,       # physicist
+    "Q593644": PersonType.ACADEMIC,       # chemist
+    "Q864503": PersonType.ACADEMIC,       # biologist
+    "Q11063": PersonType.ACADEMIC,        # astronomer
+    "Q170790": PersonType.ACADEMIC,       # mathematician
+    "Q2374149": PersonType.ACADEMIC,      # botanist
+    "Q350979": PersonType.ACADEMIC,       # zoologist
+    "Q520549": PersonType.ACADEMIC,       # geographer
+    "Q11900058": PersonType.ACADEMIC,     # anthropologist
+    "Q17167049": PersonType.ACADEMIC,     # sociologist
+    "Q16267607": PersonType.ACADEMIC,     # astrophysicist
+    "Q2306091": PersonType.ACADEMIC,      # political scientist
+    "Q15632617": PersonType.ACADEMIC,     # computer scientist
+    "Q201788": PersonType.ACADEMIC,       # historian
+    "Q13570226": PersonType.ACADEMIC,     # geologist
+    "Q2374463": PersonType.ACADEMIC,      # entomologist
+    "Q11634": PersonType.ACADEMIC,        # art historian
+    "Q2259532": PersonType.ACADEMIC,      # palaeontologist
+    "Q15976092": PersonType.ACADEMIC,     # archaeologist
+    "Q3126128": PersonType.ACADEMIC,      # philosopher
+    "Q13418253": PersonType.ACADEMIC,     # linguist
+    "Q488111": PersonType.ACADEMIC,       # philologist
+    "Q11569986": PersonType.ACADEMIC,     # sinologist
+    "Q11631524": PersonType.ACADEMIC,     # Egyptologist
+    "Q10732476": PersonType.ACADEMIC,     # mycologist
+    "Q3055126": PersonType.ACADEMIC,      # oceanographer
+    "Q15839610": PersonType.ACADEMIC,     # epidemiologist
+    "Q1662561": PersonType.ACADEMIC,      # microbiologist
+    "Q7188": PersonType.ACADEMIC,         # biochemist
+    "Q3560872": PersonType.ACADEMIC,      # neuroscientist
+    "Q3178547": PersonType.ACADEMIC,      # geneticist
+    "Q2919046": PersonType.ACADEMIC,      # ecologist
+
+    # =========================================================================
+    # JOURNALISTS
+    # =========================================================================
+    "Q1930187": PersonType.JOURNALIST,    # journalist
+    "Q13590141": PersonType.JOURNALIST,   # news presenter
+    "Q947873": PersonType.JOURNALIST,     # television presenter
+    "Q4263842": PersonType.JOURNALIST,    # columnist
+    "Q1086863": PersonType.JOURNALIST,    # war correspondent
+    "Q13382487": PersonType.JOURNALIST,   # photojournalist
+    "Q15978307": PersonType.JOURNALIST,   # broadcast journalist
+    "Q15978631": PersonType.JOURNALIST,   # investigative journalist
+
+    # =========================================================================
+    # ACTIVISTS
+    # =========================================================================
+    "Q15253558": PersonType.ACTIVIST,     # activist
+    "Q11631410": PersonType.ACTIVIST,     # human rights activist
+    "Q18939491": PersonType.ACTIVIST,     # environmental activist
+    "Q1476215": PersonType.ACTIVIST,      # trade union leader
+    "Q2135538": PersonType.ACTIVIST,      # social activist
+    "Q21072834": PersonType.ACTIVIST,     # women's rights activist
+    "Q974144": PersonType.ACTIVIST,       # philanthropist
+    "Q39894720": PersonType.ACTIVIST,     # peace activist
+
+    # =========================================================================
+    # EXECUTIVES / BUSINESS
+    # =========================================================================
+    "Q131524": PersonType.EXECUTIVE,      # entrepreneur
+    "Q43845": PersonType.EXECUTIVE,       # businessperson
+    "Q484876": PersonType.EXECUTIVE,      # CEO (as occupation)
+    "Q1208543": PersonType.EXECUTIVE,     # landowner
+    "Q3918409": PersonType.EXECUTIVE,     # investor
 }
 
 # =============================================================================
@@ -787,8 +1007,8 @@ class WikidataDumpImporter:
 
     This importer processes the Wikidata dump line-by-line to avoid memory issues
     with the ~100GB compressed file. It filters for:
-    - Humans (P31=Q5) with English Wikipedia articles
-    - Organizations with English Wikipedia articles
+    - Humans (P31=Q5)
+    - Organizations (optionally filtered to those with English Wikipedia articles)
 
     The dump URL can be customized, and the importer supports both .bz2 and .gz
     compression formats.
@@ -818,6 +1038,9 @@ class WikidataDumpImporter:
         # Track ALL occupation QIDs referenced by people (from P106 claims).
         # Used after import to backfill any missing role records.
         self._needed_role_qids: set[str] = set()
+        # Dynamic occupation → PersonType cache. Initialized from OCCUPATION_TO_TYPE,
+        # then expanded via P279 (subclass of) chains as role entities are encountered.
+        self._occupation_type_cache: dict[str, PersonType] = dict(OCCUPATION_TO_TYPE)
 
     def download_dump(
         self,
@@ -1201,101 +1424,6 @@ class WikidataDumpImporter:
 
         logger.info(f"People import complete: {count:,} records (skipped {skipped:,})")
 
-    def import_organizations(
-        self,
-        dump_path: Optional[Path] = None,
-        limit: Optional[int] = None,
-        require_enwiki: bool = False,
-        skip_ids: Optional[set[str]] = None,
-        start_index: int = 0,
-        progress_callback: Optional[Callable[[int, str, int], None]] = None,
-    ) -> Iterator[CompanyRecord]:
-        """
-        Stream through dump, yielding organizations.
-
-        This method filters the dump for:
-        - Items with type "item"
-        - Has P31 (instance of) matching an organization type
-        - Optionally: Has English Wikipedia article (enwiki sitelink)
-
-        Args:
-            dump_path: Path to dump file (uses self._dump_path if not provided)
-            limit: Optional maximum number of records to return
-            require_enwiki: If True, only include orgs with English Wikipedia articles
-            skip_ids: Optional set of source_ids (Q codes) to skip. Checked early before
-                     full processing to avoid unnecessary QID resolution.
-            start_index: Entity index to start from (for resume support). Entities
-                        before this index are skipped but labels are still cached.
-            progress_callback: Optional callback(entity_index, entity_id, records_yielded)
-                              called for each yielded record. Useful for saving progress.
-
-        Yields:
-            CompanyRecord for each qualifying organization
-        """
-        path = dump_path or self._dump_path
-        count = 0
-        skipped_existing = 0
-        skipped_no_type = 0
-        skipped_no_enwiki = 0
-        skipped_no_label = 0
-        current_entity_index = start_index
-
-        logger.info("Starting organization import from Wikidata dump...")
-        if start_index > 0:
-            logger.info(f"Resuming from entity index {start_index:,}")
-        if not require_enwiki:
-            logger.info("Importing ALL organizations (no enwiki filter)")
-        if skip_ids:
-            logger.info(f"Skipping {len(skip_ids):,} existing Q codes")
-
-        def track_entity(entity_index: int, entity_id: str) -> None:
-            nonlocal current_entity_index
-            current_entity_index = entity_index
-
-        for entity in self.iter_entities(path, start_index=start_index, progress_callback=track_entity):
-            if limit and count >= limit:
-                break
-
-            # Check skip_ids early, before full processing (avoids QID resolution)
-            entity_id = entity.get("id", "")
-            if skip_ids and entity_id in skip_ids:
-                skipped_existing += 1
-                continue
-
-            record = self._process_org_entity(entity, require_enwiki=require_enwiki)
-            if record:
-                count += 1
-                if count % 10_000 == 0:
-                    logger.info(f"Yielded {count:,} organization records (skipped {skipped_existing:,} existing)...")
-
-                # Call progress callback with current position
-                if progress_callback:
-                    progress_callback(current_entity_index, entity_id, count)
-
-                yield record
-            elif entity.get("type") == "item":
-                # Track skip reasons for debugging
-                if self._get_org_type(entity) is None:
-                    skipped_no_type += 1
-                elif require_enwiki and "enwiki" not in entity.get("sitelinks", {}):
-                    skipped_no_enwiki += 1
-                else:
-                    skipped_no_label += 1
-
-                # Log skip stats periodically
-                total_skipped = skipped_no_type + skipped_no_enwiki + skipped_no_label
-                if total_skipped > 0 and total_skipped % 1_000_000 == 0:
-                    logger.debug(
-                        f"Skip stats: no_matching_type={skipped_no_type:,}, "
-                        f"no_enwiki={skipped_no_enwiki:,}, no_label={skipped_no_label:,}"
-                    )
-
-        logger.info(f"Organization import complete: {count:,} records (skipped {skipped_existing:,} existing)")
-        logger.info(
-            f"Skipped: no_matching_type={skipped_no_type:,}, "
-            f"no_enwiki={skipped_no_enwiki:,}, no_label={skipped_no_label:,}"
-        )
-
     def import_all(
         self,
         dump_path: Optional[Path] = None,
@@ -1462,10 +1590,15 @@ class WikidataDumpImporter:
                             progress_callback(current_entity_index, entity_id, people_count, orgs_count)
                         yield ("location", location_record)
 
+        p279_resolved = len(self._occupation_type_cache) - len(OCCUPATION_TO_TYPE)
         logger.info(
             f"Combined import complete: {people_count:,} people, {orgs_count:,} orgs, "
             f"{locations_count:,} locations, {roles_count:,} roles "
             f"(skipped {people_skipped:,} people, {orgs_skipped:,} orgs, {locations_skipped:,} locations)"
+        )
+        logger.info(
+            f"Occupation type cache: {len(self._occupation_type_cache):,} total "
+            f"({len(OCCUPATION_TO_TYPE)} static + {p279_resolved:,} resolved via P279 subclass chains)"
         )
 
     def _process_person_entity(
@@ -1641,6 +1774,12 @@ class WikidataDumpImporter:
         # Cache the label for use in person processing
         self._role_labels[qid] = label
 
+        # Resolve PersonType via P279 (subclass of) chain if not already known.
+        # This expands the occupation→type mapping dynamically so that e.g.
+        # "football coach" (subclass of "coach" subclass of "athlete") gets ATHLETE.
+        if qid not in self._occupation_type_cache:
+            self._resolve_occupation_subclass(entity, qid)
+
         qid_int = int(qid[1:]) if qid.startswith("Q") and qid[1:].isdigit() else None
 
         descriptions = entity.get("descriptions", {})
@@ -1657,6 +1796,34 @@ class WikidataDumpImporter:
                 "description": description,
             },
         )
+
+    def _resolve_occupation_subclass(self, entity: dict, qid: str) -> Optional[PersonType]:
+        """Resolve PersonType for a role entity via its P279 (subclass of) parents.
+
+        Checks direct P279 parents against the occupation type cache. If any parent
+        is already resolved, this QID inherits that type. Deeper chains resolve
+        transitively: parent entities resolve their own parents when processed
+        (lower QIDs are processed first), so by the time we see a child, the
+        chain is already built up in the cache.
+
+        Args:
+            entity: Parsed Wikidata entity dictionary for the role
+            qid: QID of the role entity
+
+        Returns:
+            Resolved PersonType if found, None otherwise
+        """
+        parent_qids = self._get_claim_values(entity, "P279")
+        if not parent_qids:
+            return None
+
+        for parent_qid in parent_qids:
+            if parent_qid in self._occupation_type_cache:
+                person_type = self._occupation_type_cache[parent_qid]
+                self._occupation_type_cache[qid] = person_type
+                return person_type
+
+        return None
 
     def _get_claim_values(self, entity: dict, prop: str) -> list[str]:
         """
@@ -1810,10 +1977,10 @@ class WikidataDumpImporter:
             if pos_qid in POLITICIAN_POSITION_QIDS:
                 return PersonType.POLITICIAN
 
-        # Then check occupations
+        # Then check occupations (using dynamic cache which includes P279-resolved subclasses)
         for occ in occupations:
-            if occ in OCCUPATION_TO_TYPE:
-                return OCCUPATION_TO_TYPE[occ]
+            if occ in self._occupation_type_cache:
+                return self._occupation_type_cache[occ]
 
         # Default
         return PersonType.UNKNOWN
@@ -1827,101 +1994,15 @@ class WikidataDumpImporter:
             ""
         )
 
-    def _get_best_role_org(
-        self,
-        positions: list[dict],
-    ) -> tuple[str, str, str, Optional[str], Optional[str], dict]:
-        """
-        Select best position for role/org display.
-
-        Priority:
-        1. Positions with org/context and dates
-        2. Positions with org/context
-        3. Positions with dates
-        4. Any position
-
-        Args:
-            positions: List of position dictionaries
-
-        Returns:
-            Tuple of (role_qid, org_label, org_qid, start_date, end_date, extra_context)
-            Note: In dump mode, we return QIDs since we don't have labels
-            extra_context contains parliamentary metadata
-        """
-        def has_context(pos: dict) -> bool:
-            return bool(
-                pos.get("org_qid") or
-                pos.get("electoral_district") or
-                pos.get("parliamentary_group")
-            )
-
-        def get_extra_context(pos: dict) -> dict:
-            return {
-                k: v for k, v in {
-                    "electoral_district": pos.get("electoral_district"),
-                    "parliamentary_term": pos.get("parliamentary_term"),
-                    "parliamentary_group": pos.get("parliamentary_group"),
-                    "elected_in": pos.get("elected_in"),
-                }.items() if v
-            }
-
-        # Priority 1: Position with org/context and dates
-        for pos in positions:
-            if has_context(pos) and (pos.get("start_date") or pos.get("end_date")):
-                return (
-                    pos["position_qid"],
-                    "",
-                    self._get_org_or_context(pos),
-                    pos.get("start_date"),
-                    pos.get("end_date"),
-                    get_extra_context(pos),
-                )
-
-        # Priority 2: Position with org/context
-        for pos in positions:
-            if has_context(pos):
-                return (
-                    pos["position_qid"],
-                    "",
-                    self._get_org_or_context(pos),
-                    pos.get("start_date"),
-                    pos.get("end_date"),
-                    get_extra_context(pos),
-                )
-
-        # Priority 3: Position with dates
-        for pos in positions:
-            if pos.get("start_date") or pos.get("end_date"):
-                return (
-                    pos["position_qid"],
-                    "",
-                    self._get_org_or_context(pos),
-                    pos.get("start_date"),
-                    pos.get("end_date"),
-                    get_extra_context(pos),
-                )
-
-        # Priority 4: Any position
-        if positions:
-            pos = positions[0]
-            return (
-                pos["position_qid"],
-                "",
-                self._get_org_or_context(pos),
-                pos.get("start_date"),
-                pos.get("end_date"),
-                get_extra_context(pos),
-            )
-
-        return "", "", "", None, None, {}
-
     def _extract_person_records(self, entity: dict) -> list[PersonRecord]:
         """
         Extract one or more PersonRecords from entity dict.
 
-        Creates a separate record for each position that has an org/context,
-        so a CEO of 5 companies gets 5 entries linked by canonicalization.
-        Falls back to a single record when no positions have orgs.
+        Creates a separate record for each distinct role+org combo from:
+        1. Positions (P39) — with or without org
+        2. Reverse org→person mappings (P169, P488, etc.)
+        3. Occupations (P106) — role-only records for any not already covered
+        4. Org fallback chain — only if steps 1-3 produced nothing
 
         Args:
             entity: Parsed Wikidata entity dictionary
@@ -1929,7 +2010,7 @@ class WikidataDumpImporter:
         Returns:
             List of PersonRecords (empty if essential data is missing)
         """
-        MAX_RECORDS_PER_PERSON = 10
+        MAX_RECORDS_PER_PERSON = 5000
 
         qid = entity.get("id", "")
         labels = entity.get("labels", {})
@@ -2019,19 +2100,21 @@ class WikidataDumpImporter:
                 record=record_data,
             )
 
-        # --- Multi-record path: one record per position with an org ---
+        # --- Step 1: One record per position (P39), with or without org ---
         records: list[PersonRecord] = []
         seen_role_org: set[tuple[str, str]] = set()
+        seen_role_qids: set[str] = set()
 
         for pos in positions:
+            if len(records) >= MAX_RECORDS_PER_PERSON:
+                break
             org_qid_pos = self._get_org_or_context(pos)
-            if not org_qid_pos:
-                continue
             role_qid_pos = pos["position_qid"]
-            key = (role_qid_pos, org_qid_pos)
+            key = (role_qid_pos, org_qid_pos or "")
             if key in seen_role_org:
                 continue
             seen_role_org.add(key)
+            seen_role_qids.add(role_qid_pos)
 
             extra_context = {
                 k: v for k, v in {
@@ -2042,23 +2125,17 @@ class WikidataDumpImporter:
                 }.items() if v
             }
             records.append(make_record(
-                role_qid_pos, org_qid_pos, pos.get("start_date"), pos.get("end_date"), extra_context,
+                role_qid_pos, org_qid_pos or "", pos.get("start_date"), pos.get("end_date"), extra_context,
             ))
-            if len(records) >= MAX_RECORDS_PER_PERSON:
-                break
 
-        # --- Supplement with reverse org→person mappings (P169 CEO, P488 chair, etc.) ---
-        # These come from org entities that list this person as an executive.
-        # Creates additional records for roles not already covered by P39 qualifiers.
+        # --- Step 2: Supplement with reverse org→person mappings (P169 CEO, P488 chair, etc.) ---
         if len(records) < MAX_RECORDS_PER_PERSON and qid in self._reverse_person_orgs:
             for rev_org_qid, rev_role, rev_start, rev_end in self._reverse_person_orgs[qid]:
                 if len(records) >= MAX_RECORDS_PER_PERSON:
                     break
                 # Deduplicate: skip if we already have a record for this org
-                # (use org only since reverse role is a label string, not a QID)
                 if any(rev_org_qid == key[1] for key in seen_role_org):
                     continue
-                # Use a sentinel role_qid for reverse-mapped records
                 seen_role_org.add(("_reverse", rev_org_qid))
                 records.append(make_record(
                     "", rev_org_qid, rev_start, rev_end,
@@ -2069,41 +2146,44 @@ class WikidataDumpImporter:
                     f"{rev_org_qid} as {rev_role}"
                 )
 
+        # --- Step 3: One record per occupation (P106) not already covered by positions ---
+        for occ_qid in occupations:
+            if len(records) >= MAX_RECORDS_PER_PERSON:
+                break
+            if occ_qid in seen_role_qids:
+                continue
+            key = (occ_qid, "")
+            if key in seen_role_org:
+                continue
+            seen_role_org.add(key)
+            seen_role_qids.add(occ_qid)
+            records.append(make_record(occ_qid, "", None, None))
+
         if records:
-            logger.debug(f"{qid} ({label}): {len(records)} position records")
+            logger.debug(f"{qid} ({label}): {len(records)} records")
             return records
 
-        # --- Fallback: single record (no positions had orgs, no reverse mappings) ---
-        # Use _get_best_role_org for the single best position
-        role_qid, _, org_qid, start_date, end_date, extra_context = self._get_best_role_org(positions)
+        # --- Step 4: No positions or occupations — org fallback chain ---
+        org_qid = ""
+        fallback_props = [
+            ("P108", "employer"),
+            ("P1830", "owner-of"),
+            ("P54", "sports-team"),
+            ("P102", "political-party"),
+            ("P241", "military-branch"),
+            ("P264", "record-label"),
+            ("P1416", "affiliation"),
+            ("P463", "member-of"),
+            ("P69", "educated-at"),
+        ]
+        for prop, prop_label in fallback_props:
+            values = self._get_claim_values(entity, prop)
+            if values:
+                org_qid = values[0]
+                logger.debug(f"Using {prop} ({prop_label}) for {qid}: {org_qid}")
+                break
 
-        # Fallback: P108 employer
-        if not org_qid:
-            employers = self._get_claim_values(entity, "P108")
-            if employers:
-                org_qid = employers[0]
-                logger.debug(f"Using top-level P108 employer for {qid}: {org_qid}")
-
-        # Fallback chain: type-specific properties
-        if not org_qid:
-            fallback_props = [
-                ("P1830", "owner-of"),
-                ("P54", "sports-team"),
-                ("P102", "political-party"),
-                ("P241", "military-branch"),
-                ("P264", "record-label"),
-                ("P1416", "affiliation"),
-                ("P463", "member-of"),
-                ("P69", "educated-at"),
-            ]
-            for prop, prop_label in fallback_props:
-                values = self._get_claim_values(entity, prop)
-                if values:
-                    org_qid = values[0]
-                    logger.debug(f"Using {prop} ({prop_label}) for {qid}: {org_qid}")
-                    break
-
-        return [make_record(role_qid, org_qid, start_date, end_date, extra_context)]
+        return [make_record("", org_qid, None, None)]
 
     def _extract_org_data(
         self,
@@ -2447,39 +2527,9 @@ class WikidataDumpImporter:
                         return time_str.split("T")[0]
         return None
 
-    def get_discovered_organizations(self) -> list[CompanyRecord]:
-        """
-        Get organizations discovered during the people import.
-
-        These are organizations associated with people (from P39 P642 qualifiers)
-        that can be inserted into the organizations database if not already present.
-
-        Note: In dump mode, we only have QIDs, not labels.
-
-        Returns:
-            List of CompanyRecord objects for discovered organizations
-        """
-        records = []
-        for org_qid in self._discovered_orgs:
-            record = CompanyRecord(
-                name=org_qid,  # Only have QID, not label
-                source="wikipedia",
-                source_id=org_qid,
-                region="",
-                entity_type=EntityType.BUSINESS,  # Default
-                record={
-                    "wikidata_id": org_qid,
-                    "discovered_from": "people_import",
-                    "needs_label_resolution": True,
-                },
-            )
-            records.append(record)
-        logger.info(f"Discovered {len(records)} organizations from people import")
-        return records
-
-    def clear_discovered_organizations(self) -> None:
-        """Clear the discovered organizations cache."""
-        self._discovered_orgs.clear()
+    def get_discovered_org_qids(self) -> set[str]:
+        """Return org QID strings discovered during people import."""
+        return set(self._discovered_orgs.keys())
 
     def get_reverse_person_orgs(self) -> dict[str, list[tuple[str, str, Optional[str], Optional[str]]]]:
         """
@@ -2534,9 +2584,13 @@ class WikidataDumpImporter:
                 countries = self._get_claim_values(entity, "P27")
                 country_qid = countries[0] if countries else ""
 
-                # Get best org QID from positions
+                # Get first org QID from positions
                 positions = self._get_positions_with_org(claims)
-                _, _, org_qid, _, _, _ = self._get_best_role_org(positions)
+                org_qid = ""
+                for pos in positions:
+                    org_qid = self._get_org_or_context(pos)
+                    if org_qid:
+                        break
 
                 # Fallback: P108 employer
                 if not org_qid:
@@ -2614,18 +2668,19 @@ class WikidataDumpImporter:
         cheap for entities that don't.
         """
         claims = entity.get("claims", {})
-        # Only bother if the entity has P1001 or P17
+        # Only bother if the entity has P1001, P17, or P131
         p1001_claims = claims.get("P1001", [])
         p17_claims = claims.get("P17", [])
-        if not p1001_claims and not p17_claims:
+        p131_claims = claims.get("P131", [])
+        if not p1001_claims and not p17_claims and not p131_claims:
             return
 
         qid = entity.get("id", "")
         if not qid:
             return
 
-        # Prefer P1001 (applies to jurisdiction), fall back to P17 (country)
-        for claim_list in (p1001_claims, p17_claims):
+        # Priority: P1001 (applies to jurisdiction) > P17 (country) > P131 (located in)
+        for claim_list in (p1001_claims, p17_claims, p131_claims):
             for claim in claim_list:
                 mainsnak = claim.get("mainsnak", {})
                 value = mainsnak.get("datavalue", {}).get("value", {})

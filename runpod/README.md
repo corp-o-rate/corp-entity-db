@@ -43,6 +43,6 @@ The handler accepts a JSON payload:
 | `org` | string | `null` | Organization for composite person search (person type only) |
 | `person_type` | string | `null` | Person type hint for identity fallback (e.g. `"artist"`, `"athlete"`) |
 
-Person search uses a dual-index strategy: a primary composite index (name + role + org as 768-dim vector for AND-style matching) and a secondary identity index (256-dim Matryoshka embeddings of natural language descriptions). The identity index is consulted as fallback when composite scores are below threshold, improving accuracy for people known by name and type alone (artists, athletes, etc.).
+Person search uses a three-tier fallback: composite HNSW index (name + role + org as 768-dim vector, AND-style matching, people with org associations only) → SQL name_normalized lookup → identity HNSW index (256-dim name-only embeddings for all people). Achieves 96.1% acc@1 and 98.9% acc@20 on 280 queries (95-165ms per query after warmup).
 
 Results are cached in-memory (up to 1GB LRU cache) for repeated queries.

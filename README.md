@@ -32,7 +32,7 @@ The frontend connects to either a local server (`corp-entity-db serve`) or a Run
 
 | Source | Scale |
 |--------|-------|
-| Wikidata | ~1.5M orgs, ~13.2M people |
+| Wikidata | ~1.6M orgs, ~28M people, ~700K locations, ~180K roles |
 | GLEIF | ~2.6M orgs |
 | SEC Edgar | ~73K orgs |
 | Companies House | ~5.5M orgs |
@@ -41,6 +41,6 @@ The frontend connects to either a local server (`corp-entity-db serve`) or a Run
 
 All embeddings are generated using `google/embeddinggemma-300m` (768 dimensions) on-the-fly during index building and stored only in USearch HNSW indexes (never in SQLite). Search uses int8-quantized embeddings for fast approximate nearest neighbor lookup. The lite database variant drops `record` and `name_normalized` columns for a smaller download.
 
-People search uses a **dual-index strategy**. The primary index (`people_usearch.bin`) uses composite embeddings: name, role, and organization are embedded as separate 256-dim vectors (via Matryoshka truncation), independently L2-normalized, weighted (name=8, role=1, org=4), and concatenated into a 768-dim vector. This gives AND-style matching where a poor match on organization cannot be compensated by a good match on role, enabling precise lookups like "find the CEO named Tim Cook at Apple." A secondary identity index (`people_identity_usearch.bin`) uses 256-dim Matryoshka-truncated embeddings of natural language descriptions (e.g. "Taylor Swift, an artist") and is consulted as a fallback when composite scores are below threshold. This improves accuracy for identity-defined people (artists, athletes, activists) who have no role/org context.
+People search uses a **three-tier fallback strategy** achieving 96.1% acc@1 and 98.9% acc@20 on 280 queries (95-165ms per query after warmup). The primary composite index (`people_usearch_v5.bin`) embeds name, role, and organization as separate 256-dim vectors (via Matryoshka truncation), independently L2-normalized, weighted (name=8, role=1, org=4), and concatenated into a 768-dim vector — only for people with org associations. This gives AND-style matching where a poor match on organization cannot be compensated by a good match on role. When composite scores are below threshold, a SQL name_normalized lookup provides exact name matching. A secondary identity index (`people_identity_usearch_v5.bin`) uses 256-dim Matryoshka-truncated name-only embeddings for all people as a final fallback.
 
 See [`entity-db-lib/README.md`](entity-db-lib/README.md) for full library documentation.

@@ -489,7 +489,7 @@ class WikidataPeopleImporter:
                 if limit and total_count >= limit:
                     break
 
-                record, skip_reason = self._parse_bulk_binding(binding, person_type=person_type)
+                record, _ = self._parse_bulk_binding(binding, person_type=person_type)
                 if record is None:
                     continue
 
@@ -756,123 +756,6 @@ class WikidataPeopleImporter:
         """Parse a SPARQL result binding into a PersonRecord (legacy wrapper)."""
         record, _ = self._parse_binding_with_reason(binding, person_type)
         return record
-
-    def search_person(self, name: str, limit: int = 10) -> list[PersonRecord]:
-        """
-        Search for a specific person by name.
-
-        Args:
-            name: Person name to search for
-            limit: Maximum results to return
-
-        Returns:
-            List of matching PersonRecords
-        """
-        # Use Wikidata search API for better name matching
-        search_url = "https://www.wikidata.org/w/api.php"
-        params = urllib.parse.urlencode({
-            "action": "wbsearchentities",
-            "search": name,
-            "language": "en",
-            "type": "item",
-            "limit": limit,
-            "format": "json",
-        })
-
-        req = urllib.request.Request(
-            f"{search_url}?{params}",
-            headers={"User-Agent": "corp-extractor/1.0"}
-        )
-
-        with urllib.request.urlopen(req, timeout=30) as response:
-            data = json.loads(response.read().decode("utf-8"))
-
-        results = []
-        for item in data.get("search", []):
-            qid = item.get("id")
-            label = item.get("label", "")
-            description = item.get("description", "")
-
-            # Check if it looks like a person
-            person_keywords = [
-                "politician", "actor", "actress", "singer", "musician",
-                "businessman", "businesswoman", "ceo", "executive", "director",
-                "president", "founder", "professor", "scientist", "author",
-                "writer", "journalist", "athlete", "player", "coach",
-            ]
-            description_lower = description.lower()
-            is_person = any(kw in description_lower for kw in person_keywords)
-            if not is_person:
-                continue
-
-            # Try to infer person type from description
-            person_type = PersonType.UNKNOWN
-            if any(kw in description_lower for kw in ["ceo", "executive", "businessman", "businesswoman"]):
-                person_type = PersonType.EXECUTIVE
-            elif any(kw in description_lower for kw in ["politician", "president", "senator", "minister"]):
-                person_type = PersonType.POLITICIAN
-            elif any(kw in description_lower for kw in ["athlete", "player", "coach"]):
-                person_type = PersonType.ATHLETE
-            elif any(kw in description_lower for kw in ["actor", "actress", "singer", "musician", "director"]):
-                person_type = PersonType.ARTIST
-            elif any(kw in description_lower for kw in ["professor", "academic"]):
-                person_type = PersonType.ACADEMIC
-            elif any(kw in description_lower for kw in ["scientist", "researcher"]):
-                person_type = PersonType.ACADEMIC
-            elif any(kw in description_lower for kw in ["journalist", "reporter"]):
-                person_type = PersonType.JOURNALIST
-            elif any(kw in description_lower for kw in ["founder", "entrepreneur"]):
-                person_type = PersonType.EXECUTIVE
-
-            record = PersonRecord(
-                name=label,
-                source="wikidata",
-                source_id=qid,
-                country="",  # Not available from search API
-                person_type=person_type,
-                known_for_role="",
-                known_for_org_name="",
-                record={
-                    "wikidata_id": qid,
-                    "label": label,
-                    "description": description,
-                },
-            )
-            results.append(record)
-
-        return results
-
-    def get_discovered_organizations(self) -> list[CompanyRecord]:
-        """
-        Get organizations discovered during the people import.
-
-        These are organizations associated with people (employers, positions, etc.)
-        that can be inserted into the organizations database if not already present.
-
-        Returns:
-            List of CompanyRecord objects for discovered organizations
-        """
-        records = []
-        for org_qid, org_label in self._discovered_orgs.items():
-            record = CompanyRecord(
-                name=org_label,
-                source="wikipedia",  # Use "wikipedia" as source per wikidata.py convention
-                source_id=org_qid,
-                region="",  # Not available from this context
-                entity_type=EntityType.BUSINESS,  # Default to business for orgs linked to people
-                record={
-                    "wikidata_id": org_qid,
-                    "label": org_label,
-                    "discovered_from": "people_import",
-                },
-            )
-            records.append(record)
-        logger.info(f"Discovered {len(records)} organizations from people import")
-        return records
-
-    def clear_discovered_organizations(self) -> None:
-        """Clear the discovered organizations cache."""
-        self._discovered_orgs.clear()
 
     def enrich_person_dates(self, person_qid: str, role: str = "", org: str = "") -> tuple[Optional[str], Optional[str]]:
         """

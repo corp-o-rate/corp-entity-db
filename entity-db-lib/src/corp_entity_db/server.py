@@ -196,15 +196,14 @@ def search_people(req: SearchPeopleRequest):
 
     query_embedding = embedder.embed_composite_person(req.query, role=req.role, org=req.org)
 
-    # Identity embedding for fallback (name + type if provided)
-    from .store import format_person_query
-    identity_text = format_person_query(req.query, person_type=req.person_type)
-    identity_embedding = embedder.embed_for_identity_index(identity_text)
-
     results = person_db.search(
         query_embedding,
         top_k=req.limit,
-        identity_query_embedding=identity_embedding,
+        query_name=req.query,
+        embedder=embedder,
+        query_person_type=req.person_type,
+        query_role=req.role,
+        query_org=req.org,
     )
 
     elapsed = time.time() - t0
@@ -277,10 +276,9 @@ def resolve_entity(req: ResolveRequest):
         embedder = _get_embedder()
         person_db = _get_person_db()
         query_embedding = embedder.embed_composite_person(req.name, role=None, org=None)
-        identity_embedding = embedder.embed_for_identity_index(req.name)
         results = person_db.search(
             query_embedding, top_k=1,
-            identity_query_embedding=identity_embedding,
+            query_name=req.name,
         )
         elapsed = time.time() - t0
         if results:

@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 # Companies House API endpoints
 CH_API_BASE = "https://api.company-information.service.gov.uk"
 CH_SEARCH_URL = f"{CH_API_BASE}/search/companies"
-CH_COMPANY_URL = f"{CH_API_BASE}/company"
 
 # Bulk data download URL
 CH_BULK_DATA_URL = "https://download.companieshouse.gov.uk/BasicCompanyDataAsOneFile-{date}.zip"
@@ -436,28 +435,6 @@ class CompaniesHouseImporter:
         except Exception as e:
             logger.debug(f"Failed to parse CSV row: {e}")
             return None
-
-    def get_company(self, company_number: str) -> Optional[CompanyRecord]:
-        """
-        Fetch a specific company by number.
-
-        Args:
-            company_number: UK company registration number
-
-        Returns:
-            CompanyRecord or None if not found
-        """
-        if not self._api_key:
-            raise ValueError("Companies House API key required")
-
-        try:
-            url = f"{CH_COMPANY_URL}/{company_number}"
-            data = self._api_request(url)
-            return self._parse_api_response(data)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return None
-            raise
 
     def download_bulk_data(
         self,
