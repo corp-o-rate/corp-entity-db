@@ -952,3 +952,74 @@ def db_normalize_people(db_path: Optional[str], batch_size: int, verbose: bool):
     elapsed = time.time() - start
     click.echo(f"Done. Normalized {updated:,} names in {elapsed:.1f}s", err=True)
 
+
+@click.command("normalize-orgs")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--batch-size", type=int, default=10_000, help="Batch size for updates")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_normalize_orgs(db_path: Optional[str], batch_size: int, verbose: bool):
+    """
+    Normalize all organization names using corp-names and store in name_normalized column.
+
+    Strips legal suffixes (Inc, Ltd, AG, etc.), lowercases, and canonicalizes.
+    E.g. "Apple Inc." → "apple", "Amazon.com, Inc." → "amazon com"
+
+    \b
+    Examples:
+        corp-entity-db normalize-orgs
+        corp-entity-db normalize-orgs --batch-size 50000
+    """
+    import logging
+    import sqlite3
+    import time
+
+    from corp_names import normalize_company
+
+    _configure_logging(verbose)
+    logger = logging.getLogger("corp_entity_db")
+
+    db_path_obj = _resolve_db_path(db_path)
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    conn = sqlite3.connect(str(db_path_obj))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-500000")
+
+    total = conn.execute("SELECT COUNT(*) FROM organizations").fetchone()[0]
+    click.echo(f"Normalizing {total:,} organization names in {db_path_obj}", err=True)
+
+    updated = 0
+    last_id = 0
+    start = time.time()
+
+    while True:
+        rows = conn.execute(
+            "SELECT id, name FROM organizations WHERE id > ? ORDER BY id LIMIT ?",
+            (last_id, batch_size),
+        ).fetchall()
+        if not rows:
+            break
+
+        updates: list[tuple[str, int]] = []
+        for row_id, name in rows:
+            result = normalize_company(name)
+            updates.append((result.normalized, row_id))
+
+        conn.executemany(
+            "UPDATE organizations SET name_normalized = ? WHERE id = ?",
+            updates,
+        )
+        conn.commit()
+
+        updated += len(rows)
+        last_id = rows[-1][0]
+        elapsed = time.time() - start
+        rate = updated / elapsed if elapsed > 0 else 0
+        logger.info(f"Normalized {updated:,}/{total:,} ({rate:,.0f}/s)")
+
+    conn.close()
+    elapsed = time.time() - start
+    click.echo(f"Done. Normalized {updated:,} names in {elapsed:.1f}s", err=True)
+

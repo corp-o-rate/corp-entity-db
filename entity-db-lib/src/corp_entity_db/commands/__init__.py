@@ -106,6 +106,7 @@ from .management import (
     db_post_import,
     db_migrate,
     db_normalize_people,
+    db_normalize_orgs,
     db_reclassify_people,
 )
 
@@ -119,6 +120,7 @@ main.add_command(db_build_identity_index)
 main.add_command(db_post_import)
 main.add_command(db_migrate)
 main.add_command(db_normalize_people)
+main.add_command(db_normalize_orgs)
 main.add_command(db_reclassify_people)
 
 from .repair import db_repair_resume, db_fix_resume, db_backfill_locations, db_backfill_roles

@@ -508,11 +508,11 @@ def db_people_test(
 
             # Collect for --for-llm output (all non-top1 hits are worth reviewing)
             if for_llm and not top1_match:
-                from corp_entity_db.store import _normalize_person_name
+                from corp_names import normalize_name as _corp_normalize_name
 
                 top_results = [
                     {"rank": r, "name": rec.name,
-                     "name_normalized": _normalize_person_name(rec.name),
+                     "name_normalized": _corp_normalize_name(rec.name).normalized,
                      "score": round(sc, 4),
                      "person_type": rec.person_type.value, "role": rec.known_for_role, "org": rec.known_for_org_name}
                     for r, (rec, sc) in enumerate(results, 1)
@@ -537,7 +537,7 @@ def db_people_test(
                 issue: dict[str, Any] = {
                     "type": ptype,
                     "query": query,
-                    "query_name_normalized": _normalize_person_name(name),
+                    "query_name_normalized": _corp_normalize_name(name).normalized,
                     "expected": expected,
                     "status": "wrong_rank" if topk_match else "missing",
                     "found_at_rank": topk_rank if topk_match else None,

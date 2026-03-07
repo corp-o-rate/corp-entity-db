@@ -15,6 +15,7 @@ from typing import Any, Iterator, Optional
 
 import numpy as np
 import pycountry
+from corp_names import normalize_company, normalize_name
 
 from .models import (
     CompanyRecord,
@@ -191,19 +192,6 @@ def _get_shared_connection(
     return _shared_connections[path_key]
 
 
-# Comprehensive set of corporate legal suffixes (international)
-COMPANY_SUFFIXES: set[str] = {
-    'A/S', 'AB', 'AG', 'AO', 'AG & Co', 'AG &', 'AG & CO.', 'AG & CO. KG', 'AG & CO. KGaA',
-    'AG & KG', 'AG & KGaA', 'AG & PARTNER', 'ATE', 'ASA', 'B.V.', 'BV', 'Class A', 'Class B',
-    'Class C', 'Class D', 'Class E', 'Class F', 'Class G', 'CO', 'Co', 'Co.', 'Company',
-    'Corp', 'Corp.', 'Corporation', 'DAC', 'GmbH', 'Inc', 'Inc.', 'Incorporated', 'KGaA',
-    'Limited', 'LLC', 'LLP', 'LP', 'Ltd', 'Ltd.', 'N.V.', 'NV', 'Plc', 'PC', 'plc', 'PLC',
-    'Pty Ltd', 'Pty', 'Pty. Ltd.', 'S.A.', 'S.A.B. de C.V.', 'SAB de CV', 'S.A.B.', 'S.A.P.I.',
-    'NV/SA', 'SDI', 'SpA', 'S.L.', 'S.p.A.', 'SA', 'SE', 'Tbk PT', 'U.A.',
-    # Additional common suffixes
-    'Group', 'Holdings', 'Holding', 'Partners', 'Trust', 'Fund', 'Bank', 'N.A.', 'The',
-}
-
 # Source priority for organization canonicalization (lower = higher priority)
 SOURCE_PRIORITY: dict[str, int] = {
     "gleif": 1,       # Gold standard LEI - globally unique legal entity identifier
@@ -218,17 +206,6 @@ PERSON_SOURCE_PRIORITY: dict[str, int] = {
     "sec_edgar": 2,      # Vetted US filers (Form 4 officers/directors)
     "companies_house": 3,  # UK company officers
 }
-
-# Suffix expansions for canonical name matching
-SUFFIX_EXPANSIONS: dict[str, str] = {
-    " ltd": " limited",
-    " corp": " corporation",
-    " inc": " incorporated",
-    " co": " company",
-    " intl": " international",
-    " natl": " national",
-}
-
 
 class UnionFind:
     """Simple Union-Find (Disjoint Set Union) data structure for canonicalization."""
@@ -384,115 +361,9 @@ def _regions_match(region1: str, region2: str) -> bool:
     return norm1 == norm2
 
 
-def _normalize_for_canon(name: str) -> str:
-    """Normalize name for canonical matching (simpler than search normalization)."""
-    # Lowercase
-    result = name.lower()
-    # Remove trailing dots
-    result = result.rstrip(".")
-    # Remove extra whitespace
-    result = " ".join(result.split())
-    return result
-
-
-def _expand_suffix(name: str) -> str:
-    """Expand known suffix abbreviations."""
-    result = name.lower().rstrip(".")
-    for abbrev, full in SUFFIX_EXPANSIONS.items():
-        if result.endswith(abbrev):
-            result = result[:-len(abbrev)] + full
-            break  # Only expand one suffix
-    return result
-
-
 def _names_match_for_canon(name1: str, name2: str) -> bool:
-    """Check if two names match for canonicalization."""
-    n1 = _normalize_for_canon(name1)
-    n2 = _normalize_for_canon(name2)
-
-    # Exact match after normalization
-    if n1 == n2:
-        return True
-
-    # Try with suffix expansion
-    if _expand_suffix(n1) == _expand_suffix(n2):
-        return True
-
-    return False
-
-# Pre-compile the suffix pattern for performance
-_SUFFIX_PATTERN = re.compile(
-    r'\s+(' + '|'.join(re.escape(suffix) for suffix in COMPANY_SUFFIXES) + r')\.?$',
-    re.IGNORECASE
-)
-
-
-def _clean_org_name(name: str | None) -> str:
-    """
-    Remove special characters and formatting from organization name.
-
-    Removes brackets, parentheses, quotes, and other formatting artifacts.
-    """
-    if not name:
-        return ""
-    # Remove special characters, keeping only alphanumeric and spaces
-    cleaned = re.sub(r'[•;:\'"\[\](){}<>`~!@#$%^&*\-_=+\\|/?!`~]+', ' ', name)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    # Recurse if changes were made (handles nested special chars)
-    return _clean_org_name(cleaned) if cleaned != name else cleaned
-
-
-def _remove_suffix(name: str) -> str:
-    """
-    Remove corporate legal suffixes from company name.
-
-    Iteratively removes suffixes until no more are found.
-    Also removes possessive 's and trailing punctuation.
-    """
-    cleaned = name.strip()
-    cleaned = re.sub(r'\s+', ' ', cleaned)
-    # Remove possessive 's (e.g., "Amazon's" -> "Amazon")
-    cleaned = re.sub(r"'s\b", "", cleaned)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-
-    while True:
-        new_name = _SUFFIX_PATTERN.sub('', cleaned)
-        # Remove trailing punctuation
-        new_name = re.sub(r'[ .,;&\n\t/)]$', '', new_name)
-
-        if new_name == cleaned:
-            break
-        cleaned = new_name.strip()
-
-    return cleaned.strip()
-
-
-def _normalize_name(name: str) -> str:
-    """
-    Normalize company name for text matching.
-
-    1. Remove possessive 's (before cleaning removes apostrophe)
-    2. Clean special characters
-    3. Remove legal suffixes
-    4. Lowercase
-    5. If result is empty, use cleaned lowercase original
-
-    Always returns a non-empty string for valid input.
-    """
-    if not name:
-        return ""
-    # Remove possessive 's first (before cleaning removes the apostrophe)
-    normalized = re.sub(r"'s\b", "", name)
-    # Clean special characters
-    cleaned = _clean_org_name(normalized)
-    # Remove legal suffixes
-    normalized = _remove_suffix(cleaned)
-    # Lowercase for matching
-    normalized = normalized.lower()
-    # If normalized is empty (e.g., name was just "Ltd"), use the cleaned name
-    if not normalized:
-        normalized = cleaned.lower() if cleaned else name.lower()
-    return normalized
+    """Check if two names match for canonicalization using corp-names normalization."""
+    return normalize_company(name1).normalized == normalize_company(name2).normalized
 
 
 def _extract_search_terms(query: str) -> list[str]:
@@ -514,32 +385,6 @@ def _extract_search_terms(query: str) -> list[str]:
     return words[:3]  # Limit to top 3 terms
 
 
-# Person name normalization patterns
-_PERSON_PREFIXES = {
-    "dr.", "dr", "prof.", "prof", "professor",
-    "mr.", "mr", "mrs.", "mrs", "ms.", "ms", "miss",
-    "sir", "dame", "lord", "lady",
-    "rev.", "rev", "reverend",
-    "hon.", "hon", "honorable",
-    "gen.", "gen", "general",
-    "col.", "col", "colonel",
-    "capt.", "capt", "captain",
-    "lt.", "lt", "lieutenant",
-    "sgt.", "sgt", "sergeant",
-}
-
-_PERSON_SUFFIXES = {
-    "jr.", "jr", "junior",
-    "sr.", "sr", "senior",
-    "ii", "iii", "iv", "v",
-    "2nd", "3rd", "4th", "5th",
-    "phd", "ph.d.", "ph.d",
-    "md", "m.d.", "m.d",
-    "esq", "esq.",
-    "mba", "m.b.a.",
-    "cpa", "c.p.a.",
-    "jd", "j.d.",
-}
 
 
 def _invert_date_str(date_str: str) -> str:
@@ -553,47 +398,6 @@ def _invert_date_str(date_str: str) -> str:
     return "".join(chr(ord("9") - ord(c) + ord("0")) if c.isdigit() else c for c in date_str)
 
 
-def _normalize_person_name(name: str) -> str:
-    """
-    Normalize person name for text matching.
-
-    1. Remove honorific prefixes (Dr., Prof., Mr., etc.)
-    2. Remove generational suffixes (Jr., Sr., III, PhD, etc.)
-    3. Keep name particles (von, van, de, al-, etc.)
-    4. Lowercase and strip
-
-    Always returns a non-empty string for valid input.
-    """
-    if not name:
-        return ""
-
-    # Lowercase for matching
-    normalized = name.lower().strip()
-
-    # Split into words
-    words = normalized.split()
-    if not words:
-        return ""
-
-    # Remove prefix if first word is a title
-    while words and words[0].rstrip(".") in _PERSON_PREFIXES:
-        words.pop(0)
-        if not words:
-            return name.lower().strip()  # Fallback if name was just a title
-
-    # Remove suffix if last word is a suffix
-    while words and words[-1].rstrip(".") in _PERSON_SUFFIXES:
-        words.pop()
-        if not words:
-            return name.lower().strip()  # Fallback if name was just suffixes
-
-    # Rejoin remaining words
-    normalized = " ".join(words)
-
-    # Clean up extra spaces
-    normalized = re.sub(r'\s+', ' ', normalized).strip()
-
-    return normalized if normalized else name.lower().strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1007,7 +811,7 @@ class OrganizationDatabase:
 
         # Serialize record
         record_json = json.dumps(record.record)
-        name_normalized = _normalize_name(record.name)
+        name_normalized = normalize_company(record.name).normalized
 
         # v2+ schema: use FK IDs instead of TEXT columns
         source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
@@ -1072,7 +876,7 @@ class OrganizationDatabase:
 
         for i, record in enumerate(records):
             record_json = json.dumps(record.record)
-            name_normalized = _normalize_name(record.name)
+            name_normalized = normalize_company(record.name).normalized
 
             # v2+ schema: use FK IDs instead of TEXT columns
             source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
@@ -1482,7 +1286,6 @@ class OrganizationDatabase:
         # Name indexes now keyed by (normalized_name, normalized_region)
         # Region-less matching only applies for identifier-based matching
         name_region_index: dict[tuple[str, str], list[int]] = {}
-        expanded_name_region_index: dict[tuple[str, str], list[int]] = {}
 
         sources: dict[int, str] = {}  # org_id -> source
         all_org_ids: list[int] = []
@@ -1529,17 +1332,12 @@ class OrganizationDatabase:
 
             # Index by (normalized_name, normalized_region)
             # Same name in different regions = different legal entities
-            norm_name = _normalize_for_canon(name)
+            # corp_names.normalize_company handles suffix normalization (Ltd→Limited, etc.)
+            norm_name = normalize_company(name).normalized
             norm_region = _normalize_region(region)
             if norm_name:
                 key = (norm_name, norm_region)
                 name_region_index.setdefault(key, []).append(org_id)
-
-            # Index by (expanded_name, normalized_region)
-            expanded_name = _expand_suffix(name)
-            if expanded_name and expanded_name != norm_name:
-                key = (expanded_name, norm_region)
-                expanded_name_region_index.setdefault(key, []).append(org_id)
 
             count += 1
             if count % 100000 == 0:
@@ -1550,7 +1348,6 @@ class OrganizationDatabase:
         logger.info(f"  Ticker index: {len(ticker_index)} unique tickers")
         logger.info(f"  CIK index: {len(cik_index)} unique CIKs")
         logger.info(f"  Name+region index: {len(name_region_index)} unique (name, region) pairs")
-        logger.info(f"  Expanded name+region index: {len(expanded_name_region_index)} unique pairs")
 
         # Phase 2: Build equivalence groups using Union-Find
         logger.info("Phase 2: Building equivalence groups...")
@@ -1573,17 +1370,10 @@ class OrganizationDatabase:
                 uf.union(ids[0], ids[i])
 
         # Merge by (normalized_name, normalized_region)
+        # corp_names already handles suffix normalization (Ltd=Limited, Corp=Corporation, etc.)
         for _name_region, ids in name_region_index.items():
             for i in range(1, len(ids)):
                 uf.union(ids[0], ids[i])
-
-        # Merge by (expanded_name, normalized_region)
-        # This connects "Amazon Ltd" with "Amazon Limited" in same region
-        for key, expanded_ids in expanded_name_region_index.items():
-            # Find org_ids with the expanded form as their normalized name in same region
-            if key in name_region_index:
-                # Link first expanded_id to first name_id
-                uf.union(expanded_ids[0], name_region_index[key][0])
 
         groups = uf.groups()
         logger.info(f"  Found {len(groups)} equivalence groups")
@@ -1856,7 +1646,7 @@ class PersonDatabase:
 
         # Serialize record
         record_json = json.dumps(record.record)
-        name_normalized = _normalize_person_name(record.name)
+        name_normalized = normalize_name(record.name).normalized
 
         # v2+ schema: use FK IDs instead of TEXT columns
         source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)
@@ -1933,7 +1723,7 @@ class PersonDatabase:
 
         for i, record in enumerate(records):
             record_json = json.dumps(record.record)
-            name_normalized = _normalize_person_name(record.name)
+            name_normalized = normalize_name(record.name).normalized
 
             # v2+ schema: use FK IDs instead of TEXT columns
             source_type_id = SOURCE_NAME_TO_ID.get(record.source, 4)

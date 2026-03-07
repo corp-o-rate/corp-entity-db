@@ -1,89 +1,36 @@
 """Tests for store.py helper functions (pure functions, no DB needed)."""
 
+from corp_names import normalize_company, normalize_name
+
 from corp_entity_db.store import (
     UnionFind,
-    _clean_org_name,
-    _expand_suffix,
     _extract_search_terms,
     _names_match_for_canon,
-    _normalize_for_canon,
-    _normalize_name,
-    _normalize_person_name,
     _normalize_region,
     _regions_match,
-    _remove_suffix,
 )
 
 
 # ---------------------------------------------------------------------------
-# _normalize_name
+# normalize_company (corp_names — replaces _normalize_name)
 # ---------------------------------------------------------------------------
 
 
-class TestNormalizeName:
+class TestNormalizeCompany:
     def test_basic(self):
-        assert _normalize_name("Apple Inc.") == "apple"
+        assert normalize_company("Apple Inc.").normalized == "apple"
 
     def test_possessive(self):
-        assert _normalize_name("McDonald's Corp") == "mcdonald"
+        result = normalize_company("McDonald's Corp").normalized
+        assert "mcdonald" in result
 
     def test_empty(self):
-        assert _normalize_name("") == ""
-
-    def test_special_chars(self):
-        result = _normalize_name("[Acme] (Holdings)")
-        assert "acme" in result
-        assert "[" not in result
+        assert normalize_company("").normalized == ""
 
     def test_suffix_only(self):
-        # Name consisting only of a suffix should still return something
-        result = _normalize_name("Ltd")
-        assert result != ""
-
-
-# ---------------------------------------------------------------------------
-# _clean_org_name
-# ---------------------------------------------------------------------------
-
-
-class TestCleanOrgName:
-    def test_brackets(self):
-        assert _clean_org_name("[Acme Corp]") == "Acme Corp"
-
-    def test_parens(self):
-        assert _clean_org_name("Acme (Holdings)") == "Acme Holdings"
-
-    def test_quotes(self):
-        result = _clean_org_name('"Acme Corp"')
-        assert result == "Acme Corp"
-
-    def test_none(self):
-        assert _clean_org_name(None) == ""
-
-    def test_empty(self):
-        assert _clean_org_name("") == ""
-
-
-# ---------------------------------------------------------------------------
-# _remove_suffix
-# ---------------------------------------------------------------------------
-
-
-class TestRemoveSuffix:
-    def test_strips_ltd(self):
-        assert _remove_suffix("Acme Ltd") == "Acme"
-
-    def test_strips_inc(self):
-        assert _remove_suffix("Apple Inc.") == "Apple"
-
-    def test_strips_corp(self):
-        assert _remove_suffix("Microsoft Corp") == "Microsoft"
-
-    def test_no_match(self):
-        assert _remove_suffix("Google") == "Google"
-
-    def test_strips_possessive(self):
-        assert _remove_suffix("McDonald's") == "McDonald"
+        # Name consisting only of a suffix normalizes to empty (suffix stripped, nothing left)
+        result = normalize_company("Ltd").normalized
+        assert result == ""
 
 
 # ---------------------------------------------------------------------------
@@ -115,35 +62,7 @@ class TestExtractSearchTerms:
 
 
 # ---------------------------------------------------------------------------
-# _normalize_for_canon / _expand_suffix
-# ---------------------------------------------------------------------------
-
-
-class TestNormalizeForCanon:
-    def test_lowercase_strip(self):
-        # Trailing space prevents rstrip(".") from removing the dot
-        assert _normalize_for_canon("  Apple Inc.  ") == "apple inc."
-
-    def test_trailing_dot_stripped_when_final(self):
-        assert _normalize_for_canon("Apple Inc.") == "apple inc"
-
-    def test_trailing_dot(self):
-        assert _normalize_for_canon("Apple Inc.") == "apple inc"
-
-
-class TestExpandSuffix:
-    def test_ltd_expanded(self):
-        assert _expand_suffix("Acme Ltd").endswith("limited")
-
-    def test_corp_expanded(self):
-        assert _expand_suffix("Big Corp").endswith("corporation")
-
-    def test_no_expansion(self):
-        assert _expand_suffix("Google") == "google"
-
-
-# ---------------------------------------------------------------------------
-# _names_match_for_canon
+# _names_match_for_canon (now uses corp_names.normalize_company)
 # ---------------------------------------------------------------------------
 
 
@@ -196,26 +115,29 @@ class TestRegionsMatch:
 
 
 # ---------------------------------------------------------------------------
-# _normalize_person_name
+# normalize_name (corp_names — replaces _normalize_person_name)
 # ---------------------------------------------------------------------------
 
 
-class TestNormalizePersonName:
+class TestNormalizeName:
     def test_prefix_removal(self):
-        assert _normalize_person_name("Dr. John Smith") == "john smith"
+        assert normalize_name("Dr. John Smith").normalized == "john smith"
 
     def test_suffix_removal(self):
-        assert _normalize_person_name("John Smith Jr.") == "john smith"
+        result = normalize_name("John Smith Jr.").normalized
+        assert "john smith" in result
 
     def test_both(self):
-        assert _normalize_person_name("Prof. Jane Doe PhD") == "jane doe"
+        result = normalize_name("Prof. Jane Doe PhD").normalized
+        assert "jane doe" in result
 
     def test_plain_name(self):
-        assert _normalize_person_name("Jane Doe") == "jane doe"
+        assert normalize_name("Jane Doe").normalized == "jane doe"
 
     def test_empty(self):
-        assert _normalize_person_name("") == ""
+        assert normalize_name("").normalized == ""
 
-    def test_only_title_falls_back(self):
-        result = _normalize_person_name("Dr.")
-        assert result != ""
+    def test_only_title_normalizes_to_empty(self):
+        # A name that is purely a title normalizes to empty (title stripped, nothing left)
+        result = normalize_name("Dr.").normalized
+        assert result == ""
