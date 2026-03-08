@@ -86,7 +86,7 @@ corp-entity-db serve --port 9000      # Custom port
 - **Primary composite index** (`people_usearch_v5.bin`, 768-dim): Name, role, and organization are embedded as separate 256-dim vectors using Matryoshka truncation, independently L2-normalized, weighted (name=8, role=1, org=4), and concatenated. Only indexes people with org associations. This gives AND-style matching: a poor match on organization cannot be compensated by a good match on name, enabling precise queries like "find the CEO named Tim Cook at Apple." Built by `build_people_composite_index()`.
 - **Secondary identity index** (`people_identity_usearch_v5.bin`, 256-dim): Name-only embeddings with Matryoshka truncation to 256 dims for all people. Consulted as fallback when composite search and SQL name lookup fail. Built by `build_people_identity_index()`.
 
-Search accuracy: 96.1% acc@1, 98.9% acc@20 on 280 queries across 12 person types (95-165ms per query after model warmup). Three-tier fallback: composite HNSW → SQL name_normalized lookup → identity HNSW.
+Search accuracy: 97.5% acc@1, 100% acc@20 on 280 queries across 12 person types (95-165ms per query after model warmup). Three-tier fallback: composite HNSW → SQL name_normalized lookup (using `corp-names` for normalization, with disambiguation blending description similarity and name Levenshtein) → identity HNSW.
 
 ## Database Variants
 
@@ -103,6 +103,7 @@ corp-entity-db post-import             # Build USearch indexes + VACUUM
 corp-entity-db build-index             # Rebuild all USearch HNSW indexes
 corp-entity-db build-identity-index    # Rebuild only the people identity index
 corp-entity-db normalize-people        # Normalize people names using corp-names
+corp-entity-db normalize-orgs          # Normalize organization names using corp-names
 corp-entity-db reclassify-people       # Recalculate person_type classifications
 corp-entity-db people-test             # Run people search accuracy test
 corp-entity-db org-test                # Run organization search accuracy test

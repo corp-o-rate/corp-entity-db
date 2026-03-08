@@ -80,6 +80,7 @@ corp-entity-db post-import                     # Run after any import: build USe
 corp-entity-db build-index                     # Build all USearch HNSW indexes
 corp-entity-db build-identity-index            # Build only the people identity index
 corp-entity-db normalize-people                # Normalize people names using corp-names
+corp-entity-db normalize-orgs                  # Normalize organization names using corp-names
 corp-entity-db reclassify-people               # Recalculate person_type classifications
 corp-entity-db people-test                     # Run people search accuracy test
 corp-entity-db org-test                        # Run organization search accuracy test
@@ -202,7 +203,9 @@ The default install (`pip install corp-entity-db`) includes only search dependen
 - Server default port: 8222
 - Person records include `birth_date` and `death_date` fields, with `is_historic` property for deceased individuals
 - Canonicalization priority: wikidata > sec_edgar > companies_house
+- Name normalization uses `corp-names` library: `normalize_name()` for people, `normalize_company()` for organizations — handles title/suffix stripping, nickname canonicalization (Steven→stephen, Bob→robert), and legal suffix normalization (Ltd→limited)
 - People search uses composite HNSW index (only people with org associations) with SQL name-lookup fallback when composite scores ≤ 0.95, plus an identity HNSW index (768-dim name-only) as a secondary fallback
+- Name lookup disambiguation blends description embedding similarity (55%) with display-name Levenshtein similarity (45%) to prefer exact name matches
 - Composite index only indexes people with `known_for_org_id IS NOT NULL`
 - HNSW search results are canon-deduplicated (each canonical person appears once)
 

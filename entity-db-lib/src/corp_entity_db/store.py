@@ -2136,6 +2136,7 @@ class PersonDatabase:
                 identity_candidates = [(record, score) for _pid, record, score in name_results]
                 ranked = self._disambiguate_by_embedding(
                     identity_candidates, query_desc_emb, embedder,
+                    query_name=query_name,
                 )
             elif name_results:
                 # No embedder — fall back to Levenshtein rerank
@@ -2161,6 +2162,7 @@ class PersonDatabase:
                         identity_candidates = [(record, score) for _pid, record, score in identity_results]
                         ranked = self._disambiguate_by_embedding(
                             identity_candidates, query_desc_emb, embedder,
+                            query_name=query_name,
                         )
                     else:
                         ranked = [(record, score) for _, record, score in composite_results]
@@ -2179,6 +2181,11 @@ class PersonDatabase:
 
         return ranked[:top_k]
 
+    # SQL LIMIT for name lookups — high enough to reach famous people
+    # with many canonical entries, but bounded for safety. The indexed query
+    # is fast; the real cost is disambiguation embeddings (which are cached).
+    NAME_LOOKUP_LIMIT = 500
+
     def _name_lookup(
         self,
         query_name: str,
@@ -2196,23 +2203,32 @@ class PersonDatabase:
             return []
 
         rows = self._conn.execute(
-            """SELECT id FROM people
+            """SELECT id, known_for_role_id, known_for_org_id FROM people
                WHERE name_normalized = ?
                ORDER BY canon_size DESC, id
                LIMIT ?""",
-            (normalized, top_k),
+            (normalized, self.NAME_LOOKUP_LIMIT),
         ).fetchall()
 
-        results: list[tuple[int, PersonRecord, float]] = []
-        seen_canon: set[int] = set()
+        # Group rows by canon_id, picking the most descriptive matched record per group
+        # (one with role AND org, over one with just role, over one with nothing)
+        canon_to_best: dict[int, tuple[int, int]] = {}  # canon_id -> (person_id, descriptiveness)
         for row in rows:
             person_id = row[0]
             canon_id = self._get_canon_id(person_id)
-            if canon_id in seen_canon:
-                continue
-            seen_canon.add(canon_id)
+            # Score descriptiveness: role (+1) + org (+1)
+            desc_score = (1 if row[1] is not None else 0) + (1 if row[2] is not None else 0)
+            if canon_id not in canon_to_best or desc_score > canon_to_best[canon_id][1]:
+                canon_to_best[canon_id] = (person_id, desc_score)
+
+        results: list[tuple[int, PersonRecord, float]] = []
+        for canon_id, (best_person_id, _) in canon_to_best.items():
             record = self._get_record_by_id(canon_id)
             if record is not None:
+                if best_person_id != canon_id:
+                    matched = self._get_record_by_id(best_person_id)
+                    if matched is not None:
+                        record.matched_record = matched
                 results.append((canon_id, record, 1.0))
 
         logger.debug(f"Name lookup '{query_name}' -> '{normalized}': {len(results)} matches")
@@ -2244,14 +2260,20 @@ class PersonDatabase:
         cache_dir = Path.home() / ".cache" / "corp-extractor" / "person-embeddings"
         return diskcache.Cache(directory=str(cache_dir))
 
+    # Weight for blending name similarity into disambiguation scoring.
+    # Final score = (1 - NAME_WEIGHT) * desc_sim + NAME_WEIGHT * name_sim
+    NAME_WEIGHT = 0.45
+
     def _disambiguate_by_embedding(
         self,
         candidates: list[tuple[PersonRecord, float]],
         query_desc_embedding: np.ndarray,
         embedder: "CompanyEmbedder",
+        query_name: Optional[str] = None,
     ) -> list[tuple[PersonRecord, float]]:
         """
-        Re-score identity-match candidates using description embedding similarity.
+        Re-score identity-match candidates using description embedding similarity,
+        blended with display-name Levenshtein similarity when query_name is provided.
 
         All candidates share the same normalized name (from identity lookup).
         Builds a natural language description for each, embeds it, and scores
@@ -2288,11 +2310,16 @@ class PersonDatabase:
                 cache_key = f"v1:{record.source}:{record.source_id}"
                 cache.set(cache_key, emb.tobytes())
 
-        # Score by cosine similarity against query description
+        # Score by cosine similarity against query description, blended with name similarity
         scored: list[tuple[PersonRecord, float]] = []
         for idx, (record, _score) in enumerate(candidates):
             emb = candidate_embs[idx]
-            sim = float(np.dot(query_desc_embedding, emb))
+            desc_sim = float(np.dot(query_desc_embedding, emb))
+            if query_name:
+                name_sim = self._levenshtein_ratio(query_name, record.name)
+                sim = (1 - self.NAME_WEIGHT) * desc_sim + self.NAME_WEIGHT * name_sim
+            else:
+                sim = desc_sim
             scored.append((record, sim))
 
         logger.debug(
@@ -2382,26 +2409,31 @@ class PersonDatabase:
         if self._hnsw_index is None:
             return []
 
-        fetch_k = min(top_k * 3, len(self._hnsw_index))
+        # Fetch extra to account for same-QID entries collapsing to one canon_id
+        fetch_k = min(top_k * 10, len(self._hnsw_index))
 
         matches = self._hnsw_index.search(query_int8, fetch_k)
 
-        # Convert to results, deduplicating by canon_id so each canonical person appears once
-        seen_canon: set[int] = set()
-        results: list[tuple[int, PersonRecord, float]] = []
+        # Collect best-scoring entry per canon_id (not just the first)
+        best_per_canon: dict[int, tuple[int, float]] = {}  # canon_id -> (person_id, similarity)
         for person_id, dist in zip(matches.keys, matches.distances):
             person_id = int(person_id)
             canon_id = self._get_canon_id(person_id)
-            if canon_id in seen_canon:
-                continue
-            seen_canon.add(canon_id)
-
-            # Convert distance to similarity (cosine distance is 1 - cosine similarity)
             similarity = 1.0 - float(dist)
 
-            # Always resolve to canonical record
+            if canon_id not in best_per_canon or similarity > best_per_canon[canon_id][1]:
+                best_per_canon[canon_id] = (person_id, similarity)
+
+        # Sort by similarity descending and build results
+        sorted_canons = sorted(best_per_canon.items(), key=lambda x: x[1][1], reverse=True)
+        results: list[tuple[int, PersonRecord, float]] = []
+        for canon_id, (person_id, similarity) in sorted_canons:
             record = self._get_record_by_id(canon_id)
             if record is not None:
+                if person_id != canon_id:
+                    matched = self._get_record_by_id(person_id)
+                    if matched is not None:
+                        record.matched_record = matched
                 results.append((canon_id, record, similarity))
 
             if len(results) >= top_k:
@@ -2481,6 +2513,10 @@ class PersonDatabase:
             similarity = 1.0 - float(dist)
             record = self._get_record_by_id(canon_id)
             if record is not None:
+                if person_id != canon_id:
+                    matched = self._get_record_by_id(person_id)
+                    if matched is not None:
+                        record.matched_record = matched
                 results.append((canon_id, record, similarity))
 
             if len(results) >= top_k:
@@ -2639,8 +2675,9 @@ class PersonDatabase:
         Canonicalize person records by linking equivalent entries across sources.
 
         Uses a multi-phase approach:
-        1. Match by normalized name + same organization (org canonical group)
-        2. Match by normalized name + overlapping date ranges
+        1. Match by QID (all rows sharing the same Wikidata QID are the same person)
+        2. Match by normalized name + same organization (org canonical group)
+        3. Match by normalized name + overlapping date ranges
 
         Source priority (lower = more authoritative):
         - wikidata: 1 (curated, has Q codes)
@@ -2656,6 +2693,7 @@ class PersonDatabase:
         conn = self._connect()
         stats = {
             "total_records": 0,
+            "matched_by_qid": 0,
             "matched_by_org": 0,
             "matched_by_date": 0,
             "canonical_groups": 0,
@@ -2664,13 +2702,20 @@ class PersonDatabase:
 
         logger.info("Phase 1: Building person index...")
 
-        # Load all people with their normalized names and org info
+        # Load all people with their normalized names, org info, QID, and type/role for canonical selection
         cursor = conn.execute("""
             SELECT p.id, p.name, p.name_normalized, s.name as source, p.source_identifier as source_id,
-                   p.known_for_org_id, p.from_date, p.to_date
+                   p.known_for_org_id, p.from_date, p.to_date, p.qid,
+                   p.person_type_id, p.known_for_role_id
             FROM people p
             JOIN source_types s ON p.source_id = s.id
         """)
+
+        # Resolve "unknown" person type ID (type_id=1 is typically "unknown")
+        unknown_type_id = conn.execute(
+            "SELECT id FROM people_types WHERE name = 'unknown'"
+        ).fetchone()
+        unknown_type_id = unknown_type_id[0] if unknown_type_id else None
 
         people: list[dict] = []
         for row in cursor:
@@ -2683,6 +2728,9 @@ class PersonDatabase:
                 "known_for_org_id": row["known_for_org_id"],
                 "from_date": row["from_date"],
                 "to_date": row["to_date"],
+                "qid": row["qid"],
+                "person_type_id": row["person_type_id"],
+                "known_for_role_id": row["known_for_role_id"],
             })
 
         stats["total_records"] = len(people)
@@ -2694,6 +2742,22 @@ class PersonDatabase:
         # Initialize Union-Find
         person_ids = [p["id"] for p in people]
         uf = UnionFind(person_ids)
+
+        # Phase 1.5: Match by QID (all rows with same Wikidata QID are the same person)
+        logger.info("Phase 1.5: Matching by QID...")
+        qid_to_people: dict[int, list[dict]] = {}
+        for p in people:
+            if p["qid"] is not None:
+                qid_to_people.setdefault(p["qid"], []).append(p)
+
+        for qid, qid_people in qid_to_people.items():
+            if len(qid_people) >= 2:
+                first_id = qid_people[0]["id"]
+                for p in qid_people[1:]:
+                    uf.union(first_id, p["id"])
+                    stats["matched_by_qid"] += 1
+
+        logger.info(f"Phase 1.5 complete: {stats['matched_by_qid']} matches by QID")
 
         # Build indexes for efficient matching
         # Index by normalized name
@@ -2768,9 +2832,12 @@ class PersonDatabase:
         # Get all groups and select canonical record for each
         groups = uf.groups()
 
-        # Build id -> source and id -> from_date mappings
+        # Build id -> field mappings for canonical selection
         id_to_source = {p["id"]: p["source"] for p in people}
         id_to_from_date = {p["id"]: p["from_date"] or "" for p in people}
+        id_to_person_type_id = {p["id"]: p["person_type_id"] for p in people}
+        id_to_has_role = {p["id"]: p["known_for_role_id"] is not None for p in people}
+        id_to_has_org = {p["id"]: p["known_for_org_id"] is not None for p in people}
 
         batch_updates: list[tuple[int, int, int]] = []  # (person_id, canon_id, canon_size)
 
@@ -2782,12 +2849,15 @@ class PersonDatabase:
                 person_id = group_ids[0]
                 batch_updates.append((person_id, person_id, 1))
             else:
-                # Multiple records - pick highest priority source as canonical
-                # Sort by: source priority asc, has-date first, from_date desc (most recent), id asc
+                # Multiple records - pick best canonical representative.
+                # Prefer: known type > has role > has org > source priority > date > id
                 sorted_ids = sorted(
                     group_ids,
                     key=lambda pid: (
                         PERSON_SOURCE_PRIORITY.get(id_to_source[pid], 99),
+                        0 if id_to_person_type_id[pid] != unknown_type_id else 1,  # known type first
+                        0 if id_to_has_role[pid] else 1,  # has role first
+                        0 if id_to_has_org[pid] else 1,  # has org first
                         0 if id_to_from_date[pid] else 1,  # entries with dates first
                         _invert_date_str(id_to_from_date[pid]),  # most recent date first
                         pid,
@@ -2798,7 +2868,7 @@ class PersonDatabase:
                 stats["records_in_groups"] += group_size
 
                 for person_id in group_ids:
-                    batch_updates.append((person_id, canon_id, group_size if person_id == canon_id else 1))
+                    batch_updates.append((person_id, canon_id, group_size))
 
             # Commit in batches
             if len(batch_updates) >= batch_size:

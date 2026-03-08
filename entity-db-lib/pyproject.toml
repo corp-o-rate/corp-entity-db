@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "corp-entity-db"
-version = "0.4.0"
+version = "0.5.0"
 description = "Entity database for organizations, people, roles, and locations with embedding search"
 readme = "README.md"
 requires-python = ">=3.11"

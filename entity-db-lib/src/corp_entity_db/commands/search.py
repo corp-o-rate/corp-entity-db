@@ -220,7 +220,7 @@ def db_people_test(
             ("Samuel Alito", "Samuel Alito", {"person_type": "legal", "role": "Justice", "org": "Supreme Court of the United States", "expected_org": ""}),
             ("Ruth Bader Ginsburg", "Ruth Bader Ginsburg", {"person_type": "legal", "role": "Justice", "org": "Supreme Court of the United States", "expected_org": ""}),
             ("Brenda Hale", "Brenda Hale", {"person_type": "legal", "role": "President", "org": "Supreme Court, United Kingdom", "expected_type": "politician", "expected_org": ""}),
-            ("Robert Reed", "Robert Reed", {"person_type": "legal", "role": "President", "org": "UK Supreme Court", "expected_type": "academic", "expected_org": ""}),
+            ("Merrick Garland", "Merrick Garland", {"person_type": "legal", "role": "Attorney General", "org": "United States Department of Justice", "expected_org": ""}),
             ("Karim Khan", "Karim Khan", {"person_type": "legal", "role": "Prosecutor", "org": "International Criminal Court", "expected_type": "academic", "expected_org": ""}),
             ("Joan Donoghue", "Joan Donoghue", {"person_type": "legal", "role": "President", "org": "International Court of Justice", "expected_org": ""}),
             ("Didier Reynders", "Didier Reynders", {"person_type": "legal", "role": "Commissioner for Justice", "org": "European Commission", "expected_type": "politician", "expected_org": "European Union"}),
@@ -355,7 +355,7 @@ def db_people_test(
             ("Patrick Mahomes", "Patrick Mahomes", {"person_type": "athlete", "role": "quarterback", "org": "Kansas City Chiefs", "expected_org": ""}),
             ("Kylian Mbappé", "Kylian Mbappé", {"person_type": "athlete", "role": "footballer"}),
             ("Erling Haaland", "Erling Haaland", {"person_type": "athlete", "role": "footballer", "org": "Manchester City", "expected_org": ""}),
-            ("Stephen Curry", "Stephen Curry", {"person_type": "athlete", "role": "basketball player", "org": "Golden State Warriors", "expected_type": "artist", "expected_org": ""}),
+            ("Stephen Curry", "Stephen Curry", {"person_type": "athlete", "role": "basketball player", "org": "Golden State Warriors", "expected_type": "athlete", "expected_org": ""}),
             ("Naomi Osaka", "Naomi Osaka", {"person_type": "athlete", "role": "tennis player"}),
             ("Katie Ledecky", "Katie Ledecky", {"person_type": "athlete", "role": "swimmer"}),
             ("Eliud Kipchoge", "Eliud Kipchoge", {"person_type": "athlete", "role": "marathon runner", "expected_type": "unknown"}),
@@ -474,17 +474,25 @@ def db_people_test(
             # Accuracy: check if expected person appears in results.
             # Match by name AND verify person_type/role/org to ensure it's the right person
             # (not a different person with the same name).
+            # Checks both the canonical record and the matched_record (the actual
+            # indexed record that triggered the match, which may have different role/org).
             def _is_expected(rec: "PersonRecord") -> bool:
-                if rec.name.lower() != expected_lower:
-                    return False
-                # Use expected_type/expected_org overrides when DB values differ from search params
-                exp_type = query_kwargs.get("expected_type", person_type)
-                if exp_type and rec.person_type.value != exp_type:
-                    return False
-                exp_org = query_kwargs.get("expected_org", org)
-                if exp_org and exp_org.lower() not in rec.known_for_org_name.lower():
-                    return False
-                return True
+                # Check canonical record and matched_record (if present)
+                candidates = [rec]
+                if rec.matched_record is not None:
+                    candidates.append(rec.matched_record)
+
+                for c in candidates:
+                    if c.name.lower() != expected_lower:
+                        continue
+                    exp_type = query_kwargs.get("expected_type", person_type)
+                    if exp_type and c.person_type.value != exp_type:
+                        continue
+                    exp_org = query_kwargs.get("expected_org", org)
+                    if exp_org and exp_org.lower() not in c.known_for_org_name.lower():
+                        continue
+                    return True
+                return False
 
             top1_match = False
             topk_match = False

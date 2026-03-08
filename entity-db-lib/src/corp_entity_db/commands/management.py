@@ -216,6 +216,7 @@ def db_canonicalize(db_path: Optional[str], batch_size: int, verbose: bool):
         click.echo("\nPeople Canonicalization Results")
         click.echo("=" * 40)
         click.echo(f"Total records processed: {people_result['total_records']:,}")
+        click.echo(f"Matched by QID: {people_result['matched_by_qid']:,}")
         click.echo(f"Matched by organization: {people_result['matched_by_org']:,}")
         click.echo(f"Matched by date overlap: {people_result['matched_by_date']:,}")
         click.echo(f"Canonical groups: {people_result['canonical_groups']:,}")
