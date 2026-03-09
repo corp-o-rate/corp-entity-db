@@ -90,7 +90,7 @@ Search accuracy: 100% acc@1, 100% acc@20 on 280 queries across 12 person types (
 
 ## Database Variants
 
-- **Lite** (default download): `record` and `name_normalized` columns dropped for smaller download
+- **Lite** (default download): `record` column stripped, `name_normalized` kept on all tables
 - **Full**: Includes all columns with source record metadata
 
 In both variants, all embeddings exist only in versioned USearch index files (`organizations_usearch_v5.bin`, `people_usearch_v5.bin`, `people_identity_usearch_v5.bin`), never in SQLite.

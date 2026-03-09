@@ -348,10 +348,10 @@ def db_upload(db_path: Optional[str], repo: str, message: str, no_lite: bool, ve
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def db_create_lite(db_path: str, output: Optional[str], verbose: bool):
     """
-    Create a lite version of the database without record data or name_normalized.
+    Create a lite version of the database without record data.
 
-    The lite version strips the `record` column and drops `name_normalized`.
-    Search uses USearch HNSW index files (.bin) instead.
+    The lite version strips the `record` column content. The `name_normalized`
+    column is kept on all tables (required by SQL name-lookup fallback in search).
 
     \b
     Examples:

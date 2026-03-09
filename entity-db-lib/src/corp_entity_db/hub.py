@@ -34,18 +34,6 @@ USEARCH_INDEX_BASES = ["organizations_usearch", "people_usearch", "people_identi
 USEARCH_INDEX_FILES = [f"{base}_v{DB_VERSION}.bin" for base in USEARCH_INDEX_BASES]
 
 
-def usearch_index_filenames(version: int | None = None) -> list[str]:
-    """Return versioned USearch index filenames for a given DB version.
-
-    Args:
-        version: Schema version number. None uses DB_VERSION (latest).
-
-    Returns:
-        List of versioned index filenames.
-    """
-    v = version or DB_VERSION
-    return [f"{base}_v{v}.bin" for base in USEARCH_INDEX_BASES]
-
 # Local cache directory
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "corp-extractor"
 
@@ -215,7 +203,7 @@ def create_lite_database(
 
     The lite version:
     - Strips the `record` column content (sets to empty {})
-    - Drops the `name_normalized` column (not needed for search)
+    - Keeps `name_normalized` on all tables (required by SQL name-lookup fallback)
     - Drops any legacy vec0 embedding tables
     - Uses USearch HNSW index files for search instead
     - Significantly reduces file size
@@ -253,23 +241,14 @@ def create_lite_database(
         updated = cursor.rowcount
         logger.info(f"Stripped {updated} organization record fields")
 
-        # Drop name_normalized — not needed for search (USearch handles it)
-        try:
-            conn.execute("ALTER TABLE organizations DROP COLUMN name_normalized")
-            logger.info("Dropped name_normalized column from organizations")
-        except sqlite3.OperationalError:
-            pass  # Column doesn't exist
+        # NOTE: name_normalized is kept on both organizations and people tables
+        # (required by SQL name-lookup fallback in people search, and useful for org lookups)
 
         # Also strip people records if table exists
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='people'")
         if cursor.fetchone():
             cursor = conn.execute("UPDATE people SET record = '{}'")
             logger.info(f"Stripped {cursor.rowcount} people record fields")
-            try:
-                conn.execute("ALTER TABLE people DROP COLUMN name_normalized")
-                logger.info("Dropped name_normalized column from people")
-            except sqlite3.OperationalError:
-                pass  # Column doesn't exist
 
         # Drop legacy vec0 tables if they still exist
         for table in [

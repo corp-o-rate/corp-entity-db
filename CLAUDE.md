@@ -123,7 +123,7 @@ The frontend can connect to the entity database via two backends (configured by 
 
 ### Database Schema
 - Schema version: v5 with normalized FK references (INTEGER FKs replace TEXT enums), no embedding columns
-- Variants: full (`entities-v5.db`), lite (`entities-v5-lite.db` - drops `record` and `name_normalized` columns)
+- Variants: full (`entities-v5.db`), lite (`entities-v5-lite.db` - strips `record` content, keeps `name_normalized`)
 - Default DB path: `~/.cache/corp-extractor/entities-v5.db`
 - USearch indexes: versioned, co-located with DB (e.g. `organizations_usearch_v5.bin`, `people_usearch_v5.bin`, `people_identity_usearch_v5.bin`)
 - **All embeddings** (orgs + people) exist **only** in USearch HNSW indexes, never in SQLite — generated on-the-fly during index building
@@ -195,7 +195,7 @@ The default install (`pip install corp-entity-db`) includes only search dependen
 - **All embeddings** (orgs + people): stored **only** in USearch HNSW indexes, NOT in SQLite — generated on-the-fly during index building
 - **People composite index** (`people_usearch_v5.bin`): 768-dim composite embeddings (name|role|org as 3×256-dim segments) for people with org associations only. Name, role, and org are embedded separately, independently L2-normalized (Matryoshka truncation), weighted (name=8, role=1, org=4), and concatenated. This gives AND-style matching where a bad match on org cannot be compensated by a good match on role. Built by `build_people_composite_index()`.
 - **People identity index** (`people_identity_usearch_v5.bin`): 256-dim Matryoshka-truncated name-only embeddings for all people. Used as fallback when composite search and SQL name lookup fail.
-- Lite database drops `record` and `name_normalized` columns — uses USearch HNSW indexes for ANN search
+- Lite database strips `record` column content — keeps `name_normalized` on all tables (required by SQL name-lookup fallback)
 - Int8 quantization for USearch is computed on-the-fly during index build (not stored)
 - Embedding model: `google/embeddinggemma-300m` (300M params)
 - PyPI package: `corp-entity-db`
