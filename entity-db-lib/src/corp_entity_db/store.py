@@ -7,6 +7,7 @@ Embeddings live only in USearch indexes, never in SQLite.
 
 import json
 import logging
+import math
 import re
 import sqlite3
 import time
@@ -2134,9 +2135,10 @@ class PersonDatabase:
                 )
                 query_desc_emb = embedder.embed(query_desc)
                 identity_candidates = [(record, score) for _pid, record, score in name_results]
+                canon_ids = [pid for pid, _record, _score in name_results]
                 ranked = self._disambiguate_by_embedding(
                     identity_candidates, query_desc_emb, embedder,
-                    query_name=query_name,
+                    query_name=query_name, canon_ids=canon_ids,
                 )
             elif name_results:
                 # No embedder — fall back to Levenshtein rerank
@@ -2160,9 +2162,10 @@ class PersonDatabase:
                         )
                         query_desc_emb = embedder.embed(query_desc)
                         identity_candidates = [(record, score) for _pid, record, score in identity_results]
+                        canon_ids = [pid for pid, _record, _score in identity_results]
                         ranked = self._disambiguate_by_embedding(
                             identity_candidates, query_desc_emb, embedder,
-                            query_name=query_name,
+                            query_name=query_name, canon_ids=canon_ids,
                         )
                     else:
                         ranked = [(record, score) for _, record, score in composite_results]
@@ -2260,9 +2263,51 @@ class PersonDatabase:
         cache_dir = Path.home() / ".cache" / "corp-extractor" / "person-embeddings"
         return diskcache.Cache(directory=str(cache_dir))
 
-    # Weight for blending name similarity into disambiguation scoring.
-    # Final score = (1 - NAME_WEIGHT) * desc_sim + NAME_WEIGHT * name_sim
+    # Weights for blending disambiguation signals.
+    # Final score = (1 - NAME_WEIGHT - POP_WEIGHT) * desc_sim + NAME_WEIGHT * name_sim + POP_WEIGHT * pop_sim
     NAME_WEIGHT = 0.45
+    POP_WEIGHT = 0.15
+    MAX_ALT_DESCRIPTIONS = 5
+
+    def _get_alternative_records(self, canon_id: int) -> list[PersonRecord]:
+        """Fetch up to MAX_ALT_DESCRIPTIONS records with distinct (role, org) from a canonical group."""
+        rows = self._conn.execute("""
+            SELECT DISTINCT id, known_for_role_id, known_for_org_id
+            FROM people WHERE (canon_id = ? OR id = ?)
+              AND known_for_role_id IS NOT NULL
+            ORDER BY (CASE WHEN known_for_org_id IS NOT NULL THEN 1 ELSE 0 END) DESC, id
+        """, (canon_id, canon_id)).fetchall()
+        seen: set[tuple[int | None, int | None]] = set()
+        alt_ids: list[int] = []
+        for row in rows:
+            combo = (row[1], row[2])
+            if combo not in seen:
+                seen.add(combo)
+                alt_ids.append(row[0])
+                if len(alt_ids) >= self.MAX_ALT_DESCRIPTIONS:
+                    break
+        return [r for pid in alt_ids if (r := self._get_record_by_id(pid)) is not None]
+
+    def _embed_record(self, record: PersonRecord, cache: "diskcache.Cache",
+                      embedder: "CompanyEmbedder") -> np.ndarray:
+        """Get or compute the description embedding for a person record.
+
+        Uses a v2 cache key that includes role+org to differentiate between
+        multiple records from the same Wikidata entity (same source+source_id).
+        """
+        cache_key = f"v2:{record.source}:{record.source_id}:{record.known_for_role}:{record.known_for_org_name}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return np.frombuffer(cached, dtype=np.float32)
+        desc = format_person_query(
+            record.name,
+            person_type=record.person_type.value,
+            role=record.known_for_role,
+            org=record.known_for_org_name,
+        )
+        emb = embedder.embed(desc)
+        cache.set(cache_key, emb.tobytes())
+        return emb
 
     def _disambiguate_by_embedding(
         self,
@@ -2270,14 +2315,14 @@ class PersonDatabase:
         query_desc_embedding: np.ndarray,
         embedder: "CompanyEmbedder",
         query_name: Optional[str] = None,
+        canon_ids: Optional[list[int]] = None,
     ) -> list[tuple[PersonRecord, float]]:
         """
         Re-score identity-match candidates using description embedding similarity,
-        blended with display-name Levenshtein similarity when query_name is provided.
+        blended with display-name Levenshtein similarity and popularity (canon_size).
 
-        All candidates share the same normalized name (from identity lookup).
-        Builds a natural language description for each, embeds it, and scores
-        by cosine similarity against the query description embedding.
+        For canonical groups with canon_size > 1, tries alternative records with
+        distinct (role, org) combinations to find the best-matching description.
         """
         cache = self._get_embedding_cache()
 
@@ -2310,16 +2355,36 @@ class PersonDatabase:
                 cache_key = f"v1:{record.source}:{record.source_id}"
                 cache.set(cache_key, emb.tobytes())
 
-        # Score by cosine similarity against query description, blended with name similarity
+        # Score by cosine similarity against query description, blended with name + popularity
         scored: list[tuple[PersonRecord, float]] = []
         for idx, (record, _score) in enumerate(candidates):
             emb = candidate_embs[idx]
             desc_sim = float(np.dot(query_desc_embedding, emb))
+            best_alt: Optional[PersonRecord] = None
+
+            # Try alternative descriptions for canonical groups with multiple records
+            if record.canon_size > 1 and canon_ids is not None:
+                cid = canon_ids[idx] if idx < len(canon_ids) else None
+                if cid is not None:
+                    alts = self._get_alternative_records(cid)
+                    for alt in alts:
+                        if alt.known_for_role == record.known_for_role and alt.known_for_org_name == record.known_for_org_name:
+                            continue  # skip alternatives with same description as canonical
+                        alt_emb = self._embed_record(alt, cache, embedder)
+                        alt_sim = float(np.dot(query_desc_embedding, alt_emb))
+                        if alt_sim > desc_sim:
+                            desc_sim = alt_sim
+                            best_alt = alt
+
             if query_name:
                 name_sim = self._levenshtein_ratio(query_name, record.name)
-                sim = (1 - self.NAME_WEIGHT) * desc_sim + self.NAME_WEIGHT * name_sim
+                pop_sim = min(math.log1p(record.canon_size) / math.log1p(50), 1.0)
+                sim = (1 - self.NAME_WEIGHT - self.POP_WEIGHT) * desc_sim + self.NAME_WEIGHT * name_sim + self.POP_WEIGHT * pop_sim
             else:
                 sim = desc_sim
+
+            if best_alt is not None:
+                record.matched_record = best_alt
             scored.append((record, sim))
 
         logger.debug(
@@ -2541,6 +2606,7 @@ class PersonDatabase:
             birth_date=row["birth_date"] or "",
             death_date=row["death_date"] or "",
             record=json.loads(row["record"]),
+            canon_size=row["canon_size"] if "canon_size" in row.keys() else 1,
         )
 
     def _get_canon_id(self, person_id: int) -> int:
@@ -2558,7 +2624,7 @@ class PersonDatabase:
         cursor = conn.execute("""
             SELECT v.name, v.source, v.source_identifier, v.country, v.person_type,
                    v.known_for_role, v.known_for_org, v.known_for_org_id,
-                   v.birth_date, v.death_date, p.record
+                   v.birth_date, v.death_date, p.record, p.canon_size
             FROM people_view v
             JOIN people p ON v.id = p.id
             WHERE v.id = ?

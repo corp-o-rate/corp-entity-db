@@ -250,6 +250,7 @@ class PersonRecord(BaseModel):
     birth_date: Optional[str] = Field(default=None, description="Date of birth (ISO format YYYY-MM-DD)")
     death_date: Optional[str] = Field(default=None, description="Date of death (ISO format YYYY-MM-DD) - if set, person is historic")
     record: dict[str, Any] = Field(default_factory=dict, description="Original record from source")
+    canon_size: int = Field(default=1, description="Number of records in canonical group (popularity proxy)")
     matched_record: Optional["PersonRecord"] = Field(default=None, exclude=True, description="The actual indexed record that matched the query, attached when it differs from this canonical record")
 
     @property

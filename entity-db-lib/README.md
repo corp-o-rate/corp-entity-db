@@ -86,7 +86,7 @@ corp-entity-db serve --port 9000      # Custom port
 - **Primary composite index** (`people_usearch_v5.bin`, 768-dim): Name, role, and organization are embedded as separate 256-dim vectors using Matryoshka truncation, independently L2-normalized, weighted (name=8, role=1, org=4), and concatenated. Only indexes people with org associations. This gives AND-style matching: a poor match on organization cannot be compensated by a good match on name, enabling precise queries like "find the CEO named Tim Cook at Apple." Built by `build_people_composite_index()`.
 - **Secondary identity index** (`people_identity_usearch_v5.bin`, 256-dim): Name-only embeddings with Matryoshka truncation to 256 dims for all people. Consulted as fallback when composite search and SQL name lookup fail. Built by `build_people_identity_index()`.
 
-Search accuracy: 97.5% acc@1, 100% acc@20 on 280 queries across 12 person types (95-165ms per query after model warmup). Three-tier fallback: composite HNSW → SQL name_normalized lookup (using `corp-names` for normalization, with disambiguation blending description similarity and name Levenshtein) → identity HNSW.
+Search accuracy: 100% acc@1, 100% acc@20 on 280 queries across 12 person types (100-200ms per query after model warmup). Three-tier fallback: composite HNSW → SQL name_normalized lookup (using `corp-names` for normalization, with disambiguation blending description similarity (40%), name Levenshtein (45%), and popularity via log-scaled canon_size (15%), plus multi-description support trying alternative role/org combinations within canonical groups) → identity HNSW.
 
 ## Database Variants
 

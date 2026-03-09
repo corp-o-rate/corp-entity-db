@@ -33,7 +33,7 @@ State on the website and in the README.md the current accuracy of the performanc
 
 `uv run corp-entity-db people-test --top-k=20 --for-llm`
 
-The command prints the path to a JSON results file. Read that file to get the accuracy and performance data.
+The command prints the path to a JSON results file. Read that file to get the accuracy and performance data. Note we should be at 100% accuracy @1 
 
 ## Process
 

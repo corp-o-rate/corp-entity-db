@@ -205,7 +205,8 @@ The default install (`pip install corp-entity-db`) includes only search dependen
 - Canonicalization priority: wikidata > sec_edgar > companies_house
 - Name normalization uses `corp-names` library: `normalize_name()` for people, `normalize_company()` for organizations — handles title/suffix stripping, nickname canonicalization (Steven→stephen, Bob→robert), and legal suffix normalization (Ltd→limited)
 - People search uses composite HNSW index (only people with org associations) with SQL name-lookup fallback when composite scores ≤ 0.95, plus an identity HNSW index (768-dim name-only) as a secondary fallback
-- Name lookup disambiguation blends description embedding similarity (55%) with display-name Levenshtein similarity (45%) to prefer exact name matches
+- Name lookup disambiguation uses a 3-way blend: description embedding similarity (40%) + display-name Levenshtein similarity (45%) + popularity via log-scaled canon_size (15%). For canonical groups with canon_size > 1, multi-description disambiguation tries up to 5 alternative records with distinct (role, org) combinations to find the best-matching description. Uses v2 cache keys (`v2:{source}:{source_id}:{role}:{org}`) to differentiate embeddings for records from the same Wikidata entity.
+- `PersonRecord.canon_size` tracks the number of records in a canonical group, used as a popularity proxy in disambiguation
 - Composite index only indexes people with `known_for_org_id IS NOT NULL`
 - HNSW search results are canon-deduplicated (each canonical person appears once)
 

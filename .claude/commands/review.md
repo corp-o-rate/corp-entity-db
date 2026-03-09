@@ -47,5 +47,7 @@ Review the changed files for quality assurance:
 **5. Testing:**
 - Tests cover new functionality
 - Tests verify expected behavior (not just code paths)
+- `uv run corp-entity-db people-test --top-k=20 --for-llm` should be 100%@1 accuracy.
+
 
 Provide specific feedback with file and line references.
