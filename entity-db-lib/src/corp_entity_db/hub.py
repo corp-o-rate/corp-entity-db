@@ -380,7 +380,7 @@ def upload_database_with_variants(
         # Add README.md from ENTITY_DATABASE.md
         if include_readme:
             # Look for ENTITY_DATABASE.md in the project root
-            project_root = Path(__file__).parent.parent.parent.parent.parent  # Go up to statement-extractor
+            project_root = Path(__file__).parent.parent.parent.parent  # Go up to corp-entity-db repo root
             readme_source = project_root / "ENTITY_DATABASE.md"
             if readme_source.exists():
                 shutil.copy2(readme_source, staging_dir / "README.md")
