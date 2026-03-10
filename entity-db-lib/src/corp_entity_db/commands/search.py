@@ -703,7 +703,7 @@ def db_search(query: str, db_path: Optional[str], top_k: int, source: Optional[s
     click.echo("-" * 60)
 
     for i, (record, similarity) in enumerate(results, 1):
-        click.echo(f"{i}. {record.legal_name}")
+        click.echo(f"{i}. {record.name}")
         click.echo(f"   Source: {record.source} | ID: {record.source_id}")
         click.echo(f"   Canonical ID: {record.canonical_id}")
         click.echo(f"   Similarity: {similarity:.4f}")
@@ -851,13 +851,13 @@ def db_org_test(
             topk_match = False
             topk_rank = -1
             if results:
-                if results[0][0].legal_name.lower() == expected_lower:
+                if results[0][0].name.lower() == expected_lower:
                     top1_match = True
                     topk_match = True
                     topk_rank = 1
                 else:
                     for rank, (rec, _score) in enumerate(results, 1):
-                        if rec.legal_name.lower() == expected_lower:
+                        if rec.name.lower() == expected_lower:
                             topk_match = True
                             topk_rank = rank
                             break
@@ -868,7 +868,7 @@ def db_org_test(
                 hits_in_topk += 1
 
             hit_marker = "✓" if top1_match else ("~" if topk_match else "✗")
-            top_name = results[0][0].legal_name if results else "—"
+            top_name = results[0][0].name if results else "—"
             top_score = f"{results[0][1]:.3f}" if results else "—"
             rank_info = f"@{topk_rank}" if topk_match and not top1_match else ""
 
