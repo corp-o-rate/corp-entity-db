@@ -298,7 +298,7 @@ class CompaniesHouseOfficersImporter:
         zip_path: str | Path,
         limit: Optional[int] = None,
         resume: bool = False,
-        current_only: bool = True,
+        current_only: bool = False,
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
     ) -> Iterator[PersonRecord]:
         """
@@ -308,7 +308,7 @@ class CompaniesHouseOfficersImporter:
             zip_path: Path to the Prod195 zip file
             limit: Optional limit on number of records
             resume: If True, resume from saved progress
-            current_only: If True, only import current officers (sub_type=30)
+            current_only: If True, only import current officers (skip resigned)
             progress_callback: Optional callback(file_idx, line_num, total)
 
         Yields:
@@ -396,7 +396,7 @@ class CompaniesHouseOfficersImporter:
         self,
         file_path: str | Path,
         limit: Optional[int] = None,
-        current_only: bool = True,
+        current_only: bool = False,
     ) -> Iterator[PersonRecord]:
         """
         Import from a single uncompressed .dat file.
@@ -404,7 +404,7 @@ class CompaniesHouseOfficersImporter:
         Args:
             file_path: Path to .dat file
             limit: Optional limit
-            current_only: Only current officers
+            current_only: Only import current officers (skip resigned)
 
         Yields:
             PersonRecord for each officer

@@ -377,8 +377,11 @@ def db_create_lite(db_path: str, output: Optional[str], verbose: bool):
 @click.option("--ef-search", type=int, default=200, help="Search quality parameter (default 200)")
 @click.option("--people/--no-people", default=True, help="Build USearch index for people")
 @click.option("--orgs/--no-orgs", default=True, help="Build USearch index for organizations")
+@click.option("--sharded/--no-sharded", default=True, help="Build popularity-sharded indexes for people (default: sharded)")
+@click.option("--hot-size", type=int, default=3_000_000, help="Hot shard size (default: 3M vectors)")
+@click.option("--cold-size", type=int, default=10_000_000, help="Cold shard size (default: 10M vectors)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_search: int, people: bool, orgs: bool, verbose: bool):
+def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_search: int, people: bool, orgs: bool, sharded: bool, hot_size: int, cold_size: int, verbose: bool):
     """
     Build USearch index for fast approximate nearest neighbor search.
 
@@ -401,6 +404,7 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
     _configure_logging(verbose)
 
     from corp_entity_db.store import (
+        ShardConfig,
         _get_shared_connection,
         build_hnsw_index,
         build_people_composite_index,
@@ -413,8 +417,12 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
     if not db_path_obj.exists():
         raise click.ClickException(f"Database not found: {db_path_obj}")
 
+    shard_cfg = ShardConfig(hot_size=hot_size, cold_size=cold_size) if sharded else None
+
     click.echo(f"Database: {db_path_obj}", err=True)
     click.echo(f"Parameters: M={m}, ef_construction={ef_construction}, ef_search={ef_search}", err=True)
+    if shard_cfg:
+        click.echo(f"Sharding: hot={shard_cfg.hot_size:,}, cold={shard_cfg.cold_size:,}", err=True)
 
     conn = _get_shared_connection(db_path_obj, readonly=True)
 
@@ -436,6 +444,7 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
                 ef_construction=ef_construction,
                 ef_search=ef_search,
                 progress_callback=people_progress,
+                shard_config=shard_cfg,
             )
             click.echo(f"People USearch index: {count:,} composite vectors indexed", err=True)
         except Exception as e:
@@ -453,6 +462,7 @@ def db_build_index(db_path: Optional[str], m: int, ef_construction: int, ef_sear
                 ef_construction=ef_construction,
                 ef_search=ef_search,
                 progress_callback=identity_progress,
+                shard_config=shard_cfg,
             )
             click.echo(f"People identity index: {count:,} name vectors indexed", err=True)
         except Exception as e:
@@ -540,10 +550,11 @@ def db_build_identity_index(db_path: Optional[str], m: int, ef_construction: int
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def db_migrate(db_path: Optional[str], verbose: bool):
     """
-    Migrate database schema to the latest version (v5).
+    Migrate database schema to the latest version (v6).
 
     v4: Drops legacy embedding columns from organizations and people tables.
     v5: Merges scientist→academic and entrepreneur→executive person types.
+    v6: Adds organization alias columns and new alias source types.
 
     \b
     Examples:
@@ -575,10 +586,19 @@ def db_migrate(db_path: Optional[str], verbose: bool):
 
     click.echo(f"Current schema version: {current_version}", err=True)
 
-    if current_version >= 5:
-        click.echo("Already up to date (v5).", err=True)
-        conn.close()
-        return
+    # Check if organizations table needs repair (CREATE TABLE AS SELECT lost constraints)
+    needs_repair = False
+    if current_version >= 6:
+        create_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='organizations'"
+        ).fetchone()
+        if create_sql and "id INT," in create_sql[0] and "PRIMARY KEY" not in create_sql[0]:
+            click.echo("Detected broken schema (missing PRIMARY KEY on organizations) — repairing...", err=True)
+            needs_repair = True
+        else:
+            click.echo("Already up to date (v6).", err=True)
+            conn.close()
+            return
 
     # --- v4 migration: drop embedding columns ---
     if current_version < 4:
@@ -639,6 +659,160 @@ def db_migrate(db_path: Optional[str], verbose: bool):
         conn.execute("COMMIT")
         click.echo("  Updated schema_version to 5", err=True)
 
+    # --- v6 migration: organization alias columns + new source types ---
+    if current_version < 6 or needs_repair:
+        click.echo("\n  v6: Adding organization alias columns...", err=True)
+        conn.execute("BEGIN")
+
+        # Insert new alias source types
+        alias_source_types = [
+            (5, "wikidata_alias"),
+            (6, "gleif_other_name"),
+            (7, "sec_ticker"),
+            (8, "wiki_anchor"),
+            (9, "paranames"),
+        ]
+        conn.executemany(
+            "INSERT OR IGNORE INTO source_types (id, name) VALUES (?, ?)",
+            alias_source_types,
+        )
+        click.echo(f"  Inserted {len(alias_source_types)} alias source types", err=True)
+
+        # Add alias columns
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(organizations)").fetchall()}
+        if "alias_source_id" not in cols:
+            conn.execute("ALTER TABLE organizations ADD COLUMN alias_source_id INTEGER DEFAULT NULL REFERENCES source_types(id)")
+            click.echo("  Added alias_source_id column", err=True)
+        if "alias_source_identifier" not in cols:
+            conn.execute("ALTER TABLE organizations ADD COLUMN alias_source_identifier TEXT DEFAULT NULL")
+            click.echo("  Added alias_source_identifier column", err=True)
+
+        # Rebuild unique constraint: drop old UNIQUE(source_identifier, source_id)
+        # and replace with UNIQUE INDEX including alias_source_id and name_normalized.
+        # SQLite requires table rebuild to drop a table-level UNIQUE constraint.
+        click.echo("  Rebuilding organizations table to replace unique constraint...", err=True)
+
+        # Get current column list (after ALTER TABLEs above)
+        col_info = conn.execute("PRAGMA table_info(organizations)").fetchall()
+        col_names = [r[1] for r in col_info]
+
+        # Check if old UNIQUE constraint exists on (source_identifier, source_id)
+        # by looking at sqlite_master for the table's CREATE statement
+        create_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='organizations'"
+        ).fetchone()[0]
+
+        needs_rebuild = "UNIQUE(source_identifier, source_id)" in create_sql or "id INT," in create_sql
+        if needs_rebuild:
+            # Drop views that reference organizations before rebuilding
+            conn.execute("DROP VIEW IF EXISTS organizations_view")
+            conn.execute("DROP VIEW IF EXISTS people_view")
+
+            # Use proper CREATE TABLE with constraints (CREATE TABLE AS SELECT loses them)
+            conn.execute("""
+                CREATE TABLE organizations_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    qid INTEGER,
+                    name TEXT NOT NULL,
+                    name_normalized TEXT NOT NULL,
+                    source_id INTEGER NOT NULL,
+                    source_identifier TEXT NOT NULL,
+                    region_id INTEGER,
+                    entity_type_id INTEGER NOT NULL DEFAULT 17,
+                    from_date TEXT DEFAULT NULL,
+                    to_date TEXT DEFAULT NULL,
+                    record TEXT NOT NULL DEFAULT '{}',
+                    canon_id INTEGER DEFAULT NULL,
+                    canon_size INTEGER DEFAULT 1,
+                    alias_source_id INTEGER DEFAULT NULL,
+                    alias_source_identifier TEXT DEFAULT NULL,
+                    FOREIGN KEY (source_id) REFERENCES source_types(id),
+                    FOREIGN KEY (region_id) REFERENCES locations(id),
+                    FOREIGN KEY (entity_type_id) REFERENCES organization_types(id),
+                    FOREIGN KEY (alias_source_id) REFERENCES source_types(id)
+                )
+            """)
+            cols_csv = ", ".join(col_names)
+            conn.execute(f"INSERT INTO organizations_new ({cols_csv}) SELECT {cols_csv} FROM organizations")
+            conn.execute("DROP TABLE organizations")
+            conn.execute("ALTER TABLE organizations_new RENAME TO organizations")
+            click.echo("  Rebuilt organizations table with proper constraints", err=True)
+
+            # Recreate people_view (references organizations via known_for_org_id)
+            conn.execute("""
+                CREATE VIEW IF NOT EXISTS people_view AS
+                SELECT
+                    p.id, p.qid, p.name, p.name_normalized,
+                    s.name as source, p.source_identifier,
+                    l.name as country, pt.name as person_type,
+                    r.name as known_for_role, kfo.name as known_for_org,
+                    p.known_for_org_id, p.from_date, p.to_date,
+                    p.birth_date, p.death_date, p.canon_id, p.canon_size
+                FROM people p
+                JOIN source_types s ON p.source_id = s.id
+                LEFT JOIN locations l ON p.country_id = l.id
+                JOIN people_types pt ON p.person_type_id = pt.id
+                LEFT JOIN roles r ON p.known_for_role_id = r.id
+                LEFT JOIN organizations kfo ON p.known_for_org_id = kfo.id
+            """)
+
+        # Create new unique index
+        conn.execute("DROP INDEX IF EXISTS idx_orgs_unique")
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_orgs_unique ON organizations(
+                source_identifier, source_id, IFNULL(alias_source_id, 0), name_normalized
+            )
+        """)
+        click.echo("  Created new unique index (source_identifier, source_id, alias_source_id, name_normalized)", err=True)
+
+        # Re-create other indexes that may have been lost during table rebuild
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_orgs_name ON organizations(name)",
+            "CREATE INDEX IF NOT EXISTS idx_orgs_name_normalized ON organizations(name_normalized)",
+            "CREATE INDEX IF NOT EXISTS idx_orgs_qid ON organizations(qid)",
+            "CREATE INDEX IF NOT EXISTS idx_orgs_source_id ON organizations(source_id)",
+            "CREATE INDEX IF NOT EXISTS idx_orgs_source_identifier ON organizations(source_identifier)",
+            "CREATE INDEX IF NOT EXISTS idx_orgs_region_id ON organizations(region_id)",
+            "CREATE INDEX IF NOT EXISTS idx_orgs_entity_type_id ON organizations(entity_type_id)",
+            "CREATE INDEX IF NOT EXISTS idx_orgs_canon_id ON organizations(canon_id)",
+            "CREATE INDEX IF NOT EXISTS idx_orgs_alias_source_id ON organizations(alias_source_id)",
+        ]:
+            conn.execute(idx_sql)
+
+        # Recreate organizations_view with alias columns
+        conn.execute("DROP VIEW IF EXISTS organizations_view")
+        conn.execute("""
+            CREATE VIEW organizations_view AS
+            SELECT
+                o.id,
+                o.qid,
+                o.name,
+                o.name_normalized,
+                s.name as source,
+                o.source_identifier,
+                l.name as region,
+                slt.name as region_type,
+                ot.name as entity_type,
+                o.from_date,
+                o.to_date,
+                o.canon_id,
+                o.canon_size,
+                als.name as alias_source,
+                o.alias_source_identifier
+            FROM organizations o
+            JOIN source_types s ON o.source_id = s.id
+            LEFT JOIN locations l ON o.region_id = l.id
+            LEFT JOIN location_types lt ON l.location_type_id = lt.id
+            LEFT JOIN simplified_location_types slt ON lt.simplified_id = slt.id
+            JOIN organization_types ot ON o.entity_type_id = ot.id
+            LEFT JOIN source_types als ON o.alias_source_id = als.id
+        """)
+        click.echo("  Recreated organizations_view with alias columns", err=True)
+
+        conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '6')")
+        conn.execute("COMMIT")
+        click.echo("  Updated schema_version to 6", err=True)
+
     # VACUUM
     click.echo("  Running VACUUM...", err=True)
     conn.execute("VACUUM")
@@ -646,6 +820,219 @@ def db_migrate(db_path: Optional[str], verbose: bool):
 
     db_size_mb = db_path_obj.stat().st_size / 1024**2
     click.echo(f"Migration complete. Database size: {db_size_mb:.1f} MB", err=True)
+
+
+@click.command("populate-aliases")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_populate_aliases(db_path: Optional[str], verbose: bool):
+    """
+    Create alias records from existing organization record JSON.
+
+    Scans primary org records and creates alias rows for Wikidata aliases,
+    GLEIF other entity names, and SEC tickers. Must be run AFTER canonicalization.
+
+    \b
+    Pipeline: import → canonicalize → populate-aliases → build-index
+
+    \b
+    Examples:
+        corp-entity-db populate-aliases
+        corp-entity-db populate-aliases --db /path/to/entities.db
+    """
+    _configure_logging(verbose)
+
+    from corp_entity_db import OrganizationDatabase
+
+    db_path_obj = _resolve_db_path(db_path)
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    click.echo(f"Database: {db_path_obj}", err=True)
+
+    database = OrganizationDatabase(db_path=db_path_obj, readonly=False)
+    result = database.populate_aliases()
+
+    click.echo(f"\nAlias Population Results", err=True)
+    click.echo("=" * 40, err=True)
+    click.echo(f"Wikidata aliases:    {result['wikidata_aliases']:,}", err=True)
+    click.echo(f"GLEIF other names:   {result['gleif_other_names']:,}", err=True)
+    click.echo(f"SEC tickers:         {result['sec_tickers']:,}", err=True)
+    click.echo(f"Total inserted:      {result['total']:,}", err=True)
+
+    database.close()
+
+
+@click.command("backfill-ch-orgs")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--batch-size", type=int, default=50000, help="Batch size for commits (default: 50000)")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_backfill_ch_orgs(db_path: Optional[str], batch_size: int, verbose: bool):
+    """
+    Create stub org records for CH officers with missing organizations.
+
+    Scans CH officer records where known_for_org_id is NULL, extracts the
+    company_number and company_name from the record JSON, creates stub
+    organization records for companies not already in the DB, and links
+    the officers to their orgs.
+
+    \b
+    Pipeline: import-companies-house → import-ch-officers → backfill-ch-orgs → post-import
+
+    \b
+    Examples:
+        corp-entity-db backfill-ch-orgs
+        corp-entity-db backfill-ch-orgs --db /path/to/entities.db
+    """
+    import json
+    import sqlite3
+
+    from corp_names import normalize_company
+
+    from corp_entity_db.seed_data import SOURCE_NAME_TO_ID, ORG_TYPE_NAME_TO_ID
+
+    _configure_logging(verbose)
+
+    db_path_obj = _resolve_db_path(db_path)
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    click.echo(f"Database: {db_path_obj}", err=True)
+
+    conn = sqlite3.connect(str(db_path_obj))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA mmap_size=268435456")
+
+    ch_source_id = SOURCE_NAME_TO_ID["companies_house"]
+    unknown_type_id = ORG_TYPE_NAME_TO_ID["unknown"]
+
+    # Phase 1: Collect missing company_number → company_name from officer records
+    click.echo("Phase 1: Scanning CH officers with missing org links...", err=True)
+
+    cursor = conn.execute(
+        "SELECT id, record FROM people WHERE source_id = ? AND known_for_org_id IS NULL",
+        (ch_source_id,),
+    )
+
+    # Map company_number → (company_name, [officer_ids])
+    missing: dict[str, tuple[str, list[int]]] = {}
+    scanned = 0
+
+    for row in cursor:
+        scanned += 1
+        rec = json.loads(row["record"]) if row["record"] else {}
+        company_number = rec.get("company_number", "")
+        company_name = rec.get("company_name", "")
+        if not company_number:
+            continue
+
+        if company_number in missing:
+            missing[company_number][1].append(row["id"])
+        else:
+            missing[company_number] = (company_name, [row["id"]])
+
+        if scanned % 1_000_000 == 0:
+            click.echo(f"  Scanned {scanned:,} officers, {len(missing):,} missing companies...", err=True)
+
+    click.echo(f"  Scanned {scanned:,} officers, {len(missing):,} distinct companies to resolve", err=True)
+
+    if not missing:
+        click.echo("No missing org links found.", err=True)
+        conn.close()
+        return
+
+    # Phase 2: Filter out companies that already exist in the organizations table
+    click.echo("Phase 2: Checking which companies already exist...", err=True)
+
+    # Build a lookup of existing CH company numbers → org IDs
+    existing_cursor = conn.execute(
+        "SELECT id, source_identifier FROM organizations WHERE source_id = ? AND alias_source_id IS NULL",
+        (ch_source_id,),
+    )
+    existing_orgs: dict[str, int] = {}
+    for row in existing_cursor:
+        existing_orgs[row["source_identifier"]] = row["id"]
+
+    click.echo(f"  {len(existing_orgs):,} existing CH organizations in DB", err=True)
+
+    # Split into already-existing (just need FK update) and truly new
+    to_link: list[tuple[int, int]] = []  # (officer_id, org_id)
+    to_create: dict[str, tuple[str, list[int]]] = {}  # company_number → (name, [officer_ids])
+
+    for company_number, (company_name, officer_ids) in missing.items():
+        if company_number in existing_orgs:
+            org_id = existing_orgs[company_number]
+            for oid in officer_ids:
+                to_link.append((oid, org_id))
+        else:
+            to_create[company_number] = (company_name, officer_ids)
+
+    click.echo(f"  {len(to_link):,} officers can be linked to existing orgs", err=True)
+    click.echo(f"  {len(to_create):,} new stub organizations to create", err=True)
+
+    # Phase 3: Create stub org records and collect all FK updates
+    click.echo("Phase 3: Creating stub organizations and linking officers...", err=True)
+
+    created = 0
+    for company_number, (company_name, officer_ids) in to_create.items():
+        name = company_name.strip() if company_name else company_number
+        name_normalized = normalize_company(name).normalized
+
+        cursor = conn.execute("""
+            INSERT OR IGNORE INTO organizations
+            (name, name_normalized, source_id, source_identifier, entity_type_id, record)
+            VALUES (?, ?, ?, ?, ?, '{}')
+        """, (name, name_normalized, ch_source_id, company_number, unknown_type_id))
+
+        if cursor.lastrowid and cursor.rowcount > 0:
+            org_id = cursor.lastrowid
+            created += 1
+        else:
+            # Already existed (race or IGNORE), look it up
+            row = conn.execute(
+                "SELECT id FROM organizations WHERE source_id = ? AND source_identifier = ? AND alias_source_id IS NULL",
+                (ch_source_id, company_number),
+            ).fetchone()
+            org_id = row["id"] if row else None
+
+        if org_id:
+            for oid in officer_ids:
+                to_link.append((oid, org_id))
+
+        if created % 10000 == 0 and created > 0:
+            conn.commit()
+            click.echo(f"  Created {created:,} stub orgs...", err=True)
+
+    conn.commit()
+    click.echo(f"  Created {created:,} stub organizations", err=True)
+
+    # Phase 4: Update all officer FK links
+    click.echo(f"Phase 4: Linking {len(to_link):,} officers to organizations...", err=True)
+
+    linked = 0
+    skipped = 0
+    for officer_id, org_id in to_link:
+        try:
+            conn.execute("UPDATE people SET known_for_org_id = ? WHERE id = ?", (org_id, officer_id))
+            linked += 1
+        except sqlite3.IntegrityError:
+            skipped += 1
+
+        if (linked + skipped) % batch_size == 0:
+            conn.commit()
+            click.echo(f"  Linked {linked:,} officers ({skipped:,} skipped)...", err=True)
+
+    conn.commit()
+
+    click.echo(f"\nBackfill complete!", err=True)
+    click.echo(f"  Stub orgs created:  {created:,}", err=True)
+    click.echo(f"  Officers linked:    {linked:,}", err=True)
+    if skipped:
+        click.echo(f"  Skipped (UNIQUE):   {skipped:,}", err=True)
+    click.echo("Run `corp-entity-db post-import` to rebuild search indexes.", err=True)
+
+    conn.close()
 
 
 def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, embed_batch_size: int = 192) -> None:
@@ -661,12 +1048,14 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
 
     from corp_entity_db.embeddings import CompanyEmbedder
     from corp_entity_db.store import (
+        ShardConfig,
         _get_shared_connection,
         build_hnsw_index,
         build_people_composite_index,
         build_people_identity_index,
     )
 
+    shard_cfg = ShardConfig()  # Default sharding for post-import
     embedder = None  # Lazy load
 
     # --- Step 1: Build USearch indexes ---
@@ -685,6 +1074,7 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
         count = build_people_composite_index(
             conn, embedder, embed_batch_size=embed_batch_size,
             progress_callback=people_progress,
+            shard_config=shard_cfg,
         )
         click.echo(f"  People USearch index: {count:,} composite vectors", err=True)
 
@@ -694,6 +1084,7 @@ def _run_post_import(db_path_obj: Path, people: bool = True, orgs: bool = True, 
         count = build_people_identity_index(
             conn, embedder, embed_batch_size=embed_batch_size,
             progress_callback=identity_progress,
+            shard_config=shard_cfg,
         )
         click.echo(f"  People identity index: {count:,} name vectors", err=True)
 

@@ -63,6 +63,7 @@ from .imports import (
     db_import_people,
     db_import_companies_house,
     db_import_locations,
+    db_import_aliases,
 )
 
 main.add_command(db_gleif_info)
@@ -74,10 +75,12 @@ main.add_command(db_import_wikidata)
 main.add_command(db_import_people)
 main.add_command(db_import_companies_house)
 main.add_command(db_import_locations)
+main.add_command(db_import_aliases)
 
-from .wikidata_dump import db_import_wikidata_dump
+from .wikidata_dump import db_import_wikidata_dump, db_backfill_aliases
 
 main.add_command(db_import_wikidata_dump)
+main.add_command(db_backfill_aliases)
 
 from .search import (
     db_search,
@@ -108,6 +111,8 @@ from .management import (
     db_normalize_people,
     db_normalize_orgs,
     db_reclassify_people,
+    db_populate_aliases,
+    db_backfill_ch_orgs,
 )
 
 main.add_command(db_status)
@@ -122,6 +127,8 @@ main.add_command(db_migrate)
 main.add_command(db_normalize_people)
 main.add_command(db_normalize_orgs)
 main.add_command(db_reclassify_people)
+main.add_command(db_populate_aliases)
+main.add_command(db_backfill_ch_orgs)
 
 from .repair import db_repair_resume, db_fix_resume, db_backfill_locations, db_backfill_roles
 

@@ -167,6 +167,8 @@ def search_organizations(req: SearchRequest):
     results = org_db.search(
         query_embedding,
         top_k=req.limit,
+        query_name=req.query,
+        embedder=embedder,
     )
 
     elapsed = time.time() - t0

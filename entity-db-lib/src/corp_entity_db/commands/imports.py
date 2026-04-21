@@ -284,13 +284,14 @@ def db_import_sec_officers(db_path: Optional[str], start_year: int, end_year: Op
 @click.option("--limit", type=int, help="Limit number of records")
 @click.option("--batch-size", type=int, default=1000, help="Batch size for commits (default: 1000)")
 @click.option("--resume", is_flag=True, help="Resume from saved progress")
-@click.option("--include-resigned", is_flag=True, help="Include resigned officers (default: current only)")
+@click.option("--current-only", is_flag=True, help="Only import current officers (skip resigned/historic)")
 @click.option("--skip-existing", is_flag=True, help="Skip records that already exist")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def db_import_ch_officers(file_path: str, db_path: Optional[str], limit: Optional[int], batch_size: int, resume: bool, include_resigned: bool, skip_existing: bool, verbose: bool):
+def db_import_ch_officers(file_path: str, db_path: Optional[str], limit: Optional[int], batch_size: int, resume: bool, current_only: bool, skip_existing: bool, verbose: bool):
     """
     Import Companies House officers data into the people database.
 
+    Imports all officers (current and resigned) by default.
     Requires the Prod195 bulk officers zip file from Companies House.
     Request access via BulkProducts@companieshouse.gov.uk.
 
@@ -298,7 +299,7 @@ def db_import_ch_officers(file_path: str, db_path: Optional[str], limit: Optiona
     Examples:
         corp-entity-db import-ch-officers --file officers.zip --limit 10000
         corp-entity-db import-ch-officers --file officers.zip --resume
-        corp-entity-db import-ch-officers --file officers.zip --include-resigned
+        corp-entity-db import-ch-officers --file officers.zip --current-only
     """
     _configure_logging(verbose)
 
@@ -331,7 +332,7 @@ def db_import_ch_officers(file_path: str, db_path: Optional[str], limit: Optiona
         file_path,
         limit=limit,
         resume=resume,
-        current_only=not include_resigned,
+        current_only=current_only,
         progress_callback=progress_callback,
     ):
         # Skip existing records if flag is set
@@ -1314,3 +1315,66 @@ def db_import_locations(from_pycountry: bool, db_path: Optional[str], verbose: b
 
     click.echo(f"Imported {count:,} locations from pycountry")
     click.echo("Run `corp-entity-db post-import` to update search indexes.", err=True)
+
+
+@click.command("import-aliases")
+@click.option("--source", type=click.Choice(["wiki-anchor", "paranames"]), required=True, help="Alias source to import")
+@click.option("--download", is_flag=True, help="Download dataset automatically before importing")
+@click.option("--force", is_flag=True, help="Force re-download even if cached")
+@click.argument("file_path", type=click.Path(exists=True), required=False)
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_import_aliases(source: str, download: bool, force: bool, file_path: Optional[str], db_path: Optional[str], verbose: bool):
+    """
+    Import external alias records for organizations.
+
+    Must be run AFTER canonicalization. Creates alias records that link
+    alternative names to existing organizations.
+
+    \b
+    Examples:
+        corp-entity-db import-aliases --source wiki-anchor --download
+        corp-entity-db import-aliases --source paranames --download
+        corp-entity-db import-aliases --source wiki-anchor wiki_entity_similarity.parquet
+        corp-entity-db import-aliases --source paranames paranames.tsv
+    """
+    import sqlite3
+
+    _configure_logging(verbose)
+
+    from corp_entity_db.importers.aliases import (
+        import_wiki_entity_similarity, import_paranames,
+        download_wiki_anchor, download_paranames,
+    )
+
+    # Resolve file path: download or use provided
+    if file_path is None:
+        if not download:
+            raise click.UsageError("Either provide a file path or use --download")
+        if source == "wiki-anchor":
+            file_path = str(download_wiki_anchor(force=force))
+        elif source == "paranames":
+            file_path = str(download_paranames(force=force))
+    elif download:
+        click.echo("Ignoring --download since file path was provided.", err=True)
+
+    db_path_obj = _resolve_db_path(db_path)
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    conn = sqlite3.connect(str(db_path_obj))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-500000")
+
+    if source == "wiki-anchor":
+        count = import_wiki_entity_similarity(conn, file_path)
+    elif source == "paranames":
+        count = import_paranames(conn, file_path)
+    else:
+        raise click.UsageError(f"Unknown source: {source}")
+
+    conn.close()
+    click.echo(f"Imported {count:,} alias records from {source}")
+    click.echo("Run `corp-entity-db build-index` to update search indexes.", err=True)

@@ -10,7 +10,9 @@ import logging
 import math
 import re
 import sqlite3
+import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -53,6 +55,214 @@ def _usearch_filename(db_path: Path, base_index: int) -> str:
     m = _DB_VERSION_RE.search(db_path.name)
     v = int(m.group(1)) if m else DB_VERSION
     return f"{USEARCH_INDEX_BASES[base_index]}_v{v}.bin"
+
+
+def _usearch_base(db_path: Path, base_index: int) -> str:
+    """Return versioned USearch base name (without .bin) for shard filenames."""
+    m = _DB_VERSION_RE.search(db_path.name)
+    v = int(m.group(1)) if m else DB_VERSION
+    return f"{USEARCH_INDEX_BASES[base_index]}_v{v}"
+
+
+# ---------------------------------------------------------------------------
+# Sharded index support — works around USearch restore() scaling bug (#514)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ShardConfig:
+    """Configuration for popularity-ranked index sharding."""
+    hot_size: int = 3_000_000
+    cold_size: int = 10_000_000
+
+
+@dataclass
+class MergedSearchResults:
+    """Duck-type compatible with USearch search results."""
+    keys: np.ndarray
+    distances: np.ndarray
+
+
+class ShardedIndex:
+    """Popularity-sharded USearch index that lazy-loads cold shards on demand.
+
+    Falls back to monolithic .bin if no shard manifest is found.
+    """
+
+    def __init__(self, cache_dir: Path, base_name: str):
+        self._cache_dir = cache_dir
+        self._base_name = base_name
+        self._manifest: dict | None = None
+        self._hot_index = None  # USearch Index (shard 0)
+        self._cold_shards: dict[int, Any] = {}  # shard_idx -> USearch Index
+        self._monolithic: Any = None  # fallback USearch Index
+        self._is_sharded = False
+        self._total_vectors = 0
+        self._lock = threading.Lock()
+
+    def load(self) -> bool:
+        """Load index — tries sharded manifest first, falls back to monolithic."""
+        manifest_path = self._cache_dir / f"{self._base_name}_shards.json"
+        if manifest_path.exists():
+            return self._load_sharded(manifest_path)
+        # Fallback to monolithic
+        mono_path = self._cache_dir / f"{self._base_name}.bin"
+        if not mono_path.exists():
+            logger.debug(f"No index found: {mono_path}")
+            return False
+        return self._load_monolithic(mono_path)
+
+    def _load_sharded(self, manifest_path: Path) -> bool:
+        from usearch.index import Index
+
+        with open(manifest_path) as f:
+            self._manifest = json.load(f)
+
+        self._total_vectors = self._manifest["total_vectors"]
+        shards = self._manifest["shards"]
+
+        # Load hot shard only
+        hot = next(s for s in shards if s["hot"])
+        hot_path = self._cache_dir / hot["filename"]
+        if not hot_path.exists():
+            logger.warning(f"Hot shard missing: {hot_path}, falling back to monolithic")
+            mono_path = self._cache_dir / f"{self._base_name}.bin"
+            if mono_path.exists():
+                return self._load_monolithic(mono_path)
+            return False
+
+        t0 = time.monotonic()
+        # Disable key lookups: the reindex_keys_() hash set rebuild in USearch has
+        # O(n²) behavior for sparse/non-sequential keys due to poor hash function +
+        # linear probing (see unum-cloud/usearch#514). We never use key→slot lookups —
+        # search returns keys from graph nodes directly. This drops load from 175s to 0.1s.
+        self._hot_index = Index.restore(str(hot_path), view=True, enable_key_lookups=False)
+        self._hot_index.expansion_search = 200
+        dt = time.monotonic() - t0
+        self._is_sharded = True
+        logger.info(
+            f"Loaded hot shard {hot['filename']}: {hot['count']:,} vectors in {dt:.1f}s "
+            f"({len(shards) - 1} cold shards available, {self._total_vectors:,} total)"
+        )
+        return True
+
+    def _load_monolithic(self, mono_path: Path) -> bool:
+        from usearch.index import Index
+
+        t0 = time.monotonic()
+        logger.info(f"Loading monolithic USearch index from {mono_path.name}...")
+        self._monolithic = Index.restore(str(mono_path), view=True, enable_key_lookups=False)
+        self._monolithic.expansion_search = 200
+        self._total_vectors = len(self._monolithic)
+        dt = time.monotonic() - t0
+        logger.info(
+            f"Loaded monolithic index: {self._total_vectors:,} vectors in {dt:.1f}s, "
+            f"connectivity={self._monolithic.connectivity}"
+        )
+        return True
+
+    def _get_cold_shard(self, shard_info: dict) -> Any:
+        """Load a cold shard, caching for reuse. Safe with mmap + enable_key_lookups=False."""
+        shard_idx = shard_info["index"]
+        with self._lock:
+            if shard_idx in self._cold_shards:
+                return self._cold_shards[shard_idx]
+
+        from usearch.index import Index
+
+        shard_path = self._cache_dir / shard_info["filename"]
+        if not shard_path.exists():
+            logger.warning(f"Cold shard missing: {shard_path}")
+            return None
+
+        t0 = time.monotonic()
+        idx = Index.restore(str(shard_path), view=True, enable_key_lookups=False)
+        idx.expansion_search = 200
+        dt = time.monotonic() - t0
+        logger.info(f"Loaded cold shard {shard_info['filename']}: {shard_info['count']:,} vectors in {dt:.1f}s")
+
+        with self._lock:
+            self._cold_shards[shard_idx] = idx
+        return idx
+
+    def search(self, query, top_k: int, score_threshold: float = 0.95) -> MergedSearchResults:
+        """Search hot shard first; progressively search cold shards if needed.
+
+        Cold shards are mmap'd with enable_key_lookups=False and cached — the OS
+        manages physical memory via page faults, so caching is safe.
+        """
+        if not self._is_sharded:
+            # Monolithic path
+            return self._monolithic.search(query, min(top_k, len(self._monolithic)))
+
+        # Search hot shard
+        hot_results = self._hot_index.search(query, min(top_k, len(self._hot_index)))
+
+        # Check if hot shard is sufficient
+        best_dist = float(hot_results.distances[0]) if len(hot_results.keys) > 0 else 2.0
+        best_similarity = 1.0 - best_dist
+        if best_similarity >= score_threshold:
+            logger.debug(f"Hot shard sufficient (best={best_similarity:.3f} >= {score_threshold})")
+            return hot_results
+
+        # Progressively search cold shards with early stopping
+        all_keys = [hot_results.keys]
+        all_dists = [hot_results.distances]
+
+        cold_shards = [s for s in self._manifest["shards"] if not s["hot"]]
+        logger.info(f"Searching {len(cold_shards)} cold shards progressively (best hot={best_similarity:.3f})")
+
+        for shard_info in cold_shards:
+            idx = self._get_cold_shard(shard_info)
+            if idx is None:
+                continue
+            results = idx.search(query, min(top_k, len(idx)))
+            all_keys.append(results.keys)
+            all_dists.append(results.distances)
+
+            # Check if we now have a good enough result to stop early
+            shard_best = 1.0 - float(results.distances[0]) if len(results.keys) > 0 else 0.0
+            if shard_best > best_similarity:
+                best_similarity = shard_best
+            if best_similarity >= score_threshold:
+                logger.debug(f"Cold shard early stop (best={best_similarity:.3f} >= {score_threshold})")
+                break
+
+        # Merge by distance ascending (closest first), take top_k
+        merged_keys = np.concatenate(all_keys)
+        merged_dists = np.concatenate(all_dists)
+        order = np.argsort(merged_dists)[:top_k]
+
+        return MergedSearchResults(
+            keys=merged_keys[order],
+            distances=merged_dists[order],
+        )
+
+    def __len__(self) -> int:
+        return self._total_vectors
+
+    @property
+    def connectivity(self) -> int:
+        if self._is_sharded and self._hot_index is not None:
+            return self._hot_index.connectivity
+        if self._monolithic is not None:
+            return self._monolithic.connectivity
+        return 0
+
+    @property
+    def expansion_search(self) -> int:
+        if self._is_sharded and self._hot_index is not None:
+            return self._hot_index.expansion_search
+        if self._monolithic is not None:
+            return self._monolithic.expansion_search
+        return 200
+
+    @expansion_search.setter
+    def expansion_search(self, value: int) -> None:
+        if self._is_sharded and self._hot_index is not None:
+            self._hot_index.expansion_search = value
+        if self._monolithic is not None:
+            self._monolithic.expansion_search = value
+
 
 # Person types whose identity is defined by their role at an organization
 _ORG_DEFINED_TYPE_STRS = {
@@ -406,6 +616,69 @@ def _invert_date_str(date_str: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _build_shard_assignment(
+    conn: sqlite3.Connection,
+    table: str,
+    shard_config: ShardConfig,
+    where_clause: str = "",
+) -> int:
+    """Create temp table _shard_assignment ranking records by popularity.
+
+    Returns the number of shards created.
+    """
+    where = f"WHERE {where_clause}" if where_clause else ""
+    conn.execute("DROP TABLE IF EXISTS _shard_assignment")
+    conn.execute("CREATE TEMP TABLE _shard_assignment(person_id INTEGER PRIMARY KEY, shard_idx INTEGER)")
+
+    hot = shard_config.hot_size
+    cold = shard_config.cold_size
+
+    conn.execute(f"""
+        INSERT INTO _shard_assignment(person_id, shard_idx)
+        SELECT id, CASE
+            WHEN row_num <= :hot THEN 0
+            ELSE 1 + (row_num - :hot - 1) / :cold
+        END
+        FROM (
+            SELECT id, ROW_NUMBER() OVER (ORDER BY
+                CASE source_id WHEN 4 THEN 0 WHEN 2 THEN 1 WHEN 3 THEN 2 ELSE 3 END,
+                canon_size DESC, id
+            ) as row_num
+            FROM {table} {where}
+        )
+    """, {"hot": hot, "cold": cold})
+
+    num_shards = conn.execute("SELECT MAX(shard_idx) + 1 FROM _shard_assignment").fetchone()[0]
+    counts_by_shard = conn.execute(
+        "SELECT shard_idx, COUNT(*) FROM _shard_assignment GROUP BY shard_idx ORDER BY shard_idx"
+    ).fetchall()
+    for shard_idx, count in counts_by_shard:
+        label = "hot" if shard_idx == 0 else f"cold-{shard_idx}"
+        logger.info(f"Shard {shard_idx} ({label}): {count:,} vectors")
+
+    return num_shards
+
+
+def _write_shard_manifest(cache_dir: Path, base_name: str, shard_counts: list[int]) -> None:
+    """Write shards.json manifest file."""
+    manifest = {
+        "version": 1,
+        "total_vectors": sum(shard_counts),
+        "shards": [
+            {
+                "index": i,
+                "filename": f"{base_name}_shard{i}.bin",
+                "count": count,
+                "hot": i == 0,
+            }
+            for i, count in enumerate(shard_counts)
+        ],
+    }
+    manifest_path = cache_dir / f"{base_name}_shards.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    logger.info(f"Wrote shard manifest: {manifest_path.name} ({len(shard_counts)} shards, {sum(shard_counts):,} total)")
+
 
 def build_hnsw_index(
     conn: sqlite3.Connection,
@@ -417,6 +690,7 @@ def build_hnsw_index(
     ef_search: int = 200,
     embed_batch_size: int = 192,
     progress_callback: Optional[Any] = None,
+    shard_config: ShardConfig | None = None,
 ) -> int:
     """Build HNSW index for organizations by generating embeddings on-the-fly.
 
@@ -518,12 +792,16 @@ def build_people_composite_index(
     ef_search: int = 200,
     embed_batch_size: int = 192,
     progress_callback: Optional[Any] = None,
+    shard_config: ShardConfig | None = None,
 ) -> int:
     """Build USearch HNSW index for people using composite embeddings.
 
     Generates composite embeddings (name + role + org) on-the-fly and feeds
     them directly into the USearch index. No embeddings are stored in the
     people table — this is the only place people embeddings live.
+
+    When shard_config is provided, builds popularity-ranked shards instead of
+    a single monolithic index (works around USearch restore() scaling bug).
 
     Args:
         conn: Database connection
@@ -534,6 +812,7 @@ def build_people_composite_index(
         ef_search: Search quality parameter
         embed_batch_size: Batch size for embedding generation
         progress_callback: Optional callable(processed, total) for progress
+        shard_config: If provided, build sharded indexes ranked by popularity
 
     Returns:
         Number of vectors indexed
@@ -542,12 +821,25 @@ def build_people_composite_index(
 
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
     cache_dir = db_path.parent
+    base_name = _usearch_base(db_path, 1)
     index_path = cache_dir / _usearch_filename(db_path, 1)
 
     total_count = conn.execute("SELECT COUNT(*) FROM people WHERE known_for_org_id IS NOT NULL").fetchone()[0]
     if total_count == 0:
         logger.warning("No people with org associations found for composite index")
         return 0
+
+    # Skip sharding if total fits in hot shard
+    if shard_config and total_count <= shard_config.hot_size:
+        logger.info(f"Total {total_count:,} <= hot_size {shard_config.hot_size:,}, building monolithic")
+        shard_config = None
+
+    if shard_config:
+        return _build_sharded_composite_index(
+            conn, embedder, embedding_dim, M, ef_construction, ef_search,
+            embed_batch_size, progress_callback, shard_config, total_count,
+            cache_dir, base_name, index_path,
+        )
 
     logger.info(f"Building composite USearch index for {total_count:,} people")
     logger.info(f"Parameters: M={M}, ef_construction={ef_construction}, ef_search={ef_search}")
@@ -611,6 +903,103 @@ def build_people_composite_index(
     return total_added
 
 
+def _build_sharded_composite_index(
+    conn: sqlite3.Connection,
+    embedder: "CompanyEmbedder",
+    embedding_dim: int,
+    M: int,
+    ef_construction: int,
+    ef_search: int,
+    embed_batch_size: int,
+    progress_callback: Optional[Any],
+    shard_config: ShardConfig,
+    total_count: int,
+    cache_dir: Path,
+    base_name: str,
+    monolithic_path: Path,
+) -> int:
+    """Build sharded composite index with popularity ranking."""
+    from usearch.index import Index
+
+    logger.info(f"Building sharded composite index for {total_count:,} people "
+                f"(hot={shard_config.hot_size:,}, cold={shard_config.cold_size:,})")
+
+    num_shards = _build_shard_assignment(conn, "people", shard_config, "known_for_org_id IS NOT NULL")
+
+    shard_counts: list[int] = []
+    total_added = 0
+
+    for shard_idx in range(num_shards):
+        shard_count = conn.execute(
+            "SELECT COUNT(*) FROM _shard_assignment WHERE shard_idx = ?", (shard_idx,)
+        ).fetchone()[0]
+
+        label = "hot" if shard_idx == 0 else f"cold-{shard_idx}"
+        logger.info(f"Building shard {shard_idx} ({label}): {shard_count:,} vectors")
+
+        index = Index(
+            ndim=embedding_dim, metric='cos', dtype='i8',
+            connectivity=M, expansion_add=ef_construction, expansion_search=ef_search,
+        )
+
+        DB_BATCH_SIZE = 10_000
+        shard_added = 0
+        last_id = 0
+
+        while True:
+            cursor = conn.execute("""
+                SELECT p.id, p.name, r.name as role_name, kfo.name as org_name
+                FROM people p
+                JOIN _shard_assignment sa ON sa.person_id = p.id AND sa.shard_idx = ?
+                LEFT JOIN roles r ON p.known_for_role_id = r.id
+                JOIN organizations kfo ON p.known_for_org_id = kfo.id
+                WHERE p.id > ?
+                ORDER BY p.id
+                LIMIT ?
+            """, (shard_idx, last_id, DB_BATCH_SIZE))
+
+            rows = cursor.fetchall()
+            if not rows:
+                break
+
+            ids = [row["id"] for row in rows]
+            names = [row["name"] for row in rows]
+            roles = [row["role_name"] for row in rows]
+            orgs = [row["org_name"] for row in rows]
+
+            fp32_batch = embedder.embed_composite_person_batch(
+                names=names, roles=roles, orgs=orgs, batch_size=embed_batch_size,
+            )
+            int8_batch = np.clip(np.round(fp32_batch * 127), -127, 127).astype(np.int8)
+            ids_array = np.array(ids, dtype=np.int64)
+            index.add(ids_array, int8_batch)
+            shard_added += len(ids)
+            total_added += len(ids)
+            last_id = ids[-1]
+
+            if progress_callback:
+                progress_callback(total_added, total_count)
+            logger.info(f"Shard {shard_idx}: {shard_added:,}/{shard_count:,} vectors (total {total_added:,}/{total_count:,})")
+
+        shard_path = cache_dir / f"{base_name}_shard{shard_idx}.bin"
+        logger.info(f"Saving shard {shard_idx} to {shard_path.name}...")
+        index.save(str(shard_path))
+        shard_size_mb = shard_path.stat().st_size / 1024**2
+        logger.info(f"Shard {shard_idx}: {shard_added:,} vectors ({shard_size_mb:.1f} MB)")
+        shard_counts.append(shard_added)
+
+    embedder.clear_segment_cache()
+
+    # Write manifest (monolithic .bin is kept if it already exists for backwards compat)
+    _write_shard_manifest(cache_dir, base_name, shard_counts)
+
+    # Clean up temp table
+    conn.execute("DROP TABLE IF EXISTS _shard_assignment")
+
+    logger.info(f"Sharded composite index complete: {total_added:,} vectors in {num_shards} shards")
+    return total_added
+
+
 def build_people_identity_index(
     conn: sqlite3.Connection,
     embedder: "CompanyEmbedder",
@@ -620,12 +1009,16 @@ def build_people_identity_index(
     ef_search: int = 200,
     embed_batch_size: int = 192,
     progress_callback: Optional[Any] = None,
+    shard_config: ShardConfig | None = None,
 ) -> int:
     """Build USearch HNSW index for people using name-only embeddings.
 
     Embeds each person's name, truncates to segment_dim (Matryoshka),
     L2-normalizes, and stores as int8. This index serves as a fallback
     when composite search and SQL name lookup both fail.
+
+    When shard_config is provided, builds popularity-ranked shards instead of
+    a single monolithic index (works around USearch restore() scaling bug).
 
     Args:
         conn: Database connection
@@ -636,6 +1029,7 @@ def build_people_identity_index(
         ef_search: Search quality parameter
         embed_batch_size: Batch size for embedding generation
         progress_callback: Optional callable(processed, total) for progress
+        shard_config: If provided, build sharded indexes ranked by popularity
 
     Returns:
         Number of vectors indexed
@@ -644,12 +1038,25 @@ def build_people_identity_index(
 
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
     cache_dir = db_path.parent
+    base_name = _usearch_base(db_path, 2)
     index_path = cache_dir / _usearch_filename(db_path, 2)
 
     total_count = conn.execute("SELECT COUNT(*) FROM people").fetchone()[0]
     if total_count == 0:
         logger.warning("No people found for identity index")
         return 0
+
+    # Skip sharding if total fits in hot shard
+    if shard_config and total_count <= shard_config.hot_size:
+        logger.info(f"Total {total_count:,} <= hot_size {shard_config.hot_size:,}, building monolithic")
+        shard_config = None
+
+    if shard_config:
+        return _build_sharded_identity_index(
+            conn, embedder, segment_dim, M, ef_construction, ef_search,
+            embed_batch_size, progress_callback, shard_config, total_count,
+            cache_dir, base_name,
+        )
 
     logger.info(f"Building identity USearch index for {total_count:,} people (dim={segment_dim})")
     logger.info(f"Parameters: M={M}, ef_construction={ef_construction}, ef_search={ef_search}")
@@ -702,6 +1109,97 @@ def build_people_identity_index(
     index_size_mb = index_path.stat().st_size / 1024**2
     logger.info(f"Identity USearch index built: {total_added:,} vectors ({index_size_mb:.1f} MB)")
 
+    return total_added
+
+
+def _build_sharded_identity_index(
+    conn: sqlite3.Connection,
+    embedder: "CompanyEmbedder",
+    segment_dim: int,
+    M: int,
+    ef_construction: int,
+    ef_search: int,
+    embed_batch_size: int,
+    progress_callback: Optional[Any],
+    shard_config: ShardConfig,
+    total_count: int,
+    cache_dir: Path,
+    base_name: str,
+) -> int:
+    """Build sharded identity index with popularity ranking."""
+    from usearch.index import Index
+
+    logger.info(f"Building sharded identity index for {total_count:,} people "
+                f"(hot={shard_config.hot_size:,}, cold={shard_config.cold_size:,})")
+
+    num_shards = _build_shard_assignment(conn, "people", shard_config)
+
+    shard_counts: list[int] = []
+    total_added = 0
+
+    for shard_idx in range(num_shards):
+        shard_count = conn.execute(
+            "SELECT COUNT(*) FROM _shard_assignment WHERE shard_idx = ?", (shard_idx,)
+        ).fetchone()[0]
+
+        label = "hot" if shard_idx == 0 else f"cold-{shard_idx}"
+        logger.info(f"Building identity shard {shard_idx} ({label}): {shard_count:,} vectors")
+
+        index = Index(
+            ndim=segment_dim, metric='cos', dtype='i8',
+            connectivity=M, expansion_add=ef_construction, expansion_search=ef_search,
+        )
+
+        DB_BATCH_SIZE = 10_000
+        shard_added = 0
+        last_id = 0
+
+        while True:
+            rows = conn.execute("""
+                SELECT p.id, p.name FROM people p
+                JOIN _shard_assignment sa ON sa.person_id = p.id AND sa.shard_idx = ?
+                WHERE p.id > ?
+                ORDER BY p.id
+                LIMIT ?
+            """, (shard_idx, last_id, DB_BATCH_SIZE)).fetchall()
+            if not rows:
+                break
+
+            ids = [row["id"] for row in rows]
+            names = [row["name"] for row in rows]
+
+            fp32_batch = embedder.embed_batch(names, batch_size=embed_batch_size)
+            truncated = fp32_batch[:, :segment_dim].copy()
+            norms = np.linalg.norm(truncated, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            truncated /= norms
+
+            int8_batch = np.clip(np.round(truncated * 127), -127, 127).astype(np.int8)
+            ids_array = np.array(ids, dtype=np.int64)
+            index.add(ids_array, int8_batch)
+            shard_added += len(ids)
+            total_added += len(ids)
+            last_id = ids[-1]
+
+            if progress_callback:
+                progress_callback(total_added, total_count)
+            logger.info(f"Identity shard {shard_idx}: {shard_added:,}/{shard_count:,} vectors "
+                        f"(total {total_added:,}/{total_count:,})")
+
+        shard_path = cache_dir / f"{base_name}_shard{shard_idx}.bin"
+        logger.info(f"Saving identity shard {shard_idx} to {shard_path.name}...")
+        index.save(str(shard_path))
+        shard_size_mb = shard_path.stat().st_size / 1024**2
+        logger.info(f"Identity shard {shard_idx}: {shard_added:,} vectors ({shard_size_mb:.1f} MB)")
+        shard_counts.append(shard_added)
+
+    # Write manifest (monolithic .bin is kept if it already exists for backwards compat)
+    _write_shard_manifest(cache_dir, base_name, shard_counts)
+
+    # Clean up temp table
+    conn.execute("DROP TABLE IF EXISTS _shard_assignment")
+
+    logger.info(f"Sharded identity index complete: {total_added:,} vectors in {num_shards} shards")
     return total_added
 
 
@@ -987,14 +1485,23 @@ class OrganizationDatabase:
         query_embedding: np.ndarray,
         top_k: int = 20,
         source_filter: Optional[str] = None,
+        query_name: Optional[str] = None,
+        embedder: Optional["CompanyEmbedder"] = None,
     ) -> list[tuple[CompanyRecord, float]]:
         """
-        Search for similar organizations using USearch ANN search.
+        Search for similar organizations using USearch ANN search + name alias lookup.
+
+        When query_name is provided, also looks up exact name matches in the
+        alias table (e.g. "SEC" → "U.S. Securities and Exchange Commission").
+        When multiple aliases share the same name, disambiguation uses embedding
+        similarity to canonical record names blended with popularity (canon_size).
 
         Args:
             query_embedding: Query embedding vector
             top_k: Number of results to return
             source_filter: Optional filter by source (gleif, sec_edgar, etc.)
+            query_name: Original query text for name-based alias lookup
+            embedder: Optional embedder for disambiguating multiple alias matches
 
         Returns:
             List of (CompanyRecord, similarity_score) tuples
@@ -1016,9 +1523,178 @@ class OrganizationDatabase:
 
         results = self._hnsw_search(query_int8, top_k, source_filter=source_filter)
 
+        # Name-based alias lookup.
+        # Short queries (≤ 3 chars): always look up all records — HNSW rarely
+        # finds the right entity for short acronyms like "SEC", "MIT".
+        # Longer queries (4+ chars): look up alias records only when HNSW top
+        # score < 0.95, and only if there's a single unambiguous canonical match.
+        # This handles cases like "Federal Reserve Board" (unique alias) while
+        # avoiding disambiguation failures for common names ("Shell", "Oxford")
+        # that map to multiple canonical groups.
+        if query_name:
+            query_stripped = query_name.strip()
+            if len(query_stripped) <= 3:
+                name_results = self._name_lookup(query_name, embedder, query_normalized)
+                if name_results:
+                    results = self._merge_name_results(results, name_results, top_k)
+            elif results and results[0][1] < 0.95:
+                name_results = self._name_lookup(
+                    query_name, embedder, query_normalized,
+                    aliases_only=True, single_match_only=True,
+                )
+                if name_results:
+                    results = self._merge_name_results(results, name_results, top_k)
+
         elapsed = time.time() - start
         logger.debug(f"Organization search took {elapsed:.3f}s (results={len(results)})")
         return results
+
+    # --- Name-based alias lookup ---
+
+    # Max alias candidates to consider for embedding disambiguation
+    _ALIAS_DISAMBIG_LIMIT = 10
+
+    def _name_lookup(
+        self,
+        query_name: str,
+        embedder: Optional["CompanyEmbedder"],
+        query_normalized: np.ndarray,
+        aliases_only: bool = False,
+        single_match_only: bool = False,
+    ) -> list[tuple[CompanyRecord, float]]:
+        """Look up organizations by exact name match, resolve to canonical records.
+
+        Searches the name column (indexed) for exact matches, groups by canon_id,
+        and returns the best canonical record. When multiple canon groups share the
+        same alias name (e.g. "SEC" → 7 different entities), disambiguation uses
+        embedding similarity between the query and each canonical record's full name,
+        blended with log-scaled popularity (canon_size).
+
+        Args:
+            aliases_only: If True, only match alias records (alias_source_id IS NOT NULL).
+                This prevents primary records with common names (e.g. GLEIF "Shell")
+                from overriding HNSW results for longer queries.
+            single_match_only: If True, only return results when there's exactly one
+                canonical match. This avoids disambiguation failures for ambiguous
+                names that map to multiple unrelated entities.
+
+        Returns:
+            List of (CompanyRecord, score) tuples — typically 0 or 1 result.
+        """
+        conn = self._conn
+        assert conn is not None
+
+        # Find all distinct canon groups that have a record with this exact name
+        alias_filter = " AND o.alias_source_id IS NOT NULL" if aliases_only else ""
+        rows = conn.execute(
+            f"""SELECT DISTINCT o.canon_id,
+                      c.name AS canon_name,
+                      c.canon_size
+               FROM organizations o
+               JOIN organizations c ON c.id = o.canon_id
+               WHERE o.name = ?{alias_filter}
+               ORDER BY c.canon_size DESC""",
+            (query_name,),
+        ).fetchall()
+
+        if not rows:
+            return []
+
+        # When single_match_only, bail if there are multiple canonical groups
+        if single_match_only and len(rows) > 1:
+            logger.debug(
+                f"Name lookup: '{query_name}' has {len(rows)} canonical matches, "
+                f"skipping (single_match_only)"
+            )
+            return []
+
+        # Single candidate — no disambiguation needed
+        if len(rows) == 1:
+            record = self._get_record_by_id(rows[0]["canon_id"])
+            if record:
+                logger.debug(f"Name lookup: '{query_name}' → {record.name} (single match)")
+                return [(record, 1.0)]
+            return []
+
+        # Multiple candidates — disambiguate
+        candidates: list[tuple[CompanyRecord, str, int]] = []
+        for row in rows[: self._ALIAS_DISAMBIG_LIMIT]:
+            record = self._get_record_by_id(row["canon_id"])
+            if record:
+                candidates.append((record, row["canon_name"], row["canon_size"]))
+
+        if not candidates:
+            return []
+
+        if embedder is not None:
+            # Embed each canonical name and score against query embedding
+            canon_names = [name for _, name, _ in candidates]
+            canon_embeddings = embedder.embed_batch(canon_names)
+
+            best_score = -1.0
+            best_record: Optional[CompanyRecord] = None
+            query_len = len(query_name)
+            for (record, canon_name, canon_size), emb in zip(candidates, canon_embeddings):
+                emb_norm = np.linalg.norm(emb)
+                if emb_norm == 0:
+                    continue
+                sim = float(np.dot(query_normalized, emb / emb_norm))
+                # Penalize trivial self-matches: a canonical name that embeds
+                # near-identically to the query (sim > 0.95) and is roughly the
+                # same length provides no disambiguation signal — zero it out
+                # so popularity alone drives the ranking for that candidate.
+                if sim > 0.95 and len(canon_name) <= query_len + 3:
+                    sim = 0.0
+                # Blend: 70% embedding similarity + 30% log-scaled popularity
+                pop = min(math.log(canon_size + 1) / math.log(20), 1.0)
+                score = 0.7 * sim + 0.3 * pop
+                if score > best_score:
+                    best_score = score
+                    best_record = record
+
+            if best_record:
+                logger.debug(
+                    f"Name lookup: '{query_name}' → {best_record.name} "
+                    f"(disambiguated from {len(candidates)} candidates, score={best_score:.3f})"
+                )
+                return [(best_record, 1.0)]
+        else:
+            # No embedder — return highest canon_size (already sorted DESC)
+            record = candidates[0][0]
+            logger.debug(f"Name lookup: '{query_name}' → {record.name} (by canon_size)")
+            return [(record, 1.0)]
+
+        return []
+
+    @staticmethod
+    def _merge_name_results(
+        hnsw_results: list[tuple[CompanyRecord, float]],
+        name_results: list[tuple[CompanyRecord, float]],
+        top_k: int,
+    ) -> list[tuple[CompanyRecord, float]]:
+        """Merge name lookup results into HNSW results, deduplicating by canon_id.
+
+        Name results are placed first (higher confidence from exact name match),
+        followed by HNSW results that aren't already represented.
+        """
+        seen_canon_ids: set[int] = set()
+        merged: list[tuple[CompanyRecord, float]] = []
+
+        for record, score in name_results:
+            canon_id = record.record.get("canon_id")
+            if canon_id is not None:
+                seen_canon_ids.add(canon_id)
+            merged.append((record, score))
+
+        for record, score in hnsw_results:
+            canon_id = record.record.get("canon_id")
+            if canon_id is not None and canon_id in seen_canon_ids:
+                continue
+            if canon_id is not None:
+                seen_canon_ids.add(canon_id)
+            merged.append((record, score))
+
+        return merged[:top_k]
 
     # --- USearch approximate nearest neighbor search ---
 
@@ -1028,7 +1704,7 @@ class OrganizationDatabase:
 
     def _load_hnsw_index(self) -> bool:
         """
-        Load pre-built USearch index from disk.
+        Load pre-built USearch index from disk (sharded or monolithic).
 
         Returns:
             True if successfully loaded, False otherwise.
@@ -1036,26 +1712,12 @@ class OrganizationDatabase:
         if self._hnsw_index is not None:
             return True  # Already loaded
 
-        index_path = self._get_hnsw_index_path()
-        if not index_path.exists():
-            logger.debug(f"USearch index not found: {index_path}")
+        base_name = _usearch_base(self._db_path, 0)
+        sharded = ShardedIndex(self._db_path.parent, base_name)
+        if not sharded.load():
             return False
-
-        try:
-            from usearch.index import Index
-
-            # Load index (IDs are stored in the index itself)
-            logger.info(f"Loading USearch index from {index_path.name}...")
-            index = Index.restore(str(index_path))
-            # USearch doesn't persist expansion_search — restore it for good recall on large indexes
-            index.expansion_search = 200
-            self._hnsw_index = index
-            logger.info(f"Loaded USearch index: {len(index):,} vectors, connectivity={index.connectivity}, ef_search={index.expansion_search}")
-            return True
-
-        except Exception as e:
-            logger.warning(f"Failed to load USearch index: {e}")
-            return False
+        self._hnsw_index = sharded
+        return True
 
     def _hnsw_search(
         self,
@@ -1064,7 +1726,10 @@ class OrganizationDatabase:
         source_filter: Optional[str] = None,
     ) -> list[tuple[CompanyRecord, float]]:
         """
-        Search using USearch index.
+        Search using USearch index with canon dedup.
+
+        When an alias record is found, resolves to its canonical record.
+        Each canonical group appears at most once in the results.
 
         Args:
             query_int8: Query embedding quantized to int8
@@ -1077,14 +1742,20 @@ class OrganizationDatabase:
         if self._hnsw_index is None:
             return []
 
-        # Query USearch index (fetch more if we need to filter by source)
-        fetch_k = top_k * 10 if source_filter else top_k
+        # Fetch extra to compensate for alias filtering, canon dedup, and source filtering.
+        # Alias records (~25% of index) are skipped — they duplicate primary record
+        # embeddings and can resolve to wrong canonical entities for common names.
+        fetch_k = top_k * 5
+        if source_filter:
+            fetch_k = top_k * 10
         fetch_k = min(fetch_k, len(self._hnsw_index))
 
         matches = self._hnsw_index.search(query_int8, fetch_k)
 
-        # Convert to results
+        # Convert to results with canon dedup, skipping alias records
         results: list[tuple[CompanyRecord, float]] = []
+        seen_canon_ids: set[int] = set()
+
         for org_id, dist in zip(matches.keys, matches.distances):
             org_id = int(org_id)
 
@@ -1092,11 +1763,28 @@ class OrganizationDatabase:
             similarity = 1.0 - float(dist)
 
             record = self._get_record_by_id(org_id)
-            if record is not None:
-                # Apply source filter if specified
-                if source_filter and record.source != source_filter:
+            if record is None:
+                continue
+
+            # Skip alias records — they share embeddings with primary records
+            # but resolve to potentially wrong canonical entities (e.g. alias
+            # "Oxford" for Groupe Hamelin outranking University of Oxford).
+            # Alias resolution for acronyms is handled by _name_lookup instead.
+            if record.alias_source is not None:
+                continue
+
+            # Apply source filter if specified
+            if source_filter and record.source != source_filter:
+                continue
+
+            # Canon dedup: skip if we've already seen this canonical group
+            canon_id = record.record.get("canon_id")
+            if canon_id is not None:
+                if canon_id in seen_canon_ids:
                     continue
-                results.append((record, similarity))
+                seen_canon_ids.add(canon_id)
+
+            results.append((record, similarity))
 
             if len(results) >= top_k:
                 break
@@ -1109,7 +1797,8 @@ class OrganizationDatabase:
         assert conn is not None
 
         cursor = conn.execute("""
-            SELECT v.id, v.name, v.source, v.source_identifier, v.region, v.entity_type, v.canon_id, o.record
+            SELECT v.id, v.name, v.source, v.source_identifier, v.region, v.entity_type,
+                   v.canon_id, o.record, v.alias_source, v.alias_source_identifier
             FROM organizations_view v
             JOIN organizations o ON v.id = o.id
             WHERE v.id = ?
@@ -1128,11 +1817,13 @@ class OrganizationDatabase:
                 region=row["region"] or "",
                 entity_type=EntityType(row["entity_type"]) if row["entity_type"] else EntityType.UNKNOWN,
                 record=record_data,
+                alias_source=row["alias_source"],
+                alias_source_identifier=row["alias_source_identifier"],
             )
         return None
 
     def get_by_source_id(self, source: str, source_id: str) -> Optional[CompanyRecord]:
-        """Get an organization record by source and source_id."""
+        """Get a primary organization record by source and source_id (excludes aliases)."""
         conn = self._connect()
 
         source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
@@ -1140,7 +1831,7 @@ class OrganizationDatabase:
             SELECT v.name, v.source, v.source_identifier, v.region, v.entity_type, o.record
             FROM organizations_view v
             JOIN organizations o ON v.id = o.id
-            WHERE o.source_id = ? AND o.source_identifier = ?
+            WHERE o.source_id = ? AND o.source_identifier = ? AND o.alias_source_id IS NULL
         """, (source_type_id, source_id))
 
         row = cursor.fetchone()
@@ -1156,13 +1847,13 @@ class OrganizationDatabase:
         return None
 
     def get_id_by_source_id(self, source: str, source_id: str) -> Optional[int]:
-        """Get the internal database ID for an organization by source and source_id."""
+        """Get the internal database ID for a primary organization by source and source_id."""
         conn = self._connect()
 
         source_type_id = SOURCE_NAME_TO_ID.get(source, 4)
         cursor = conn.execute("""
             SELECT id FROM organizations
-            WHERE source_id = ? AND source_identifier = ?
+            WHERE source_id = ? AND source_identifier = ? AND alias_source_id IS NULL
         """, (source_type_id, source_id))
 
         row = cursor.fetchone()
@@ -1296,6 +1987,7 @@ class OrganizationDatabase:
             FROM organizations o
             JOIN source_types s ON o.source_id = s.id
             LEFT JOIN locations l ON o.region_id = l.id
+            WHERE o.alias_source_id IS NULL
         """)
 
         count = 0
@@ -1442,6 +2134,148 @@ class OrganizationDatabase:
 
         conn.commit()
 
+    def populate_aliases(self) -> dict[str, int]:
+        """
+        Create alias records from existing organization record JSON.
+
+        Scans primary records (alias_source_id IS NULL) with non-empty record JSON
+        and creates alias rows for:
+        - Wikidata aliases (record["wikidata_aliases"])
+        - GLEIF other entity names (record["other_names"])
+        - SEC tickers (record["ticker"])
+
+        Each alias row copies all fields from the parent but with a different name,
+        alias_source_id, and alias_source_identifier set. Uses INSERT OR IGNORE to
+        skip duplicates (handled by the unique index).
+
+        Must be run AFTER canonicalization so alias records inherit correct canon_id.
+
+        Returns:
+            Dict with counts: wikidata_aliases, gleif_other_names, sec_tickers, total
+        """
+        conn = self._connect()
+
+        # First delete existing alias records to allow re-population
+        deleted = conn.execute("DELETE FROM organizations WHERE alias_source_id IS NOT NULL").rowcount
+        if deleted:
+            logger.info(f"Cleared {deleted:,} existing alias records")
+            conn.commit()
+
+        wikidata_alias_id = SOURCE_NAME_TO_ID["wikidata_alias"]  # 5
+        gleif_other_name_id = SOURCE_NAME_TO_ID["gleif_other_name"]  # 6
+        sec_ticker_id = SOURCE_NAME_TO_ID["sec_ticker"]  # 7
+
+        counts = {"wikidata_aliases": 0, "gleif_other_names": 0, "sec_tickers": 0, "total": 0}
+
+        # Stream primary records with non-empty record JSON
+        DB_BATCH = 10_000
+        last_id = 0
+        total_inserted = 0
+
+        while True:
+            cursor = conn.execute("""
+                SELECT id, name, name_normalized, source_id, source_identifier, qid,
+                       region_id, entity_type_id, from_date, to_date, record, canon_id
+                FROM organizations
+                WHERE id > ? AND alias_source_id IS NULL AND record != '{}'
+                ORDER BY id LIMIT ?
+            """, (last_id, DB_BATCH))
+            rows = cursor.fetchall()
+            if not rows:
+                break
+
+            for row in rows:
+                parent_id = row["id"]
+                parent_name_norm = row["name_normalized"]
+                source_id = row["source_id"]
+                source_identifier = row["source_identifier"]
+                canon_id = row["canon_id"] or parent_id
+                record_data = json.loads(row["record"])
+
+                aliases_to_insert: list[tuple[str, int, str]] = []  # (alias_name, alias_source_id, alias_source_identifier)
+
+                # Wikidata aliases
+                for alias in record_data.get("wikidata_aliases", []):
+                    alias = alias.strip()
+                    if not alias:
+                        continue
+                    alias_norm = normalize_company(alias).normalized
+                    if alias_norm == parent_name_norm:
+                        continue  # Skip aliases that normalize to the same value
+                    aliases_to_insert.append((alias, wikidata_alias_id, source_identifier))
+
+                # GLEIF other entity names
+                for other_name_entry in record_data.get("other_names", []):
+                    if isinstance(other_name_entry, dict):
+                        other_name = other_name_entry.get("name", "").strip()
+                    else:
+                        other_name = str(other_name_entry).strip()
+                    if not other_name:
+                        continue
+                    other_norm = normalize_company(other_name).normalized
+                    if other_norm == parent_name_norm:
+                        continue
+                    aliases_to_insert.append((other_name, gleif_other_name_id, source_identifier))
+
+                # SEC ticker
+                ticker = record_data.get("ticker")
+                if ticker and isinstance(ticker, str) and ticker.strip():
+                    ticker = ticker.strip()
+                    ticker_norm = normalize_company(ticker).normalized
+                    if ticker_norm != parent_name_norm:
+                        aliases_to_insert.append((ticker, sec_ticker_id, source_identifier))
+
+                for alias_name, alias_src_id, alias_src_ident in aliases_to_insert:
+                    alias_name_norm = normalize_company(alias_name).normalized
+                    try:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO organizations
+                            (name, name_normalized, source_id, source_identifier, qid,
+                             region_id, entity_type_id, from_date, to_date, record,
+                             canon_id, canon_size, alias_source_id, alias_source_identifier)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, 1, ?, ?)
+                        """, (
+                            alias_name, alias_name_norm,
+                            source_id, source_identifier, row["qid"],
+                            row["region_id"], row["entity_type_id"],
+                            row["from_date"], row["to_date"],
+                            canon_id, alias_src_id, alias_src_ident,
+                        ))
+                        if alias_src_id == wikidata_alias_id:
+                            counts["wikidata_aliases"] += 1
+                        elif alias_src_id == gleif_other_name_id:
+                            counts["gleif_other_names"] += 1
+                        elif alias_src_id == sec_ticker_id:
+                            counts["sec_tickers"] += 1
+                        total_inserted += 1
+                    except Exception as e:
+                        logger.debug(f"Skipped alias '{alias_name}' for {source_identifier}: {e}")
+
+                if total_inserted % 10_000 == 0 and total_inserted > 0:
+                    conn.commit()
+                    logger.info(f"Inserted {total_inserted:,} alias records...")
+
+            last_id = rows[-1]["id"]
+
+        conn.commit()
+        counts["total"] = total_inserted
+        logger.info(
+            f"Alias population complete: {total_inserted:,} total "
+            f"(wikidata={counts['wikidata_aliases']:,}, "
+            f"gleif={counts['gleif_other_names']:,}, "
+            f"tickers={counts['sec_tickers']:,})"
+        )
+
+        # Update canon_size on canonical records to include alias count
+        conn.execute("""
+            UPDATE organizations SET canon_size = (
+                SELECT COUNT(*) FROM organizations o2 WHERE o2.canon_id = organizations.id
+            ) WHERE id = canon_id
+        """)
+        conn.commit()
+        logger.info("Updated canon_size to include alias records")
+
+        return counts
 
 
 def get_person_database(
@@ -2116,6 +2950,7 @@ class PersonDatabase:
         # Tier selection based on max composite score
         if max_composite_score > self.COMPOSITE_HIGH:
             tier = "high"
+            lookup = "composite"
             ranked = [(record, score) for _, record, score in composite_results]
             ranked.sort(key=lambda x: x[1], reverse=True)
             n_name = 0
@@ -2128,6 +2963,7 @@ class PersonDatabase:
             tier = "low" if max_composite_score < self.COMPOSITE_LOW else "medium"
 
             if name_results and embedder and query_name:
+                lookup = "name"
                 # Disambiguate identity matches using description embeddings
                 query_desc = format_person_query(
                     query_name, person_type=query_person_type,
@@ -2141,6 +2977,7 @@ class PersonDatabase:
                     query_name=query_name, canon_ids=canon_ids,
                 )
             elif name_results:
+                lookup = "name"
                 # No embedder — fall back to Levenshtein rerank
                 merged: list[tuple[PersonRecord, float, bool]] = [
                     (record, score, False) for _pid, record, score in name_results
@@ -2155,6 +2992,7 @@ class PersonDatabase:
                     logger.debug(f"Identity HNSW fallback: {n_identity} results")
 
                     if identity_results:
+                        lookup = "identity"
                         # Disambiguate identity results using description embeddings
                         query_desc = format_person_query(
                             query_name, person_type=query_person_type,
@@ -2168,12 +3006,18 @@ class PersonDatabase:
                             query_name=query_name, canon_ids=canon_ids,
                         )
                     else:
+                        lookup = "composite"
                         ranked = [(record, score) for _, record, score in composite_results]
                         ranked.sort(key=lambda x: x[1], reverse=True)
                 else:
+                    lookup = "composite"
                     # No embedder or no identity index — use composite results as-is
                     ranked = [(record, score) for _, record, score in composite_results]
                     ranked.sort(key=lambda x: x[1], reverse=True)
+
+        # Tag all results with how they were found
+        for record, _score in ranked:
+            record.lookup_method = lookup
 
         elapsed = time.time() - start
         logger.debug(
@@ -2427,7 +3271,7 @@ class PersonDatabase:
 
     def _load_hnsw_index(self) -> bool:
         """
-        Load pre-built USearch composite index (768-dim) from disk.
+        Load pre-built USearch composite index (768-dim) from disk (sharded or monolithic).
 
         Returns:
             True if index successfully loaded, False otherwise.
@@ -2435,26 +3279,12 @@ class PersonDatabase:
         if self._hnsw_index is not None:
             return True  # Already loaded
 
-        index_path = self._get_hnsw_index_path()
-        if not index_path.exists():
-            logger.debug(f"USearch index not found: {index_path}")
+        base_name = _usearch_base(self._db_path, 1)
+        sharded = ShardedIndex(self._db_path.parent, base_name)
+        if not sharded.load():
             return False
-
-        try:
-            from usearch.index import Index
-
-            logger.info(f"Loading USearch index from {index_path.name}...")
-            index = Index.restore(str(index_path))
-            # USearch doesn't persist expansion_search — restore it for good recall on large indexes
-            index.expansion_search = 200
-            self._hnsw_index = index
-            logger.info(f"Loaded USearch index: {len(index):,} vectors, connectivity={index.connectivity}, ef_search={index.expansion_search}")
-
-            return True
-
-        except Exception as e:
-            logger.warning(f"Failed to load USearch index: {e}")
-            return False
+        self._hnsw_index = sharded
+        return True
 
     def _hnsw_search(
         self,
@@ -2513,27 +3343,16 @@ class PersonDatabase:
         return self._db_path.parent / _usearch_filename(self._db_path, 2)
 
     def _load_identity_hnsw_index(self) -> bool:
-        """Load pre-built USearch identity index (768-dim name-only) from disk."""
+        """Load pre-built USearch identity index (sharded or monolithic) from disk."""
         if self._identity_hnsw_index is not None:
             return True
 
-        index_path = self._get_identity_index_path()
-        if not index_path.exists():
-            logger.debug(f"Identity USearch index not found: {index_path}")
+        base_name = _usearch_base(self._db_path, 2)
+        sharded = ShardedIndex(self._db_path.parent, base_name)
+        if not sharded.load():
             return False
-
-        try:
-            from usearch.index import Index
-
-            logger.info(f"Loading identity USearch index from {index_path.name}...")
-            index = Index.restore(str(index_path))
-            index.expansion_search = 200
-            self._identity_hnsw_index = index
-            logger.info(f"Loaded identity index: {len(index):,} vectors, connectivity={index.connectivity}")
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to load identity USearch index: {e}")
-            return False
+        self._identity_hnsw_index = sharded
+        return True
 
     def _identity_hnsw_search(
         self,
@@ -2564,7 +3383,7 @@ class PersonDatabase:
         query_int8 = np.clip(np.round(truncated * 127), -127, 127).astype(np.int8)
 
         fetch_k = min(top_k * 3, len(self._identity_hnsw_index))
-        matches = self._identity_hnsw_index.search(query_int8, fetch_k)
+        matches = self._identity_hnsw_index.search(query_int8, fetch_k, score_threshold=0.90)
 
         seen_canon: set[int] = set()
         results: list[tuple[int, PersonRecord, float]] = []

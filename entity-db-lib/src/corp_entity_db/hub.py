@@ -19,7 +19,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # Database schema version — bump this when the schema changes
-DB_VERSION = 5
+DB_VERSION = 6
 
 # Default HuggingFace repo for entity database
 DEFAULT_REPO_ID = "Corp-o-Rate-Community/entity-references"
@@ -77,9 +77,11 @@ def get_database_path(
     # Check if database exists in cache
     cache_dir = DEFAULT_CACHE_DIR
 
-    # Check common locations (v5 first, then older fallbacks)
+    # Check common locations (v6 first, then older fallbacks)
     possible_paths = [
         cache_dir / filename,
+        cache_dir / "entities-v6.db",
+        cache_dir / "entities-v6-lite.db",
         cache_dir / "entities-v5.db",
         cache_dir / "entities-v5-lite.db",
         cache_dir / "entities-v4.db",
@@ -377,6 +379,16 @@ def upload_database_with_variants(
             else:
                 logger.warning(f"USearch index not found: {idx_path} — skipping")
 
+        # Stage shard manifests and shard files
+        import glob as glob_mod
+        for pattern in ["*_shards.json", "*_shard*.bin"]:
+            for shard_file in sorted(glob_mod.glob(str(db_dir / pattern))):
+                shard_path = Path(shard_file)
+                shutil.copy2(shard_path, staging_dir / shard_path.name)
+                files_to_upload.append((shard_path, shard_path.name))
+                shard_size_mb = shard_path.stat().st_size / 1024**2
+                logger.info(f"Staged shard file {shard_path.name} ({shard_size_mb:.0f} MB)")
+
         # Add README.md from ENTITY_DATABASE.md
         if include_readme:
             # Look for ENTITY_DATABASE.md in the project root
@@ -453,20 +465,53 @@ def download_database(
 
     logger.info(f"Database downloaded to {local_path}")
 
-    # Also download USearch index files
-    for idx_name in USEARCH_INDEX_FILES:
+    # Also download USearch index files — try sharded first, fall back to monolithic
+    import json as json_mod
+
+    for base in USEARCH_INDEX_BASES:
+        manifest_name = f"{base}_v{DB_VERSION}_shards.json"
+        manifest_downloaded = False
+        try:
+            manifest_path = hf_hub_download(
+                repo_id=repo_id, filename=manifest_name,
+                revision=revision, cache_dir=str(cache_dir),
+                force_download=force_download, repo_type="dataset",
+            )
+            logger.info(f"Downloaded shard manifest: {manifest_name}")
+            manifest_downloaded = True
+
+            # Download each shard file listed in the manifest
+            with open(manifest_path) as f:
+                manifest = json_mod.load(f)
+            for shard_info in manifest["shards"]:
+                shard_name = shard_info["filename"]
+                try:
+                    shard_path = hf_hub_download(
+                        repo_id=repo_id, filename=shard_name,
+                        revision=revision, cache_dir=str(cache_dir),
+                        force_download=force_download, repo_type="dataset",
+                    )
+                    shard_size_mb = Path(shard_path).stat().st_size / 1024**2
+                    label = "hot" if shard_info.get("hot") else "cold"
+                    logger.info(f"Downloaded shard {shard_name} ({label}, {shard_size_mb:.0f} MB)")
+                except Exception as e:
+                    logger.warning(f"Shard {shard_name} not available: {e}")
+
+        except Exception:
+            pass  # No shard manifest — try monolithic
+
+        # Always try monolithic too (for backwards compat / fallback)
+        idx_name = f"{base}_v{DB_VERSION}.bin"
         try:
             idx_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=idx_name,
-                revision=revision,
-                cache_dir=str(cache_dir),
-                force_download=force_download,
-                repo_type="dataset",
+                repo_id=repo_id, filename=idx_name,
+                revision=revision, cache_dir=str(cache_dir),
+                force_download=force_download, repo_type="dataset",
             )
             idx_size_mb = Path(idx_path).stat().st_size / 1024**2
             logger.info(f"Downloaded {idx_name} ({idx_size_mb:.0f} MB)")
         except Exception as e:
-            logger.warning(f"USearch index {idx_name} not available: {e} — rebuild with: corp-extractor db build-index")
+            if not manifest_downloaded:
+                logger.warning(f"USearch index {idx_name} not available: {e} — rebuild with: corp-entity-db build-index")
 
     return Path(local_path)

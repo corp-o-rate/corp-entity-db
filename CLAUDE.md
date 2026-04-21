@@ -74,8 +74,11 @@ corp-entity-db import-ch-officers --file officers.zip --limit 10000
 corp-entity-db import-wikidata-dump --download --limit 50000
 
 # Database management
-corp-entity-db migrate                         # Migrate schema to latest (v5)
+corp-entity-db migrate                         # Migrate schema to latest (v6)
 corp-entity-db canonicalize                    # Link equivalent records across sources
+corp-entity-db populate-aliases                # Create alias records from record JSON (run after canonicalize)
+corp-entity-db import-aliases --source wiki-anchor data.parquet  # Import Wikipedia anchor aliases
+corp-entity-db import-aliases --source paranames data.tsv        # Import ParaNames aliases
 corp-entity-db post-import                     # Run after any import: build USearch indexes + VACUUM
 corp-entity-db build-index                     # Build all USearch HNSW indexes
 corp-entity-db build-identity-index            # Build only the people identity index
@@ -122,12 +125,12 @@ The frontend can connect to the entity database via two backends (configured by 
 - `Canonicalizer` - Link equivalent records across data sources
 
 ### Database Schema
-- Schema version: v5 with normalized FK references (INTEGER FKs replace TEXT enums), no embedding columns
-- Variants: full (`entities-v5.db`), lite (`entities-v5-lite.db` - strips `record` content, keeps `name_normalized`)
-- Default DB path: `~/.cache/corp-extractor/entities-v5.db`
-- USearch indexes: versioned, co-located with DB (e.g. `organizations_usearch_v5.bin`, `people_usearch_v5.bin`, `people_identity_usearch_v5.bin`)
+- Schema version: v6 with normalized FK references (INTEGER FKs replace TEXT enums), no embedding columns, organization aliases
+- Variants: full (`entities-v6.db`), lite (`entities-v6-lite.db` - strips `record` content, keeps `name_normalized`)
+- Default DB path: `~/.cache/corp-extractor/entities-v6.db`
+- USearch indexes: versioned, co-located with DB (e.g. `organizations_usearch_v6.bin`, `people_usearch_v6.bin`, `people_identity_usearch_v6.bin`)
 - **All embeddings** (orgs + people) exist **only** in USearch HNSW indexes, never in SQLite — generated on-the-fly during index building
-- Tables: `organizations`, `people`, `roles`, `locations`, `organization_types`, `people_types`, `location_types`, `simplified_location_types`, `source_types`, `db_info`
+- Tables: `organizations` (with `alias_source_id`/`alias_source_identifier` for alias records), `people`, `roles`, `locations`, `organization_types`, `people_types`, `location_types`, `simplified_location_types`, `source_types`, `db_info`
 
 ### Organization EntityType Classification
 

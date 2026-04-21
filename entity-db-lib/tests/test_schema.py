@@ -31,8 +31,8 @@ def test_create_all_tables_creates_expected_tables(db_path):
     assert expected.issubset(tables), f"Missing tables: {expected - tables}"
 
 
-def test_schema_version_is_5(db_path):
-    """db_info should record schema_version = '5' after table creation."""
+def test_schema_version_is_6(db_path):
+    """db_info should record schema_version = '6' after table creation."""
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     create_all_tables(conn)
@@ -42,7 +42,7 @@ def test_schema_version_is_5(db_path):
     )
     row = cursor.fetchone()
     assert row is not None
-    assert row["value"] == "5"
+    assert row["value"] == "6"
 
 
 def test_views_created(db_path):
@@ -75,4 +75,16 @@ def test_idempotent_creation(db_path):
     cursor = conn.execute(
         "SELECT value FROM db_info WHERE key = 'schema_version'"
     )
-    assert cursor.fetchone()["value"] == "5"
+    assert cursor.fetchone()["value"] == "6"
+
+
+def test_organizations_has_alias_columns(db_path):
+    """Organizations table should have alias_source_id and alias_source_identifier columns."""
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    create_all_tables(conn)
+
+    cursor = conn.execute("PRAGMA table_info(organizations)")
+    columns = {row["name"] for row in cursor}
+    assert "alias_source_id" in columns
+    assert "alias_source_identifier" in columns

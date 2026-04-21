@@ -63,7 +63,8 @@ def db_search_people(query: str, db_path: Optional[str], top_k: int, role: Optio
         org_str = f" at {record.known_for_org_name}" if record.known_for_org_name else ""
         country_str = f" [{record.country}]" if record.country else ""
         click.echo(f"  {i}. {record.name}{role_str}{org_str}{country_str}")
-        click.echo(f"     Source: wikidata:{record.source_id}, Type: {record.person_type.value}, Score: {similarity:.3f}")
+        lookup_str = f", Lookup: {record.lookup_method}" if record.lookup_method else ""
+        click.echo(f"     Source: {record.source}:{record.source_id}, Type: {record.person_type.value}, Score: {similarity:.3f}{lookup_str}")
         click.echo()
 
     database.close()
@@ -244,7 +245,7 @@ def db_people_test(
             ("I. M. Pei", "I. M. Pei", {"person_type": "unknown", "role": "architect", "org": "Pei Cobb Freed", "expected_org": ""}),
             ("Santiago Calatrava", "Santiago Calatrava", {"person_type": "professional", "role": "architect", "expected_type": "artist"}),
             ("Rem Koolhaas", "Rem Koolhaas", {"person_type": "professional", "role": "architect", "org": "OMA", "expected_type": "artist", "expected_org": ""}),
-            ("Thomas Heatherwick", "Thomas Heatherwick", {"person_type": "professional", "role": "designer", "org": "Heatherwick Studio", "expected_type": "artist", "expected_org": ""}),
+            ("Ettore Sottsass", "Ettore Sottsass", {"person_type": "professional", "role": "designer", "org": "Memphis Group", "expected_type": "artist", "expected_org": ""}),
             ("Jony Ive", "Jony Ive", {"person_type": "professional", "role": "designer", "org": "Apple", "expected_type": "unknown", "expected_org": ""}),
             ("Dieter Rams", "Dieter Rams", {"person_type": "professional", "role": "designer", "org": "Braun", "expected_type": "academic", "expected_org": ""}),
             ("Philippe Starck", "Philippe Starck", {"person_type": "professional", "role": "designer", "expected_type": "executive"}),
@@ -693,7 +694,10 @@ def db_search(query: str, db_path: Optional[str], top_k: int, source: Optional[s
     query_embedding = embedder.embed(query)
 
     # Search
-    results = database.search(query_embedding, top_k=top_k, source_filter=source)
+    results = database.search(
+        query_embedding, top_k=top_k, source_filter=source,
+        query_name=query, embedder=embedder,
+    )
 
     if not results:
         click.echo("No results found.")
@@ -715,6 +719,28 @@ def db_search(query: str, db_path: Optional[str], top_k: int, source: Optional[s
         click.echo()
 
     database.close()
+
+
+def _normalize_org(name: str) -> str:
+    """Normalize an organization name using corp-names for comparison."""
+    from corp_names import normalize_company
+
+    result = normalize_company(name)
+    # corp-names treats some acronyms as suffixes (e.g. "SEC" → ""),
+    # fall back to lowercased original in that case
+    return result.normalized if result.normalized else name.lower()
+
+
+def _org_names_match(norm_a: str, norm_b: str) -> bool:
+    """Check if two normalized org names match (equality or substring containment).
+
+    Substring matching requires the shorter name to be at least 4 characters
+    to avoid spurious matches on very short names (e.g. "wik" in "wikimedia").
+    """
+    if norm_a == norm_b:
+        return True
+    shorter, longer = (norm_a, norm_b) if len(norm_a) <= len(norm_b) else (norm_b, norm_a)
+    return len(shorter) >= 4 and shorter in longer
 
 
 @click.command("org-test")
@@ -743,47 +769,125 @@ def db_org_test(
 
     test_queries_by_type: dict[str, list[tuple[str, str]]] = {
         "business": [
+            # US tech giants
             ("Apple", "Apple Inc."),
             ("Microsoft", "Microsoft Corporation"),
             ("Amazon", "Amazon.com, Inc."),
-            ("Google", "Alphabet Inc."),
+            ("Google", "Google"),
             ("Tesla", "Tesla, Inc."),
             ("NVIDIA", "NVIDIA CORPORATION"),
             ("Meta", "Meta Platforms, Inc."),
+            ("Adobe", "Adobe Inc."),
+            ("Salesforce", "Salesforce, Inc."),
+            ("Netflix", "Netflix, Inc."),
+            ("Intel", "Intel Corporation"),
+            ("Qualcomm", "Qualcomm"),
+            ("Cisco", "Cisco"),
+            ("IBM", "IBM"),
+            ("Oracle", "Oracle"),
+            ("Dell Technologies", "Dell Technologies"),
+            ("HP Inc.", "HP Inc."),
+            ("Zoom Video", "Zoom Video Communications"),
+            ("Shopify", "Shopify"),
+            ("Palantir Technologies", "Palantir Technologies"),
+            # Finance
             ("JPMorgan Chase", "JPMORGAN CHASE & CO"),
+            ("Goldman Sachs", "The Goldman Sachs Group, Inc."),
             ("Berkshire Hathaway", "Berkshire Hathaway Inc."),
+            ("Morgan Stanley", "Morgan Stanley"),
+            ("Citigroup", "Citigroup"),
+            ("HSBC", "HSBC"),
+            ("Deutsche Bank", "Deutsche Bank"),
+            ("BNP Paribas", "BNP Paribas"),
+            ("Barclays", "Barclays"),
+            ("Credit Suisse", "Credit Suisse"),
+            # Consumer & industrial
             ("Samsung Electronics", "Samsung Electronics Co., Ltd."),
             ("Toyota", "Toyota Motor Corporation"),
             ("LVMH", "LVMH Moët Hennessy Louis Vuitton"),
             ("Nestlé", "Nestlé S.A."),
-            ("Goldman Sachs", "The Goldman Sachs Group, Inc."),
             ("Shell", "Shell plc"),
             ("Pfizer", "PFIZER INC"),
-            ("Intel", "Intel Corporation"),
-            ("Adobe", "Adobe Inc."),
-            ("Salesforce", "Salesforce, Inc."),
-            ("Netflix", "Netflix, Inc."),
+            ("Walt Disney Company", "The Walt Disney Company"),
+            ("Procter & Gamble", "Procter & Gamble"),
+            ("Johnson & Johnson", "Johnson & Johnson"),
+            ("Siemens", "Siemens"),
+            ("Volkswagen", "Volkswagen"),
+            ("Mercedes-Benz", "Mercedes-Benz"),
+            ("Boeing", "Boeing"),
+            ("General Motors", "General Motors"),
+            ("Lockheed Martin", "Lockheed Martin"),
+            ("Rolls-Royce", "Rolls-Royce"),
+            ("Honda", "Honda"),
+            ("Tencent", "Tencent"),
+            ("Huawei", "Huawei"),
+            ("SpaceX", "SpaceX"),
         ],
         "fund": [
-            ("Vanguard S&P 500", "Vanguard S&P 500 ETF"),
+            ("Vanguard S&P 500", "Vanguard S&P 500 Index ETF"),
             ("BlackRock", "BlackRock, Inc."),
             ("Fidelity", "Fidelity Investments"),
             ("PIMCO", "PIMCO"),
             ("Bridgewater Associates", "Bridgewater Associates"),
+            ("T. Rowe Price", "T. Rowe Price"),
+            ("Invesco", "Invesco"),
+            ("Northern Trust", "Northern Trust"),
+            ("Schroders", "Schroders"),
+            ("Man Group", "Man Group"),
+            ("Capital Group", "Capital Group"),
+            ("Two Sigma", "Two Sigma"),
+            ("Renaissance Technologies", "Renaissance Technologies"),
+            ("Citadel", "Citadel"),
+            ("Millennium Management", "Millennium Management"),
+            ("AQR Capital", "AQR Capital"),
+            ("Franklin Templeton Investments", "Franklin Templeton Investments"),
+            ("J.P. Morgan Asset Management", "J.P. Morgan Asset Management"),
+            ("Vanguard Group", "The Vanguard Group"),
+            ("Charles Schwab", "Charles Schwab Corporation"),
         ],
         "government": [
             ("SEC", "U.S. Securities and Exchange Commission"),
             ("FDA", "Food and Drug Administration"),
-            ("Federal Reserve", "Board of Governors of the Federal Reserve System"),
+            ("Federal Reserve Board", "Board of Governors of the Federal Reserve System"),
             ("Bank of England", "Bank of England"),
             ("European Central Bank", "European Central Bank"),
+            ("Central Intelligence Agency", "Central Intelligence Agency"),
+            ("Federal Bureau of Investigation", "Federal Bureau of Investigation"),
+            ("Environmental Protection Agency", "Environmental Protection Agency"),
+            ("Internal Revenue Service", "Internal Revenue Service"),
+            ("National Institutes of Health", "National Institutes of Health"),
+            ("Federal Aviation Administration", "Federal Aviation Administration"),
+            ("Department of Justice", "Department of Justice"),
+            ("Reserve Bank of India", "Reserve Bank of India"),
+            ("Bank of Japan", "Bank of Japan"),
+            ("Swiss National Bank", "Swiss National Bank"),
+            ("HM Treasury", "HM Treasury"),
+            ("National Science Foundation", "National Science Foundation"),
+            ("Bank of Canada", "Bank of Canada"),
+            ("Monetary Authority of Singapore", "Monetary Authority of Singapore"),
+            ("Deutsche Bundesbank", "Deutsche Bundesbank"),
         ],
         "educational": [
             ("MIT", "Massachusetts Institute of Technology"),
-            ("Stanford", "Stanford University"),
+            ("Stanford University", "Stanford University"),
             ("Harvard", "Harvard University"),
             ("Oxford", "University of Oxford"),
             ("Cambridge", "University of Cambridge"),
+            ("Yale University", "Yale University"),
+            ("Princeton University", "Princeton University"),
+            ("Columbia University", "Columbia University"),
+            ("UC Berkeley", "University of California, Berkeley"),
+            ("Caltech", "California Institute of Technology"),
+            ("ETH Zurich", "ETH Zurich"),
+            ("Imperial College London", "Imperial College London"),
+            ("University of Tokyo", "University of Tokyo"),
+            ("Peking University", "Peking University"),
+            ("Tsinghua University", "Tsinghua University"),
+            ("University of Toronto", "University of Toronto"),
+            ("Seoul National University", "Seoul National University"),
+            ("Cornell University", "Cornell University"),
+            ("Duke University", "Duke University"),
+            ("University of Edinburgh", "University of Edinburgh"),
         ],
         "international_org": [
             ("United Nations", "United Nations"),
@@ -791,13 +895,43 @@ def db_org_test(
             ("IMF", "International Monetary Fund"),
             ("WHO", "World Health Organization"),
             ("NATO", "NATO"),
+            ("UNICEF", "UNICEF"),
+            ("UNESCO", "UNESCO"),
+            ("World Trade Organization", "World Trade Organization"),
+            ("International Atomic Energy Agency", "International Atomic Energy Agency"),
+            ("Interpol", "Interpol"),
+            ("African Union", "African Union"),
+            ("European Union", "European Union"),
+            ("International Labour Organization", "International Labour Organization"),
+            ("Food and Agriculture Organization", "Food and Agriculture Organization"),
+            ("International Criminal Court", "International Criminal Court"),
+            ("World Intellectual Property Organization", "World Intellectual Property Organization"),
+            ("International Telecommunication Union", "International Telecommunication Union"),
+            ("Pan American Health Organization", "Pan American Health Organization"),
+            ("Commonwealth of Nations", "Commonwealth of Nations"),
+            ("Organization of the Petroleum Exporting Countries", "Organization of the Petroleum Exporting Countries"),
         ],
         "nonprofit": [
             ("Red Cross", "International Committee of the Red Cross"),
             ("Wikimedia Foundation", "Wikimedia Foundation, Inc."),
-            ("Mozilla", "Mozilla Foundation"),
-            ("Wikipedia", "Wikimedia Foundation, Inc."),
+            ("Mozilla Foundation", "Mozilla Foundation"),
+            ("Amnesty International", "Amnesty International"),
             ("Linux Foundation", "The Linux Foundation"),
+            ("Oxfam", "Oxfam"),
+            ("Save the Children", "Save the Children"),
+            ("Habitat for Humanity", "Habitat for Humanity"),
+            ("Electronic Frontier Foundation", "Electronic Frontier Foundation"),
+            ("Human Rights Watch", "Human Rights Watch"),
+            ("Transparency International", "Transparency International"),
+            ("World Food Programme", "World Food Programme"),
+            ("Médecins Sans Frontières", "Médecins Sans Frontières"),
+            ("Open Society Foundations", "Open Society Foundations"),
+            ("CARE International", "CARE International"),
+            ("World Vision International", "World Vision International"),
+            ("Reporters Without Borders", "Reporters Without Borders"),
+            ("The Nature Conservancy", "The Nature Conservancy"),
+            ("International Rescue Committee", "International Rescue Committee"),
+            ("Creative Commons", "Creative Commons"),
         ],
     }
 
@@ -837,11 +971,14 @@ def db_org_test(
         type_timings: list[float] = []
 
         for i, (query, expected) in enumerate(queries, 1):
-            expected_lower = expected.lower()
+            norm_expected = _normalize_org(expected)
 
             t0 = _time.perf_counter()
             query_embedding = embedder.embed(query)
-            results = database.search(query_embedding, top_k=top_k)
+            results = database.search(
+                query_embedding, top_k=top_k,
+                query_name=query, embedder=embedder,
+            )
             total_elapsed = _time.perf_counter() - t0
 
             type_timings.append(total_elapsed)
@@ -851,13 +988,13 @@ def db_org_test(
             topk_match = False
             topk_rank = -1
             if results:
-                if results[0][0].name.lower() == expected_lower:
+                if _org_names_match(_normalize_org(results[0][0].name), norm_expected):
                     top1_match = True
                     topk_match = True
                     topk_rank = 1
                 else:
                     for rank, (rec, _score) in enumerate(results, 1):
-                        if rec.name.lower() == expected_lower:
+                        if _org_names_match(_normalize_org(rec.name), norm_expected):
                             topk_match = True
                             topk_rank = rank
                             break

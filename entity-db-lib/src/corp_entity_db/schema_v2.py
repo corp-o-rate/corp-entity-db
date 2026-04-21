@@ -135,14 +135,19 @@ CREATE TABLE IF NOT EXISTS organizations (
     record TEXT NOT NULL DEFAULT '{}',
     canon_id INTEGER DEFAULT NULL,
     canon_size INTEGER DEFAULT 1,
+    alias_source_id INTEGER DEFAULT NULL,
+    alias_source_identifier TEXT DEFAULT NULL,
     FOREIGN KEY (source_id) REFERENCES source_types(id),
     FOREIGN KEY (region_id) REFERENCES locations(id),
     FOREIGN KEY (entity_type_id) REFERENCES organization_types(id),
-    UNIQUE(source_identifier, source_id)
+    FOREIGN KEY (alias_source_id) REFERENCES source_types(id)
 );
 """
 
 CREATE_ORGANIZATIONS_V2_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orgs_unique ON organizations(
+    source_identifier, source_id, IFNULL(alias_source_id, 0), name_normalized
+);
 CREATE INDEX IF NOT EXISTS idx_orgs_name ON organizations(name);
 CREATE INDEX IF NOT EXISTS idx_orgs_name_normalized ON organizations(name_normalized);
 CREATE INDEX IF NOT EXISTS idx_orgs_qid ON organizations(qid);
@@ -151,6 +156,7 @@ CREATE INDEX IF NOT EXISTS idx_orgs_source_identifier ON organizations(source_id
 CREATE INDEX IF NOT EXISTS idx_orgs_region_id ON organizations(region_id);
 CREATE INDEX IF NOT EXISTS idx_orgs_entity_type_id ON organizations(entity_type_id);
 CREATE INDEX IF NOT EXISTS idx_orgs_canon_id ON organizations(canon_id);
+CREATE INDEX IF NOT EXISTS idx_orgs_alias_source_id ON organizations(alias_source_id);
 """
 
 # =============================================================================
@@ -228,13 +234,16 @@ SELECT
     o.from_date,
     o.to_date,
     o.canon_id,
-    o.canon_size
+    o.canon_size,
+    als.name as alias_source,
+    o.alias_source_identifier
 FROM organizations o
 JOIN source_types s ON o.source_id = s.id
 LEFT JOIN locations l ON o.region_id = l.id
 LEFT JOIN location_types lt ON l.location_type_id = lt.id
 LEFT JOIN simplified_location_types slt ON lt.simplified_id = slt.id
-JOIN organization_types ot ON o.entity_type_id = ot.id;
+JOIN organization_types ot ON o.entity_type_id = ot.id
+LEFT JOIN source_types als ON o.alias_source_id = als.id;
 """
 
 CREATE_PEOPLE_VIEW = """
@@ -356,6 +365,6 @@ def create_all_tables(conn, embedding_dim: int = 768) -> None:
         conn.execute(ddl)
 
     # Set schema version
-    conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '5')")
+    conn.execute("INSERT OR REPLACE INTO db_info (key, value) VALUES ('schema_version', '6')")
 
     conn.commit()

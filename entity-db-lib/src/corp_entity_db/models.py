@@ -118,6 +118,8 @@ class CompanyRecord(BaseModel):
     from_date: Optional[str] = Field(default=None, description="Start date (ISO format YYYY-MM-DD)")
     to_date: Optional[str] = Field(default=None, description="End date (ISO format YYYY-MM-DD)")
     record: dict[str, Any] = Field(default_factory=dict, description="Original record from source")
+    alias_source: Optional[str] = Field(default=None, description="Alias source type name (e.g., 'wikidata_alias', 'sec_ticker'), NULL for primary records")
+    alias_source_identifier: Optional[str] = Field(default=None, description="Identifier from alias dataset, NULL for primary records")
 
     @property
     def canonical_id(self) -> str:
@@ -252,6 +254,7 @@ class PersonRecord(BaseModel):
     record: dict[str, Any] = Field(default_factory=dict, description="Original record from source")
     canon_size: int = Field(default=1, description="Number of records in canonical group (popularity proxy)")
     matched_record: Optional["PersonRecord"] = Field(default=None, exclude=True, description="The actual indexed record that matched the query, attached when it differs from this canonical record")
+    lookup_method: str = Field(default="", exclude=True, description="How this result was found: composite, name, identity")
 
     @property
     def canonical_id(self) -> str:

@@ -2263,6 +2263,17 @@ class WikidataDumpImporter:
                     f"({start_date or '?'} – {end_date or '?'})"
                 )
 
+        # Extract Wikidata aliases (alternative names in English)
+        aliases_data = entity.get("aliases", {})
+        en_aliases = aliases_data.get("en", [])
+        wikidata_aliases: list[str] = []
+        if en_aliases:
+            label_lower = label.lower()
+            for alias_entry in en_aliases:
+                alias_val = alias_entry.get("value", "").strip() if isinstance(alias_entry, dict) else str(alias_entry).strip()
+                if alias_val and alias_val.lower() != label_lower:
+                    wikidata_aliases.append(alias_val)
+
         record_data: dict[str, Any] = {
             "wikidata_id": qid,
             "label": label,
@@ -2271,6 +2282,8 @@ class WikidataDumpImporter:
             "ticker": ticker,
             "country_qid": country_qid,
         }
+        if wikidata_aliases:
+            record_data["wikidata_aliases"] = wikidata_aliases
         if executives:
             record_data["executives"] = executives
 
@@ -2655,6 +2668,105 @@ class WikidataDumpImporter:
                 logger.info(f"FK relations pass: {count:,} entities with FKs extracted")
 
         logger.info(f"FK relations pass complete: {count:,} entities with FK data")
+
+    def backfill_aliases(
+        self,
+        conn: "sqlite3.Connection",
+        dump_path: Optional[Path] = None,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+    ) -> int:
+        """
+        Scan the dump and backfill wikidata_aliases into existing org record JSON.
+
+        This is a lightweight pass that only reads aliases from entities whose QID
+        matches an existing org. It updates the record JSON in-place (adds/updates
+        the "wikidata_aliases" key) without modifying any other fields.
+
+        Run this followed by `populate-aliases` and `build-index` to get alias
+        search working without a full re-import.
+
+        Args:
+            conn: Writable SQLite connection
+            dump_path: Path to dump file (uses self._dump_path if not provided)
+            progress_callback: Optional callback(entity_index, entity_id)
+
+        Returns:
+            Number of org records updated with aliases
+        """
+        import sqlite3
+
+        path = dump_path or self._dump_path
+        if path is None:
+            raise ValueError("No dump path provided. Call download_dump() first or pass dump_path.")
+
+        # Load existing org QIDs
+        cursor = conn.execute("SELECT qid FROM organizations WHERE qid IS NOT NULL AND alias_source_id IS NULL")
+        org_qids: set[int] = {row[0] for row in cursor}
+        logger.info(f"Loaded {len(org_qids):,} org QIDs to match against")
+
+        updated = 0
+        scanned = 0
+
+        for entity in self.iter_entities(path, progress_callback=progress_callback):
+            if entity.get("type") != "item":
+                continue
+
+            qid_str = entity.get("id", "")
+            if not qid_str or not qid_str.startswith("Q"):
+                continue
+
+            qid_int_str = qid_str[1:]
+            if not qid_int_str.isdigit():
+                continue
+            qid_int = int(qid_int_str)
+
+            if qid_int not in org_qids:
+                continue
+
+            scanned += 1
+
+            # Extract English aliases
+            aliases_data = entity.get("aliases", {})
+            en_aliases = aliases_data.get("en", [])
+            if not en_aliases:
+                continue
+
+            label = entity.get("labels", {}).get("en", {}).get("value", "")
+            label_lower = label.lower() if label else ""
+
+            alias_list: list[str] = []
+            for alias_entry in en_aliases:
+                val = alias_entry.get("value", "").strip() if isinstance(alias_entry, dict) else str(alias_entry).strip()
+                if val and val.lower() != label_lower:
+                    alias_list.append(val)
+
+            if not alias_list:
+                continue
+
+            # Read current record JSON, merge aliases, write back
+            row = conn.execute(
+                "SELECT id, record FROM organizations WHERE qid = ? AND alias_source_id IS NULL",
+                (qid_int,),
+            ).fetchone()
+            if not row:
+                continue
+
+            record_data = json.loads(row[1]) if row[1] and row[1] != "{}" else {}
+            record_data["wikidata_aliases"] = alias_list
+
+            conn.execute(
+                "UPDATE organizations SET record = ? WHERE id = ?",
+                (json.dumps(record_data), row[0]),
+            )
+            updated += 1
+
+            if updated % 10_000 == 0:
+                conn.commit()
+                logger.info(f"Updated {updated:,} org records with aliases (scanned {scanned:,} matching entities)...")
+
+        conn.commit()
+        logger.info(f"Alias backfill complete: {updated:,} orgs updated with aliases (scanned {scanned:,} matching entities)")
+        return updated
 
     def _cache_position_jurisdiction(self, entity: dict) -> None:
         """

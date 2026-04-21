@@ -1030,3 +1030,72 @@ def db_import_wikidata_dump(
 
     click.echo("\nWikidata dump import complete!", err=True)
     click.echo("Run `corp-entity-db post-import` to update search indexes.", err=True)
+
+
+@click.command("backfill-aliases")
+@click.option("--dump", "dump_path", type=click.Path(exists=True), help="Path to Wikidata dump file")
+@click.option("--download", is_flag=True, help="Download the dump if not present")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def db_backfill_aliases(dump_path: Optional[str], download: bool, db_path: Optional[str], verbose: bool):
+    """
+    Backfill Wikidata aliases into existing org record JSON from the dump.
+
+    Scans the Wikidata dump for entities matching existing orgs and writes
+    their English aliases into the record JSON. Follow up with:
+
+    \b
+        corp-entity-db populate-aliases
+        corp-entity-db build-index --no-people
+
+    \b
+    Examples:
+        corp-entity-db backfill-aliases --download
+        corp-entity-db backfill-aliases --dump /path/to/latest-all.json.bz2
+    """
+    import sqlite3
+
+    _configure_logging(verbose)
+
+    from ..importers.wikidata_dump import WikidataDumpImporter
+
+    db_path_obj = _resolve_db_path(db_path)
+    if not db_path_obj.exists():
+        raise click.ClickException(f"Database not found: {db_path_obj}")
+
+    importer = WikidataDumpImporter(dump_path=dump_path)
+
+    if download:
+        click.echo("Downloading Wikidata dump (this may take a while)...", err=True)
+        importer.download_dump()
+
+    if importer._dump_path is None:
+        # Try default cache location
+        default_dump = Path.home() / ".cache" / "corp-extractor" / "wikidata-latest-all.json.bz2"
+        if default_dump.exists():
+            importer._dump_path = default_dump
+        else:
+            raise click.ClickException(
+                "No dump file found. Use --dump /path/to/dump or --download"
+            )
+
+    click.echo(f"Database: {db_path_obj}", err=True)
+    click.echo(f"Dump: {importer._dump_path}", err=True)
+
+    conn = sqlite3.connect(str(db_path_obj))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-500000")
+
+    def progress(entity_index: int, entity_id: str) -> None:
+        if entity_index % 1_000_000 == 0:
+            click.echo(f"  Scanned {entity_index:,} entities...", err=True)
+
+    updated = importer.backfill_aliases(conn, progress_callback=progress)
+    conn.close()
+
+    click.echo(f"\nBackfilled aliases for {updated:,} organizations.", err=True)
+    click.echo("Now run:", err=True)
+    click.echo("  corp-entity-db populate-aliases", err=True)
+    click.echo("  corp-entity-db build-index --no-people", err=True)

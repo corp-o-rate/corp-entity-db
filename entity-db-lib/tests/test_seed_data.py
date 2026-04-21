@@ -52,8 +52,8 @@ def test_seed_all_enums_populates_tables(db_conn):
 
 
 def test_source_types_count():
-    """SOURCE_TYPES should have exactly 4 entries."""
-    assert len(SOURCE_TYPES) == 4
+    """SOURCE_TYPES should have 9 entries (4 primary + 5 alias types)."""
+    assert len(SOURCE_TYPES) == 9
 
 
 def test_organization_types_count():

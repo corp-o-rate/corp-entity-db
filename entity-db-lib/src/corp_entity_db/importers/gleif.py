@@ -53,12 +53,12 @@ class GleifImporter:
     - INTERNATIONAL_ORGANIZATION -> INTERNATIONAL_ORG
     """
 
-    def __init__(self, active_only: bool = True):
+    def __init__(self, active_only: bool = False):
         """
         Initialize the GLEIF importer.
 
         Args:
-            active_only: Only import ACTIVE entities (default True)
+            active_only: Only import ACTIVE entities
         """
         self._active_only = active_only
 

@@ -108,7 +108,7 @@ class CompaniesHouseImporter:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        active_only: bool = True,
+        active_only: bool = False,
         delay_seconds: float = 0.6,  # API rate limit is ~600/min
     ):
         """
@@ -116,7 +116,7 @@ class CompaniesHouseImporter:
 
         Args:
             api_key: Companies House API key (or set COMPANIES_HOUSE_API_KEY env var)
-            active_only: Only import active companies (default True)
+            active_only: Only import active companies
             delay_seconds: Delay between requests to respect rate limits
         """
         self._api_key = api_key or os.environ.get("COMPANIES_HOUSE_API_KEY")
@@ -322,10 +322,6 @@ class CompaniesHouseImporter:
             if self._active_only and not company_status.startswith(ACTIVE_STATUS_PREFIXES):
                 return None
 
-            # Filter to only include actual companies (not sole traders, individuals, etc.)
-            if company_type and not company_type.startswith(COMPANY_TYPE_PREFIXES):
-                return None
-
             # Get address info
             address = item.get("registered_office_address") or item.get("address", {})
             if isinstance(address, dict):
@@ -393,10 +389,6 @@ class CompaniesHouseImporter:
             company_name = company_name.strip()
 
             if self._active_only and not company_status.startswith(ACTIVE_STATUS_PREFIXES):
-                return None
-
-            # Filter to only include actual companies (not sole traders, individuals, etc.)
-            if company_type and not company_type.startswith(COMPANY_TYPE_PREFIXES):
                 return None
 
             # Determine entity type from company_type

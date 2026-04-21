@@ -128,10 +128,12 @@ class OrganizationResolver:
             # Embed the org name
             query_embedding = embedder.embed(org_name)
 
-            # Search with embeddings-only (fast KNN MATCH path)
+            # Search with embeddings + alias name lookup
             results = database.search(
                 query_embedding,
                 top_k=self._top_k,
+                query_name=org_name,
+                embedder=embedder,
             )
 
             # Filter by similarity threshold
@@ -188,6 +190,8 @@ class OrganizationResolver:
             results = database.search(
                 query_embedding,
                 top_k=top_k or self._top_k,
+                query_name=org_name,
+                embedder=embedder,
             )
             return [(r, s) for r, s in results if s >= self._min_similarity]
         except Exception as e:

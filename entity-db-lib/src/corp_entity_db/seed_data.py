@@ -15,6 +15,12 @@ SOURCE_TYPES: list[tuple[int, str]] = [
     (2, "sec_edgar"),
     (3, "companies_house"),
     (4, "wikidata"),
+    # Alias source types (used in organizations.alias_source_id)
+    (5, "wikidata_alias"),
+    (6, "gleif_other_name"),
+    (7, "sec_ticker"),
+    (8, "wiki_anchor"),
+    (9, "paranames"),
 ]
 
 # Mapping from old v1 source names to v2 source IDs
@@ -25,6 +31,12 @@ SOURCE_NAME_TO_ID: dict[str, int] = {
     "wikidata": 4,
     # Legacy name mapping (v1 used "wikipedia" for Wikidata sources)
     "wikipedia": 4,
+    # Alias source types
+    "wikidata_alias": 5,
+    "gleif_other_name": 6,
+    "sec_ticker": 7,
+    "wiki_anchor": 8,
+    "paranames": 9,
 }
 
 SOURCE_ID_TO_NAME: dict[int, str] = {
@@ -32,6 +44,11 @@ SOURCE_ID_TO_NAME: dict[int, str] = {
     2: "sec_edgar",
     3: "companies_house",
     4: "wikidata",
+    5: "wikidata_alias",
+    6: "gleif_other_name",
+    7: "sec_ticker",
+    8: "wiki_anchor",
+    9: "paranames",
 }
 
 # =============================================================================
