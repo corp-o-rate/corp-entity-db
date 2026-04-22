@@ -469,8 +469,11 @@ def download_database(
     import json as json_mod
 
     for base in USEARCH_INDEX_BASES:
+        # Manifest download is best-effort: a 404 is expected for bases that were
+        # never sharded (e.g. organizations_usearch). Narrow the try/except to just
+        # the manifest HEAD/GET so shard download failures below are NOT swallowed.
         manifest_name = f"{base}_v{DB_VERSION}_shards.json"
-        manifest_downloaded = False
+        manifest_path = None
         try:
             manifest_path = hf_hub_download(
                 repo_id=repo_id, filename=manifest_name,
@@ -478,9 +481,13 @@ def download_database(
                 force_download=force_download, repo_type="dataset",
             )
             logger.info(f"Downloaded shard manifest: {manifest_name}")
-            manifest_downloaded = True
+        except Exception as e:
+            logger.info(f"No shard manifest for {base} ({e}) — will use monolithic")
 
-            # Download each shard file listed in the manifest
+        if manifest_path is not None:
+            # Shards: fail fast. A mid-loop failure would leave the index half-populated
+            # and silently degrade search quality — preferable to crash here with a
+            # clear ENOSPC/HTTP/etc. stack trace than to ship a broken download.
             with open(manifest_path) as f:
                 manifest = json_mod.load(f)
             for shard_info in manifest["shards"]:
@@ -493,13 +500,7 @@ def download_database(
                 shard_size_mb = Path(shard_path).stat().st_size / 1024**2
                 label = "hot" if shard_info.get("hot") else "cold"
                 logger.info(f"Downloaded shard {shard_name} ({label}, {shard_size_mb:.0f} MB)")
-
-        except Exception as e:
-            logger.info(f"No shard manifest for {base} ({e}) — falling back to monolithic")
-
-        # Monolithic is only needed when no shards were fetched — ShardedIndex.load()
-        # prefers the shard manifest when present, so the monolithic would be dead weight.
-        if manifest_downloaded:
+            # Shards complete — ShardedIndex.load() prefers them, so skip the monolithic.
             continue
 
         idx_name = f"{base}_v{DB_VERSION}.bin"

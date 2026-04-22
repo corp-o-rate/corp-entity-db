@@ -5,7 +5,7 @@ Provides embedding-based search using USearch HNSW indexes,
 with data sourced from GLEIF, SEC EDGAR, Companies House, and Wikidata.
 """
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 from corp_entity_db.store import (
     OrganizationDatabase,
