@@ -20,8 +20,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 ARG HF_TOKEN
 ENV HF_TOKEN=${HF_TOKEN}
 
-# Pre-download database + USearch indexes from HuggingFace
-RUN python -c "from corp_entity_db.hub import download_database; path = download_database(); print(f'Database downloaded to {path}')"
+# Pre-download database + USearch indexes (shard manifests, shards, monolithic fallback) from HuggingFace
+COPY predownload.py .
+RUN python predownload.py
 
 # Pre-download embedding model (google/embeddinggemma-300m)
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('google/embeddinggemma-300m'); print('Embedding model downloaded')"

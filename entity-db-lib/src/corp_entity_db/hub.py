@@ -485,22 +485,23 @@ def download_database(
                 manifest = json_mod.load(f)
             for shard_info in manifest["shards"]:
                 shard_name = shard_info["filename"]
-                try:
-                    shard_path = hf_hub_download(
-                        repo_id=repo_id, filename=shard_name,
-                        revision=revision, cache_dir=str(cache_dir),
-                        force_download=force_download, repo_type="dataset",
-                    )
-                    shard_size_mb = Path(shard_path).stat().st_size / 1024**2
-                    label = "hot" if shard_info.get("hot") else "cold"
-                    logger.info(f"Downloaded shard {shard_name} ({label}, {shard_size_mb:.0f} MB)")
-                except Exception as e:
-                    logger.warning(f"Shard {shard_name} not available: {e}")
+                shard_path = hf_hub_download(
+                    repo_id=repo_id, filename=shard_name,
+                    revision=revision, cache_dir=str(cache_dir),
+                    force_download=force_download, repo_type="dataset",
+                )
+                shard_size_mb = Path(shard_path).stat().st_size / 1024**2
+                label = "hot" if shard_info.get("hot") else "cold"
+                logger.info(f"Downloaded shard {shard_name} ({label}, {shard_size_mb:.0f} MB)")
 
-        except Exception:
-            pass  # No shard manifest — try monolithic
+        except Exception as e:
+            logger.info(f"No shard manifest for {base} ({e}) — falling back to monolithic")
 
-        # Always try monolithic too (for backwards compat / fallback)
+        # Monolithic is only needed when no shards were fetched — ShardedIndex.load()
+        # prefers the shard manifest when present, so the monolithic would be dead weight.
+        if manifest_downloaded:
+            continue
+
         idx_name = f"{base}_v{DB_VERSION}.bin"
         try:
             idx_path = hf_hub_download(
@@ -511,7 +512,6 @@ def download_database(
             idx_size_mb = Path(idx_path).stat().st_size / 1024**2
             logger.info(f"Downloaded {idx_name} ({idx_size_mb:.0f} MB)")
         except Exception as e:
-            if not manifest_downloaded:
-                logger.warning(f"USearch index {idx_name} not available: {e} — rebuild with: corp-entity-db build-index")
+            logger.warning(f"USearch index {idx_name} not available: {e} — rebuild with: corp-entity-db build-index")
 
     return Path(local_path)
