@@ -16,15 +16,13 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# HuggingFace token for gated model access (needed for both DB download and model download)
+# HuggingFace token for gated model access (needed for embedding model + runtime DB download)
 ARG HF_TOKEN
 ENV HF_TOKEN=${HF_TOKEN}
 
-# Pre-download database + USearch indexes (shard manifests, shards, monolithic fallback) from HuggingFace
-COPY predownload.py .
-RUN python predownload.py
-
-# Pre-download embedding model (google/embeddinggemma-300m)
+# Pre-download embedding model (google/embeddinggemma-300m, ~1 GB) — kept in image to avoid
+# cold-start latency. Database + USearch indexes (~100 GB) are NOT baked in; they download
+# on first boot via get_database_path(auto_download=True) in handler.py.
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('google/embeddinggemma-300m'); print('Embedding model downloaded')"
 
 # Copy handler
