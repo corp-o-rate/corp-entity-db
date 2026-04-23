@@ -7,6 +7,17 @@ if [ -z "$1" ]; then
   exit 1
 fi
 
-DOCKER_BUILDKIT=1 docker build --build-arg HF_TOKEN=$HF_TOKEN --platform linux/amd64 -t corp-entity-db-runpod .
+if [ -z "$HF_TOKEN" ]; then
+  echo "ERROR: HF_TOKEN env var must be set (needed to download the gated embedding model)."
+  echo "Get a token at https://huggingface.co/settings/tokens"
+  exit 1
+fi
+
+# HF_TOKEN is passed as a BuildKit secret — NOT a build-arg — so it is never baked
+# into any image layer. See docker/dockerfile:1.4 --mount=type=secret in the Dockerfile.
+DOCKER_BUILDKIT=1 docker build \
+  --secret id=hf_token,env=HF_TOKEN \
+  --platform linux/amd64 \
+  -t corp-entity-db-runpod .
 docker tag corp-entity-db-runpod neilellis/corp-entity-db-runpod:v$1
 docker push neilellis/corp-entity-db-runpod:v$1

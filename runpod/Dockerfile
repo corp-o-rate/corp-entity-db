@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # RunPod Serverless Dockerfile for Entity Database Search
 # Lighter image - no T5-Gemma or GLiNER2 needed, CPU-only
 FROM python:3.11-slim
@@ -16,14 +17,16 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# HuggingFace token for gated model access (needed for embedding model + runtime DB download)
-ARG HF_TOKEN
-ENV HF_TOKEN=${HF_TOKEN}
-
 # Pre-download embedding model (google/embeddinggemma-300m, ~1 GB) — kept in image to avoid
 # cold-start latency. Database + USearch indexes (~100 GB) are NOT baked in; they download
 # on first boot via get_database_path(auto_download=True) in handler.py.
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('google/embeddinggemma-300m'); print('Embedding model downloaded')"
+#
+# HF_TOKEN is mounted as a BuildKit secret so it never lands in any image layer. The token
+# is only present in the environment of this single RUN command. At runtime the token must
+# come from the RunPod account env (for the DB download) — it is NOT baked into the image.
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN=$(cat /run/secrets/hf_token) \
+    python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('google/embeddinggemma-300m'); print('Embedding model downloaded')"
 
 # Copy handler
 COPY handler.py .
