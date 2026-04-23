@@ -14,6 +14,35 @@ interface SearchRequest {
   hybrid?: boolean;
 }
 
+// The RunPod handler returns `{record: {...}, score}` per result with
+// corp-entity-db's internal field names (known_for_role, known_for_org_name,
+// region, source_id). The frontend (ResultCard.tsx) expects flat results with
+// role/organization/country/wikidata_id. Normalize here so the frontend
+// doesn't need to care about the backend's shape.
+function normalizeResults(payload: unknown): unknown {
+  if (!payload || typeof payload !== 'object') return payload;
+  const p = payload as Record<string, unknown>;
+  const results = p.results;
+  if (!Array.isArray(results)) return payload;
+  p.results = results.map((r) => {
+    if (!r || typeof r !== 'object') return r;
+    const item = r as Record<string, unknown>;
+    const rec = (item.record ?? {}) as Record<string, unknown>;
+    const source = rec.source as string | undefined;
+    const sourceId = rec.source_id as string | undefined;
+    return {
+      ...rec,
+      score: item.score,
+      role: rec.known_for_role ?? rec.role,
+      organization: rec.known_for_org_name ?? rec.organization,
+      country: rec.country ?? rec.region,
+      wikidata_id: source === 'wikidata' ? sourceId : undefined,
+      canonical_id: (rec.record as { canon_id?: number } | undefined)?.canon_id,
+    };
+  });
+  return payload;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body: SearchRequest = await request.json();
@@ -45,7 +74,7 @@ export async function POST(request: NextRequest) {
 
         if (localResponse.ok) {
           const data = await localResponse.json();
-          return NextResponse.json(data);
+          return NextResponse.json(normalizeResults(data));
         }
 
         console.warn(`Local server returned ${localResponse.status}`);
@@ -84,7 +113,7 @@ export async function POST(request: NextRequest) {
 
         // If completed immediately
         if (job.status === 'COMPLETED' && job.output) {
-          return NextResponse.json(job.output);
+          return NextResponse.json(normalizeResults(job.output));
         }
 
         // Poll for result
@@ -109,7 +138,7 @@ export async function POST(request: NextRequest) {
           console.log(`RunPod job ${job.id} status: ${status.status}`);
 
           if (status.status === 'COMPLETED') {
-            return NextResponse.json(status.output);
+            return NextResponse.json(normalizeResults(status.output));
           }
 
           if (status.status === 'FAILED') {
