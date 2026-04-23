@@ -8,9 +8,20 @@ the corp-entity-db database with USearch HNSW indexes.
 import hashlib
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Optional
+
+# RunPod mounts network volumes at /workspace regardless of template config
+# (runpodctl currently ignores --volume-mount-path for serverless). hub.py writes
+# to ~/.cache/corp-extractor — point that at the volume so the ~100 GB DB +
+# index download persists across workers instead of hitting the 20 GB container disk.
+_CACHE_LINK = Path.home() / ".cache" / "corp-extractor"
+if Path("/workspace").is_dir() and not _CACHE_LINK.exists():
+    _CACHE_LINK.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink("/workspace", _CACHE_LINK)
 
 import runpod
 
