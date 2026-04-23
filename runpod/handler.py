@@ -168,19 +168,16 @@ def search_organizations(query: str, limit: int) -> list[dict]:
 
 
 def search_people(query: str, limit: int, role: str = None, org: str = None, person_type: str = None) -> list[dict]:
-    """Search people using composite embedding similarity (name + role + org) with identity fallback."""
-    from corp_entity_db.store import format_person_query
-
+    """Search people using composite embedding + SQL name-lookup fallback + description disambiguation."""
     embedding = embedder.embed_composite_person(query, role=role, org=org)
-
-    # Identity embedding for fallback (name + type if provided)
-    identity_text = format_person_query(query, person_type=person_type)
-    identity_embedding = embedder.embed_for_identity_index(identity_text)
-
     results = person_db.search(
         query_embedding=embedding,
         top_k=limit,
-        identity_query_embedding=identity_embedding,
+        query_name=query,
+        embedder=embedder,
+        query_person_type=person_type,
+        query_role=role,
+        query_org=org,
     )
     return [
         {"record": record.model_dump(mode="json"), "score": float(score)}
