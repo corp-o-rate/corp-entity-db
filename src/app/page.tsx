@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { Header } from '@/components/header';
 import { Footer } from '@/components/footer';
 import { SearchBar, EntityType } from '@/components/SearchBar';
@@ -37,6 +37,28 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
   const [searchTime, setSearchTime] = useState<number | null>(null);
+
+  // Pre-warm the RunPod worker on load if we haven't in the last hour. The
+  // first cold-start pulls ~100GB HF cache and can take minutes; firing a
+  // dummy request from the browser means the worker is usually warm by the
+  // time the user submits a real query.
+  useEffect(() => {
+    const PREWARM_KEY = 'corp-entity-db:lastPrewarm';
+    const PREWARM_TTL_MS = 60 * 60 * 1000;
+    try {
+      const last = Number(localStorage.getItem(PREWARM_KEY) ?? 0);
+      if (Date.now() - last < PREWARM_TTL_MS) return;
+      localStorage.setItem(PREWARM_KEY, String(Date.now()));
+    } catch {
+      return;
+    }
+    fetch('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'warmup', type: 'org', limit: 1, hybrid: false }),
+      keepalive: true,
+    }).catch(() => {});
+  }, []);
 
   const handleSearch = useCallback(async () => {
     if (!query.trim()) return;

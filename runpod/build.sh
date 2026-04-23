@@ -15,9 +15,17 @@ fi
 
 # HF_TOKEN is passed as a BuildKit secret — NOT a build-arg — so it is never baked
 # into any image layer. See docker/dockerfile:1.4 --mount=type=secret in the Dockerfile.
-DOCKER_BUILDKIT=1 docker build \
+#
+# --provenance=false --sbom=false disable BuildKit's attestation manifest. The default
+# output is an OCI image index containing an "unknown/unknown" attestation manifest;
+# RunPod's image puller has been seen to hang on "pending" when pulling that format.
+# Plain single-manifest images pull reliably.
+DOCKER_BUILDKIT=1 docker buildx build \
   --secret id=hf_token,env=HF_TOKEN \
   --platform linux/amd64 \
+  --provenance=false \
+  --sbom=false \
+  --load \
   -t corp-entity-db-runpod .
 docker tag corp-entity-db-runpod neilellis/corp-entity-db-runpod:v$1
 docker push neilellis/corp-entity-db-runpod:v$1
