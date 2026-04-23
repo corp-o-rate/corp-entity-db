@@ -9,19 +9,58 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
-# RunPod mounts network volumes at /workspace regardless of template config
-# (runpodctl currently ignores --volume-mount-path for serverless). hub.py writes
-# to ~/.cache/corp-extractor — point that at the volume so the ~100 GB DB +
-# index download persists across workers instead of hitting the 20 GB container disk.
-_CACHE_LINK = Path.home() / ".cache" / "corp-extractor"
-if Path("/workspace").is_dir() and not _CACHE_LINK.exists():
-    _CACHE_LINK.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink("/workspace", _CACHE_LINK)
+# Route the ~100 GB DB + index download to the network volume, not container disk.
+# RunPod mounts the endpoint's network volume at the template's volumeMountPath
+# (defaults to /workspace for runpodctl-created templates).
+#
+# Strategy: probe several candidate mount paths, and if we find a volume with
+# enough space, monkey-patch corp_entity_db.hub.DEFAULT_CACHE_DIR BEFORE the
+# module's functions read it. Loud logging so we can diagnose from RunPod logs
+# when the volume isn't where we expect.
+print("=" * 60)
+print("[handler-init] probing mount paths for network volume")
+for _p in ("/workspace", "/runpod-volume", "/mnt/workspace", "/runpod/workspace"):
+    _P = Path(_p)
+    if _P.exists():
+        try:
+            _usage = shutil.disk_usage(_p)
+            _free_gb = _usage.free / 1024 ** 3
+            _is_mount = os.path.ismount(_p)
+            print(f"[handler-init]   {_p}: exists=True is_dir={_P.is_dir()} is_mount={_is_mount} free={_free_gb:.1f} GB")
+        except Exception as _e:
+            print(f"[handler-init]   {_p}: exists=True but stat failed: {_e}")
+    else:
+        print(f"[handler-init]   {_p}: does not exist")
+
+_HOME_FREE_GB = shutil.disk_usage(str(Path.home())).free / 1024 ** 3
+print(f"[handler-init] $HOME ({Path.home()}) free: {_HOME_FREE_GB:.1f} GB")
+
+# Pick the mount with the most free space that looks like a volume (>=100 GB free).
+_VOLUME = None
+for _p in ("/workspace", "/runpod-volume", "/mnt/workspace"):
+    _P = Path(_p)
+    if _P.is_dir():
+        _free_gb = shutil.disk_usage(_p).free / 1024 ** 3
+        if _free_gb >= 100:
+            _VOLUME = _P
+            print(f"[handler-init] selected volume: {_p} ({_free_gb:.1f} GB free)")
+            break
+
+if _VOLUME is not None:
+    # Monkey-patch BEFORE hub is imported elsewhere — hub.DEFAULT_CACHE_DIR is read
+    # at call time by download_database() / get_database_path().
+    import corp_entity_db.hub as _hub
+    _hub.DEFAULT_CACHE_DIR = _VOLUME
+    print(f"[handler-init] hub.DEFAULT_CACHE_DIR = {_VOLUME}")
+else:
+    print("[handler-init] WARNING: no network volume detected — downloads will hit container disk (ENOSPC expected)")
+print("=" * 60)
 
 import runpod
 
