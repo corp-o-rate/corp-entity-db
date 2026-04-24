@@ -60,8 +60,9 @@ export default function Home() {
     }).catch(() => {});
   }, []);
 
-  const handleSearch = useCallback(async () => {
-    if (!query.trim()) return;
+  const runSearch = useCallback(async (q: string, type: EntityType) => {
+    const trimmed = q.trim();
+    if (!trimmed) return;
 
     setIsLoading(true);
     setError(null);
@@ -73,8 +74,8 @@ export default function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          query: query.trim(),
-          type: entityType,
+          query: trimmed,
+          type,
           limit: 20,
           hybrid,
         }),
@@ -96,7 +97,24 @@ export default function Home() {
     } finally {
       setIsLoading(false);
     }
-  }, [query, entityType, hybrid]);
+  }, [hybrid]);
+
+  const handleSearch = useCallback(() => {
+    runSearch(query, entityType);
+  }, [runSearch, query, entityType]);
+
+  const handleEntityTypeChange = useCallback((type: EntityType) => {
+    setEntityType(type);
+    setResults([]);
+    setHasSearched(false);
+    setError(null);
+    setSearchTime(null);
+  }, []);
+
+  const handleExampleClick = useCallback((example: string) => {
+    setQuery(example);
+    runSearch(example, entityType);
+  }, [runSearch, entityType]);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -135,10 +153,11 @@ export default function Home() {
                 query={query}
                 onQueryChange={setQuery}
                 entityType={entityType}
-                onEntityTypeChange={setEntityType}
+                onEntityTypeChange={handleEntityTypeChange}
                 hybrid={hybrid}
                 onHybridChange={setHybrid}
                 onSubmit={handleSearch}
+                onExampleClick={handleExampleClick}
                 isLoading={isLoading}
               />
             </div>

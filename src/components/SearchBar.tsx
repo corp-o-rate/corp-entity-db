@@ -12,6 +12,7 @@ interface SearchBarProps {
   hybrid: boolean;
   onHybridChange: (hybrid: boolean) => void;
   onSubmit: () => void;
+  onExampleClick: (example: string) => void;
   isLoading: boolean;
 }
 
@@ -22,6 +23,13 @@ const entityTypes: { value: EntityType; label: string }[] = [
   { value: 'location', label: 'Locations' },
 ];
 
+const examples: Record<EntityType, string[]> = {
+  org: ['Apple', 'Goldman Sachs', 'BlackRock', 'United Nations', 'MIT'],
+  person: ['Tim Cook', 'Elon Musk', 'Barack Obama', 'Greta Thunberg', 'Taylor Swift'],
+  role: ['CEO', 'Chief Financial Officer', 'Board Member', 'President', 'General Counsel'],
+  location: ['California', 'London', 'New York', 'Tokyo', 'Delaware'],
+};
+
 export function SearchBar({
   query,
   onQueryChange,
@@ -30,6 +38,7 @@ export function SearchBar({
   hybrid,
   onHybridChange,
   onSubmit,
+  onExampleClick,
   isLoading,
 }: SearchBarProps) {
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -83,6 +92,22 @@ export function SearchBar({
           )}
           Search
         </button>
+      </div>
+
+      {/* Quick examples */}
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <span className="text-gray-500 font-medium mr-1">Try:</span>
+        {examples[entityType].map((example) => (
+          <button
+            key={example}
+            type="button"
+            onClick={() => onExampleClick(example)}
+            disabled={isLoading}
+            className="px-3 py-1 border border-gray-200 text-gray-700 hover:border-black hover:text-black disabled:opacity-50 disabled:cursor-not-allowed transition-colors cursor-pointer"
+          >
+            {example}
+          </button>
+        ))}
       </div>
 
       {/* Hybrid toggle */}
