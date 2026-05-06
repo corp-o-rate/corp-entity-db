@@ -178,6 +178,16 @@ export default function Home() {
               </p>
             </div>
 
+            {/* Cold-start warning */}
+            <div className="flex items-start gap-2 p-4 mb-4 border border-amber-200 bg-amber-50 text-amber-800 text-sm">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>
+                <strong className="font-semibold">Heads up:</strong> the search server runs on-demand
+                serverless GPU, so the first query after an idle period can take a minute or two while
+                the worker spins up and loads the model. Subsequent queries are fast.
+              </span>
+            </div>
+
             {/* Search Section */}
             <div className="brutal-card p-6 md:p-8">
               <SearchBar
