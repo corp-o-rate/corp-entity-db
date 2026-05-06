@@ -37,6 +37,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
   const [searchTime, setSearchTime] = useState<number | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
 
   // Pre-warm the RunPod worker on load if we haven't in the last hour. The
@@ -69,39 +70,51 @@ export default function Home() {
     const controller = new AbortController();
     searchAbortRef.current = controller;
 
+    const MAX_RETRIES = 3;
     setIsLoading(true);
     setError(null);
+    setNotice(null);
     setHasSearched(true);
     const start = performance.now();
 
     try {
-      const response = await fetch('/api/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query: trimmed,
-          type,
-          limit: 20,
-          hybrid,
-        }),
-        signal: controller.signal,
-      });
-      if (controller.signal.aborted) return;
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        const response = await fetch('/api/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: trimmed,
+            type,
+            limit: 20,
+            hybrid,
+          }),
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
 
-      if (!response.ok) {
+        if (response.status === 504 && attempt < MAX_RETRIES) {
+          setNotice(`Server timed out — retrying (${attempt + 1}/${MAX_RETRIES})…`);
+          continue;
+        }
+
+        if (!response.ok) {
+          const data = await response.json();
+          if (controller.signal.aborted) return;
+          throw new Error(data.error || `Search failed (${response.status})`);
+        }
+
         const data = await response.json();
         if (controller.signal.aborted) return;
-        throw new Error(data.error || `Search failed (${response.status})`);
+        setNotice(null);
+        setResults(data.results || []);
+        setSearchTime(Math.round(performance.now() - start));
+        return;
       }
-
-      const data = await response.json();
-      if (controller.signal.aborted) return;
-      setResults(data.results || []);
-      setSearchTime(Math.round(performance.now() - start));
     } catch (err) {
       if (controller.signal.aborted) return;
       if (err instanceof DOMException && err.name === 'AbortError') return;
       console.error('Search error:', err);
+      setNotice(null);
       setError(err instanceof Error ? err.message : 'Search failed');
       setResults([]);
       setSearchTime(null);
@@ -124,6 +137,7 @@ export default function Home() {
     setResults([]);
     setHasSearched(false);
     setError(null);
+    setNotice(null);
     setSearchTime(null);
     setIsLoading(false);
   }, []);
@@ -189,6 +203,14 @@ export default function Home() {
               <div className="flex items-center gap-2 p-4 mb-6 border border-red-200 bg-red-50 text-red-700 text-sm">
                 <AlertCircle className="w-4 h-4 shrink-0" />
                 {error}
+              </div>
+            )}
+
+            {/* Transient notice (e.g. retrying after timeout) */}
+            {notice && !error && (
+              <div className="flex items-center gap-2 p-4 mb-6 border border-amber-200 bg-amber-50 text-amber-800 text-sm">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                {notice}
               </div>
             )}
 
