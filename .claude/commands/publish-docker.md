@@ -1,6 +1,6 @@
 ---
 description: Build and publish the RunPod Docker image
-allowed-tools: Bash(cd:*), Bash(./build.sh:*), Bash(echo:*), Bash(git:*), Read, Edit
+allowed-tools: Bash(cd:*), Bash(./build.sh:*), Bash(echo:*), Bash(git:*), Bash(runpodctl:*), Read, Edit
 ---
 
 Build and publish the corp-entity-db RunPod Docker image:
@@ -29,7 +29,25 @@ Build and publish the corp-entity-db RunPod Docker image:
    ```
    This builds for linux/amd64, tags as `neilellis/corp-entity-db-runpod:v{version}`, and pushes to Docker Hub.
 
-6. **Post-publish:**
+6. **Update the RunPod template image (use the `runpodctl` skill):**
+   Production endpoints don't auto-pick-up new image tags — the deployed template's image field has to be updated so new workers pull the new tag. Use the `runpodctl` skill (`/Users/neil/.claude/skills/runpodctl/SKILL.md`) for this.
+
+   First find the template id — it's a user-owned template whose name includes `corp-entity-db`:
+   ```bash
+   runpodctl template list --type user
+   ```
+
+   Then point it at the freshly-pushed image:
+   ```bash
+   runpodctl template update <template-id> --image neilellis/corp-entity-db-runpod:v{version}
+   ```
+
+   Workers spun up after this update will use the new image. To force currently-running workers to recycle, wait for the endpoint's idle-timeout, or send a few queries to drain old workers. You can list endpoints/workers with:
+   ```bash
+   runpodctl serverless list --include-workers
+   ```
+
+7. **Post-publish:**
    - Commit any changes to `runpod/requirements.txt` if it was updated, and push to Github.
 
-**Note:** Requires Docker Hub credentials (`docker login`) and `HF_TOKEN` environment variable for gated model access.
+**Note:** Requires Docker Hub credentials (`docker login`) and `HF_TOKEN` environment variable for gated model access. The `runpodctl` step also requires the CLI to be installed and authenticated (`runpodctl doctor` to verify).
