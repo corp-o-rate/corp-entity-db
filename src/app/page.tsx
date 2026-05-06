@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Header } from '@/components/header';
 import { Footer } from '@/components/footer';
 import { SearchBar, EntityType } from '@/components/SearchBar';
@@ -37,6 +37,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
   const [searchTime, setSearchTime] = useState<number | null>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
 
   // Pre-warm the RunPod worker on load if we haven't in the last hour. The
   // first cold-start pulls ~100GB HF cache and can take minutes; firing a
@@ -64,6 +65,10 @@ export default function Home() {
     const trimmed = q.trim();
     if (!trimmed) return;
 
+    searchAbortRef.current?.abort();
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
+
     setIsLoading(true);
     setError(null);
     setHasSearched(true);
@@ -79,6 +84,7 @@ export default function Home() {
           limit: 20,
           hybrid,
         }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -90,12 +96,16 @@ export default function Home() {
       setResults(data.results || []);
       setSearchTime(Math.round(performance.now() - start));
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
       console.error('Search error:', err);
       setError(err instanceof Error ? err.message : 'Search failed');
       setResults([]);
       setSearchTime(null);
     } finally {
-      setIsLoading(false);
+      if (searchAbortRef.current === controller) {
+        searchAbortRef.current = null;
+        setIsLoading(false);
+      }
     }
   }, [hybrid]);
 
@@ -104,11 +114,14 @@ export default function Home() {
   }, [runSearch, query, entityType]);
 
   const handleEntityTypeChange = useCallback((type: EntityType) => {
+    searchAbortRef.current?.abort();
+    searchAbortRef.current = null;
     setEntityType(type);
     setResults([]);
     setHasSearched(false);
     setError(null);
     setSearchTime(null);
+    setIsLoading(false);
   }, []);
 
   const handleExampleClick = useCallback((example: string) => {
