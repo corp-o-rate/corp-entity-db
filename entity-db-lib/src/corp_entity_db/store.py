@@ -12,6 +12,7 @@ import re
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -80,6 +81,23 @@ class MergedSearchResults:
     """Duck-type compatible with USearch search results."""
     keys: np.ndarray
     distances: np.ndarray
+
+
+def _prewarm_file(path: Path) -> None:
+    """Read the file sequentially so its bytes land in the kernel page cache.
+
+    Index.restore(view=True) only mmaps; HNSW graph bytes page in lazily during
+    search, which is catastrophic on a network volume (random-read ~10M-vector
+    shard during graph traversal = 60-80s). Touching the file once at init
+    pre-populates the page cache so the first real query is fast.
+    """
+    t0 = time.monotonic()
+    size_bytes = 0
+    with open(path, "rb") as f:
+        while chunk := f.read(8 * 1024 * 1024):
+            size_bytes += len(chunk)
+    dt = time.monotonic() - t0
+    logger.info(f"Prewarmed {path.name}: {size_bytes / 1024**3:.2f} GB in {dt:.1f}s")
 
 
 class ShardedIndex:
@@ -184,11 +202,34 @@ class ShardedIndex:
             self._cold_shards[shard_idx] = idx
         return idx
 
-    def search(self, query, top_k: int, score_threshold: float = 0.95) -> MergedSearchResults:
-        """Search hot shard first; progressively search cold shards if needed.
+    def preload_all(self) -> None:
+        """Load and prewarm every shard (hot + all cold) into the page cache.
 
-        Cold shards are mmap'd with enable_key_lookups=False and cached — the OS
-        manages physical memory via page faults, so caching is safe.
+        Call from handler initialize() so query latency doesn't pay for it.
+        Safe to call multiple times — _get_cold_shard caches indexes.
+        """
+        if not self._is_sharded:
+            if self._monolithic is not None:
+                _prewarm_file(self._cache_dir / f"{self._base_name}.bin")
+            return
+
+        hot = next(s for s in self._manifest["shards"] if s["hot"])
+        _prewarm_file(self._cache_dir / hot["filename"])
+
+        for shard_info in self._manifest["shards"]:
+            if shard_info["hot"]:
+                continue
+            idx = self._get_cold_shard(shard_info)
+            if idx is not None:
+                _prewarm_file(self._cache_dir / shard_info["filename"])
+
+    def search(self, query, top_k: int, score_threshold: float = 0.95) -> MergedSearchResults:
+        """Search hot shard first; if not good enough, search all cold shards in parallel.
+
+        Cold shards are mmap'd with enable_key_lookups=False and cached. With
+        preload_all() called at handler init, the bytes are already paged in
+        and per-shard search is fast (~10-50ms), so we run cold shards in
+        parallel rather than progressively-with-early-stopping.
         """
         if not self._is_sharded:
             # Monolithic path
@@ -204,28 +245,24 @@ class ShardedIndex:
             logger.debug(f"Hot shard sufficient (best={best_similarity:.3f} >= {score_threshold})")
             return hot_results
 
-        # Progressively search cold shards with early stopping
-        all_keys = [hot_results.keys]
-        all_dists = [hot_results.distances]
-
+        # Search all cold shards in parallel
         cold_shards = [s for s in self._manifest["shards"] if not s["hot"]]
-        logger.info(f"Searching {len(cold_shards)} cold shards progressively (best hot={best_similarity:.3f})")
+        logger.info(f"Searching {len(cold_shards)} cold shards in parallel (best hot={best_similarity:.3f})")
 
-        for shard_info in cold_shards:
+        def _search_one(shard_info):
             idx = self._get_cold_shard(shard_info)
             if idx is None:
-                continue
-            results = idx.search(query, min(top_k, len(idx)))
-            all_keys.append(results.keys)
-            all_dists.append(results.distances)
+                return None
+            return idx.search(query, min(top_k, len(idx)))
 
-            # Check if we now have a good enough result to stop early
-            shard_best = 1.0 - float(results.distances[0]) if len(results.keys) > 0 else 0.0
-            if shard_best > best_similarity:
-                best_similarity = shard_best
-            if best_similarity >= score_threshold:
-                logger.debug(f"Cold shard early stop (best={best_similarity:.3f} >= {score_threshold})")
-                break
+        all_keys = [hot_results.keys]
+        all_dists = [hot_results.distances]
+        with ThreadPoolExecutor(max_workers=len(cold_shards)) as pool:
+            for results in pool.map(_search_one, cold_shards):
+                if results is None:
+                    continue
+                all_keys.append(results.keys)
+                all_dists.append(results.distances)
 
         # Merge by distance ascending (closest first), take top_k
         merged_keys = np.concatenate(all_keys)
@@ -3307,7 +3344,10 @@ class PersonDatabase:
         # Fetch extra to account for same-QID entries collapsing to one canon_id
         fetch_k = min(top_k * 10, len(self._hnsw_index))
 
-        matches = self._hnsw_index.search(query_int8, fetch_k)
+        # Lower threshold than the 0.95 default: composite-people scores often
+        # land in 0.80-0.90 even for the right person, so 0.85 lets the hot
+        # shard short-circuit cold sweep when it has a confident match.
+        matches = self._hnsw_index.search(query_int8, fetch_k, score_threshold=0.85)
 
         # Collect best-scoring entry per canon_id (not just the first)
         best_per_canon: dict[int, tuple[int, float]] = {}  # canon_id -> (person_id, similarity)

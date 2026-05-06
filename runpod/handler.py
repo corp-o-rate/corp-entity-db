@@ -153,6 +153,27 @@ def initialize():
 
     logger.info("All databases initialized")
 
+    # Eager-load + prewarm HNSW indexes so the first query doesn't pay for
+    # mmap page-faulting from the network volume. Without this the first
+    # search of each shard takes 60-80s while the kernel pages in graph bytes
+    # on demand. Reading the file once here pre-populates the page cache.
+    logger.info("Eager-loading + prewarming HNSW indexes...")
+    t0 = time.time()
+
+    org_db._load_hnsw_index()
+    if org_db._hnsw_index is not None:
+        org_db._hnsw_index.preload_all()
+
+    person_db._load_hnsw_index()
+    if person_db._hnsw_index is not None:
+        person_db._hnsw_index.preload_all()
+
+    person_db._load_identity_hnsw_index()
+    if person_db._identity_hnsw_index is not None:
+        person_db._identity_hnsw_index.preload_all()
+
+    logger.info(f"All HNSW indexes ready in {time.time() - t0:.1f}s")
+
 
 def search_organizations(query: str, limit: int) -> list[dict]:
     """Search organizations using embedding similarity."""
