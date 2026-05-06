@@ -86,16 +86,20 @@ export default function Home() {
         }),
         signal: controller.signal,
       });
+      if (controller.signal.aborted) return;
 
       if (!response.ok) {
         const data = await response.json();
+        if (controller.signal.aborted) return;
         throw new Error(data.error || `Search failed (${response.status})`);
       }
 
       const data = await response.json();
+      if (controller.signal.aborted) return;
       setResults(data.results || []);
       setSearchTime(Math.round(performance.now() - start));
     } catch (err) {
+      if (controller.signal.aborted) return;
       if (err instanceof DOMException && err.name === 'AbortError') return;
       console.error('Search error:', err);
       setError(err instanceof Error ? err.message : 'Search failed');
