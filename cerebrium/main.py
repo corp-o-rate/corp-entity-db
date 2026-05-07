@@ -40,6 +40,11 @@ if _VOLUME is not None:
     print(f"[init] hub.DEFAULT_CACHE_DIR = {_VOLUME}")
 else:
     print("[init] WARNING: no volume with >=100 GB free — resize the project volume to 200 GB before sending requests")
+
+_hf_present = bool(os.environ.get("HF_TOKEN"))
+print(f"[init] HF_TOKEN env var present: {_hf_present}")
+if not _hf_present:
+    print("[init] WARNING: HF_TOKEN not in environment — gated model + dataset downloads will fail or be slow")
 print("=" * 60)
 
 from corp_entity_db.embeddings import CompanyEmbedder
