@@ -26,10 +26,11 @@ provider = "aws"
 region = "us-east-1"
 
 [cerebrium.scaling]
-min_replicas = 0          # scale to zero between requests
-max_replicas = 1          # demo workload — one is plenty
-cooldown = 60             # idle seconds before scale-down
-replica_concurrency = 4   # concurrent requests per replica
+min_replicas = 0             # scale to zero between requests
+max_replicas = 1             # demo workload — one is plenty
+cooldown = 60                # idle seconds before scale-down
+replica_concurrency = 4      # concurrent requests per replica
+response_grace_period = 3600 # 1h: cold-boot must download ~100 GB from HF (~30 min)
 
 [cerebrium.dependencies.pip]
 "corp-entity-db" = ">=0.6.0"
