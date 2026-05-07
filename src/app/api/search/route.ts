@@ -1,11 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-const RUNPOD_ENDPOINT_ID = process.env.RUNPOD_ENDPOINT_ID;
-const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
+const CEREBRIUM_ENDPOINT_URL = process.env.CEREBRIUM_ENDPOINT_URL;
+const CEREBRIUM_TOKEN = process.env.CEREBRIUM_TOKEN;
 const LOCAL_SERVER_URL = process.env.LOCAL_SERVER_URL;
-
-const POLL_INTERVAL = 2000;
-const MAX_POLLS = 30;
 
 interface SearchRequest {
   query: string;
@@ -83,78 +80,36 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Try RunPod
-    if (RUNPOD_ENDPOINT_ID && RUNPOD_API_KEY) {
+    // Try Cerebrium. Sync POST — handler runs to completion server-side.
+    // Cerebrium wraps the response as { run_id, result, run_time_ms }; the
+    // handler's actual payload is in `result`.
+    if (CEREBRIUM_ENDPOINT_URL && CEREBRIUM_TOKEN) {
       try {
-        console.log(`Submitting search job to RunPod: type=${type} query="${query}"`);
+        console.log(`Calling Cerebrium: type=${type} query="${query}"`);
+        const cerebriumResponse = await fetch(CEREBRIUM_ENDPOINT_URL, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${CEREBRIUM_TOKEN}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ query, type, limit, hybrid }),
+        });
 
-        const runpodResponse = await fetch(
-          `https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/run`,
-          {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${RUNPOD_API_KEY}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              input: { query, type, limit, hybrid },
-            }),
-          }
-        );
-
-        if (!runpodResponse.ok) {
-          const errorText = await runpodResponse.text();
-          console.error(`RunPod API error: status=${runpodResponse.status}, body=${errorText}`);
-          throw new Error(`RunPod API error: ${runpodResponse.status}`);
+        if (!cerebriumResponse.ok) {
+          const errorText = await cerebriumResponse.text();
+          console.error(`Cerebrium error: status=${cerebriumResponse.status}, body=${errorText}`);
+          throw new Error(`Cerebrium error: ${cerebriumResponse.status}`);
         }
 
-        const job = await runpodResponse.json();
-        console.log(`RunPod job submitted: ${job.id}, status: ${job.status}`);
-
-        // If completed immediately
-        if (job.status === 'COMPLETED' && job.output) {
-          return NextResponse.json(normalizeResults(job.output));
-        }
-
-        // Poll for result
-        for (let i = 0; i < MAX_POLLS; i++) {
-          await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-
-          const statusResponse = await fetch(
-            `https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/status/${job.id}`,
-            {
-              headers: {
-                'Authorization': `Bearer ${RUNPOD_API_KEY}`,
-              },
-            }
-          );
-
-          if (!statusResponse.ok) {
-            console.error(`RunPod status check failed: ${statusResponse.status}`);
-            continue;
-          }
-
-          const status = await statusResponse.json();
-          console.log(`RunPod job ${job.id} status: ${status.status}`);
-
-          if (status.status === 'COMPLETED') {
-            return NextResponse.json(normalizeResults(status.output));
-          }
-
-          if (status.status === 'FAILED') {
-            throw new Error(status.error || 'RunPod job failed');
-          }
-        }
-
-        return NextResponse.json(
-          { error: 'Search timed out' },
-          { status: 504 }
-        );
-      } catch (runpodError) {
-        console.warn('RunPod unavailable:', runpodError);
+        const envelope = await cerebriumResponse.json();
+        console.log(`Cerebrium run ${envelope.run_id} completed in ${envelope.run_time_ms}ms`);
+        const payload = envelope.result ?? envelope;
+        return NextResponse.json(normalizeResults(payload));
+      } catch (cerebriumError) {
+        console.warn('Cerebrium unavailable:', cerebriumError);
         if (!LOCAL_SERVER_URL) {
           return NextResponse.json(
-            { error: runpodError instanceof Error ? runpodError.message : 'RunPod error' },
+            { error: cerebriumError instanceof Error ? cerebriumError.message : 'Cerebrium error' },
             { status: 502 }
           );
         }
@@ -163,7 +118,7 @@ export async function POST(request: NextRequest) {
 
     // No backend available
     return NextResponse.json(
-      { error: 'No search backend configured. Set LOCAL_SERVER_URL or RUNPOD_ENDPOINT_ID + RUNPOD_API_KEY.' },
+      { error: 'No search backend configured. Set LOCAL_SERVER_URL or CEREBRIUM_ENDPOINT_URL + CEREBRIUM_TOKEN.' },
       { status: 503 }
     );
   } catch (error) {
