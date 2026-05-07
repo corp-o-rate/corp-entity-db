@@ -1,0 +1,36 @@
+name: Cerebrium deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - cerebrium/**
+      - .github/workflows/cerebrium-deploy.yml
+  workflow_dispatch:
+
+concurrency:
+  group: cerebrium-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CEREBRIUM_SERVICE_ACCOUNT_TOKEN: ${{ secrets.CEREBRIUM_SERVICE_ACCOUNT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Cerebrium CLI
+        run: pip install --quiet cerebrium
+
+      - name: Verify auth
+        run: cerebrium projects current
+
+      - name: Deploy
+        working-directory: cerebrium
+        run: cerebrium deploy -y --disable-confirmation
