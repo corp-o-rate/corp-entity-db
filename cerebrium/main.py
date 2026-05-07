@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -65,6 +66,7 @@ person_db: Optional[PersonDatabase] = None
 roles_db: Optional[RolesDatabase] = None
 locations_db: Optional[LocationsDatabase] = None
 _initialized = False
+_init_lock = threading.Lock()
 
 result_cache: OrderedDict[str, str] = OrderedDict()
 cache_size_bytes = 0
@@ -93,44 +95,49 @@ def _initialize() -> None:
     """Lazy: runs on the first call to search().
 
     Done lazily so Cerebrium can boot the replica even when the volume is too
-    small (allowing the operator to resize without a crash loop).
+    small (allowing the operator to resize without a crash loop). Lock ensures
+    concurrent first-requests (replica_concurrency > 1) don't each kick off
+    their own ~100 GB download.
     """
     global embedder, org_db, person_db, roles_db, locations_db, _initialized
     if _initialized:
         return
+    with _init_lock:
+        if _initialized:
+            return
 
-    logger.info("Initialising entity search handler...")
-    db_path = get_database_path(auto_download=True)
-    if db_path is None:
-        logger.info("Database not found locally, downloading...")
-        db_path = download_database()
-    logger.info(f"Using database at {db_path}")
+        logger.info("Initialising entity search handler...")
+        db_path = get_database_path(auto_download=True)
+        if db_path is None:
+            logger.info("Database not found locally, downloading...")
+            db_path = download_database()
+        logger.info(f"Using database at {db_path}")
 
-    logger.info("Loading embedding model...")
-    embedder = CompanyEmbedder()
-    _ = embedder.embedding_dim
-    logger.info(f"Embedder loaded (dim={embedder.embedding_dim})")
+        logger.info("Loading embedding model...")
+        embedder = CompanyEmbedder()
+        _ = embedder.embedding_dim
+        logger.info(f"Embedder loaded (dim={embedder.embedding_dim})")
 
-    org_db = get_database(db_path=db_path)
-    person_db = get_person_database(db_path=db_path)
-    roles_db = get_roles_database(db_path=db_path)
-    locations_db = get_locations_database(db_path=db_path)
-    logger.info("All databases initialised")
+        org_db = get_database(db_path=db_path)
+        person_db = get_person_database(db_path=db_path)
+        roles_db = get_roles_database(db_path=db_path)
+        locations_db = get_locations_database(db_path=db_path)
+        logger.info("All databases initialised")
 
-    logger.info("Eager-loading + prewarming HNSW indexes...")
-    t0 = time.time()
-    org_db._load_hnsw_index()
-    if org_db._hnsw_index is not None:
-        org_db._hnsw_index.preload_all()
-    person_db._load_hnsw_index()
-    if person_db._hnsw_index is not None:
-        person_db._hnsw_index.preload_all()
-    person_db._load_identity_hnsw_index()
-    if person_db._identity_hnsw_index is not None:
-        person_db._identity_hnsw_index.preload_all()
-    logger.info(f"All HNSW indexes ready in {time.time() - t0:.1f}s")
+        logger.info("Eager-loading + prewarming HNSW indexes...")
+        t0 = time.time()
+        org_db._load_hnsw_index()
+        if org_db._hnsw_index is not None:
+            org_db._hnsw_index.preload_all()
+        person_db._load_hnsw_index()
+        if person_db._hnsw_index is not None:
+            person_db._hnsw_index.preload_all()
+        person_db._load_identity_hnsw_index()
+        if person_db._identity_hnsw_index is not None:
+            person_db._identity_hnsw_index.preload_all()
+        logger.info(f"All HNSW indexes ready in {time.time() - t0:.1f}s")
 
-    _initialized = True
+        _initialized = True
 
 
 def _search_organizations(query: str, limit: int) -> list[dict]:
