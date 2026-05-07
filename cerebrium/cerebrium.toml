@@ -1,0 +1,42 @@
+# Cerebrium app config for corp-entity-db search demo.
+# Mirrors runpod/handler.py — entity search via /persistent-storage.
+#
+# Build context = this directory. Endpoint URL after deploy:
+#   https://api.aws.us-east-1.cerebrium.ai/v4/<project-id>/corp-entity-db/search
+#
+# First deploy auto-creates a 50 GB project volume. The DB + indexes total ~100 GB,
+# so the volume must be resized to ~200 GB BEFORE the first request triggers
+# initialize(). See the cerebrium skill for the resize curl.
+
+[cerebrium.deployment]
+name = "corp-entity-db"
+python_version = "3.11"
+include = ["./main.py", "./cerebrium.toml"]
+exclude = [".git/*", "__pycache__/*", "*.pyc", ".pytest_cache/*"]
+docker_base_image_url = "debian:bookworm-slim"
+
+[cerebrium.hardware]
+# T4 is the cheapest GPU; embedder (google/embeddinggemma-300m) benefits from it.
+# If demo cost matters more than embed throughput, switch compute to "CPU".
+compute = "TURING_T4"
+gpu_count = 1
+cpu = 4
+memory = 16
+provider = "aws"
+region = "us-east-1"
+
+[cerebrium.scaling]
+min_replicas = 0          # scale to zero between requests
+max_replicas = 1          # demo workload — one is plenty
+cooldown = 60             # idle seconds before scale-down
+replica_concurrency = 4   # concurrent requests per replica
+
+[cerebrium.dependencies.pip]
+"corp-entity-db" = ">=0.6.0"
+
+[cerebrium.dependencies.apt]
+# (none)
+
+# Required at runtime via cerebrium secrets:
+#   HF_TOKEN — for the gated google/embeddinggemma-300m model.
+# Set with: cerebrium secrets set HF_TOKEN <token>
