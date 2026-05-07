@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+// Cold-boot of a warm-volume Cerebrium replica still takes ~3-5 min to
+// page-cache ~80 GB of HNSW indexes from /persistent-storage. The default 60s
+// Vercel function timeout returns HTTP 000 mid-cold-boot; 300s is the hobby-
+// plan max and lets one retry usually succeed once the replica is warm.
+export const maxDuration = 300;
+
 const CEREBRIUM_ENDPOINT_URL = process.env.CEREBRIUM_ENDPOINT_URL;
 const CEREBRIUM_TOKEN = process.env.CEREBRIUM_TOKEN;
 const LOCAL_SERVER_URL = process.env.LOCAL_SERVER_URL;
