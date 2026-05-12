@@ -3,7 +3,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { Header } from '@/components/header';
 import { Footer } from '@/components/footer';
-import { SearchBar, EntityType } from '@/components/SearchBar';
+import { SearchBar, EntityType, PersonExample } from '@/components/SearchBar';
 import { ResultCard } from '@/components/ResultCard';
 import { HowItWorks, AboutCorpORate } from '@/components/about-sections';
 import { Database, AlertCircle, BookOpen, Terminal } from 'lucide-react';
@@ -31,6 +31,8 @@ interface SearchResult {
 export default function Home() {
   const [query, setQuery] = useState('');
   const [entityType, setEntityType] = useState<EntityType>('org');
+  const [personRole, setPersonRole] = useState('');
+  const [personOrg, setPersonOrg] = useState('');
   const [hybrid, setHybrid] = useState(false);
   const [results, setResults] = useState<SearchResult[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -62,7 +64,7 @@ export default function Home() {
     }).catch(() => {});
   }, []);
 
-  const runSearch = useCallback(async (q: string, type: EntityType) => {
+  const runSearch = useCallback(async (q: string, type: EntityType, role?: string, org?: string) => {
     const trimmed = q.trim();
     if (!trimmed) return;
 
@@ -79,15 +81,22 @@ export default function Home() {
 
     try {
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        const payload: Record<string, unknown> = {
+          query: trimmed,
+          type,
+          limit: 20,
+          hybrid,
+        };
+        if (type === 'person') {
+          const r = role?.trim();
+          const o = org?.trim();
+          if (r) payload.role = r;
+          if (o) payload.org = o;
+        }
         const response = await fetch('/api/search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            query: trimmed,
-            type,
-            limit: 20,
-            hybrid,
-          }),
+          body: JSON.stringify(payload),
           signal: controller.signal,
         });
         if (controller.signal.aborted) return;
@@ -127,8 +136,8 @@ export default function Home() {
   }, [hybrid]);
 
   const handleSearch = useCallback(() => {
-    runSearch(query, entityType);
-  }, [runSearch, query, entityType]);
+    runSearch(query, entityType, personRole, personOrg);
+  }, [runSearch, query, entityType, personRole, personOrg]);
 
   const handleEntityTypeChange = useCallback((type: EntityType) => {
     searchAbortRef.current?.abort();
@@ -142,9 +151,18 @@ export default function Home() {
     setIsLoading(false);
   }, []);
 
-  const handleExampleClick = useCallback((example: string) => {
-    setQuery(example);
-    runSearch(example, entityType);
+  const handleExampleClick = useCallback((example: string | PersonExample) => {
+    if (typeof example === 'string') {
+      setQuery(example);
+      runSearch(example, entityType);
+      return;
+    }
+    const role = example.role ?? '';
+    const org = example.org ?? '';
+    setQuery(example.name);
+    setPersonRole(role);
+    setPersonOrg(org);
+    runSearch(example.name, 'person', role, org);
   }, [runSearch, entityType]);
 
   return (
@@ -195,6 +213,10 @@ export default function Home() {
                 onQueryChange={setQuery}
                 entityType={entityType}
                 onEntityTypeChange={handleEntityTypeChange}
+                personRole={personRole}
+                onPersonRoleChange={setPersonRole}
+                personOrg={personOrg}
+                onPersonOrgChange={setPersonOrg}
                 hybrid={hybrid}
                 onHybridChange={setHybrid}
                 onSubmit={handleSearch}

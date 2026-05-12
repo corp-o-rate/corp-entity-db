@@ -4,15 +4,25 @@ import { Search, Loader2 } from 'lucide-react';
 
 export type EntityType = 'org' | 'person' | 'role' | 'location';
 
+export interface PersonExample {
+  name: string;
+  role?: string;
+  org?: string;
+}
+
 interface SearchBarProps {
   query: string;
   onQueryChange: (query: string) => void;
   entityType: EntityType;
   onEntityTypeChange: (type: EntityType) => void;
+  personRole: string;
+  onPersonRoleChange: (role: string) => void;
+  personOrg: string;
+  onPersonOrgChange: (org: string) => void;
   hybrid: boolean;
   onHybridChange: (hybrid: boolean) => void;
   onSubmit: () => void;
-  onExampleClick: (example: string) => void;
+  onExampleClick: (example: string | PersonExample) => void;
   isLoading: boolean;
 }
 
@@ -23,18 +33,29 @@ const entityTypes: { value: EntityType; label: string }[] = [
   { value: 'location', label: 'Locations' },
 ];
 
-const examples: Record<EntityType, string[]> = {
+const simpleExamples: Record<Exclude<EntityType, 'person'>, string[]> = {
   org: ['Apple', 'Goldman Sachs', 'BlackRock', 'United Nations', 'MIT'],
-  person: ['Tim Cook', 'Elon Musk', 'Barack Obama', 'Greta Thunberg', 'Taylor Swift'],
   role: ['CEO', 'Chief Financial Officer', 'Board Member', 'President', 'General Counsel'],
   location: ['California', 'London', 'New York', 'Tokyo', 'Delaware'],
 };
+
+const personExamples: PersonExample[] = [
+  { name: 'Tim Cook', role: 'CEO', org: 'Apple' },
+  { name: 'Elon Musk', role: 'CEO', org: 'Tesla' },
+  { name: 'Barack Obama', role: 'President', org: 'United States' },
+  { name: 'Greta Thunberg', role: 'Activist' },
+  { name: 'Taylor Swift', role: 'Singer' },
+];
 
 export function SearchBar({
   query,
   onQueryChange,
   entityType,
   onEntityTypeChange,
+  personRole,
+  onPersonRoleChange,
+  personOrg,
+  onPersonOrgChange,
   hybrid,
   onHybridChange,
   onSubmit,
@@ -94,20 +115,59 @@ export function SearchBar({
         </button>
       </div>
 
+      {/* Optional role + org inputs for people search */}
+      {entityType === 'person' && (
+        <div className="grid sm:grid-cols-2 gap-3">
+          <input
+            type="text"
+            value={personRole}
+            onChange={(e) => onPersonRoleChange(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Role (optional) — e.g. CEO"
+            className="w-full px-3 py-2.5 border border-gray-200 text-sm focus:outline-none focus:border-black transition-colors"
+            disabled={isLoading}
+          />
+          <input
+            type="text"
+            value={personOrg}
+            onChange={(e) => onPersonOrgChange(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Organization (optional) — e.g. Apple"
+            className="w-full px-3 py-2.5 border border-gray-200 text-sm focus:outline-none focus:border-black transition-colors"
+            disabled={isLoading}
+          />
+        </div>
+      )}
+
       {/* Quick examples */}
       <div className="flex flex-wrap items-center gap-2 text-sm">
         <span className="text-gray-500 font-medium mr-1">Try:</span>
-        {examples[entityType].map((example) => (
-          <button
-            key={example}
-            type="button"
-            onClick={() => onExampleClick(example)}
-            disabled={isLoading}
-            className="px-3 py-1 border border-gray-200 text-gray-700 hover:border-black hover:text-black disabled:opacity-50 disabled:cursor-not-allowed transition-colors cursor-pointer"
-          >
-            {example}
-          </button>
-        ))}
+        {entityType === 'person'
+          ? personExamples.map((example) => {
+              const label = [example.name, example.role, example.org].filter(Boolean).join(' · ');
+              return (
+                <button
+                  key={example.name}
+                  type="button"
+                  onClick={() => onExampleClick(example)}
+                  disabled={isLoading}
+                  className="px-3 py-1 border border-gray-200 text-gray-700 hover:border-black hover:text-black disabled:opacity-50 disabled:cursor-not-allowed transition-colors cursor-pointer"
+                >
+                  {label}
+                </button>
+              );
+            })
+          : simpleExamples[entityType].map((example) => (
+              <button
+                key={example}
+                type="button"
+                onClick={() => onExampleClick(example)}
+                disabled={isLoading}
+                className="px-3 py-1 border border-gray-200 text-gray-700 hover:border-black hover:text-black disabled:opacity-50 disabled:cursor-not-allowed transition-colors cursor-pointer"
+              >
+                {example}
+              </button>
+            ))}
       </div>
 
       {/* Hybrid toggle */}

@@ -15,6 +15,8 @@ interface SearchRequest {
   type: 'org' | 'person' | 'role' | 'location';
   limit?: number;
   hybrid?: boolean;
+  role?: string;
+  org?: string;
 }
 
 // The RunPod handler returns `{record: {...}, score}` per result with
@@ -49,7 +51,12 @@ function normalizeResults(payload: unknown): unknown {
 export async function POST(request: NextRequest) {
   try {
     const body: SearchRequest = await request.json();
-    const { query, type, limit = 20, hybrid = false } = body;
+    const { query, type, limit = 20, hybrid = false, role, org } = body;
+    const backendPayload: Record<string, unknown> = { query, type, limit, hybrid };
+    if (type === 'person') {
+      if (role && role.trim()) backendPayload.role = role.trim();
+      if (org && org.trim()) backendPayload.org = org.trim();
+    }
 
     if (!query || typeof query !== 'string') {
       return NextResponse.json(
@@ -72,7 +79,7 @@ export async function POST(request: NextRequest) {
         const localResponse = await fetch(`${LOCAL_SERVER_URL}/search`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query, type, limit, hybrid }),
+          body: JSON.stringify(backendPayload),
         });
 
         if (localResponse.ok) {
@@ -98,7 +105,7 @@ export async function POST(request: NextRequest) {
             'Authorization': `Bearer ${CEREBRIUM_TOKEN}`,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ query, type, limit, hybrid }),
+          body: JSON.stringify(backendPayload),
         });
 
         if (!cerebriumResponse.ok) {
